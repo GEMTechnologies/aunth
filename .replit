@@ -5,7 +5,7 @@ channel = "stable-25_05"
 packages = ["libxcrypt"]
 
 [workflows]
-runButton = "Fixed Dev"
+runButton = "Granada Dev"
 
 [[workflows.workflow]]
 name = "Frontend Dev Server"
@@ -50,6 +50,19 @@ args = "cd backend && python -m uvicorn main:app --host 0.0.0.0 --port 8000 --re
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "cd frontend && npm install --legacy-peer-deps && npm run dev"
+
+[[workflows.workflow]]
+name = "Granada Dev"
+author = 44960339
+mode = "parallel"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd backend && python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd frontend && npm install --legacy-peer-deps && npm start"
 
 [[ports]]
 localPort = 3001

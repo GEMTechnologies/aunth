@@ -8,7 +8,7 @@ import secrets
 import hashlib
 import hmac
 import base64
-from .config import settings
+from config import settings
 
 # Configure Argon2id password context with production-ready settings
 pwd_context = CryptContext(

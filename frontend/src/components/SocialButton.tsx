@@ -15,6 +15,7 @@ const SocialButton: React.FC<SocialButtonProps> = ({ provider, onClick = () => {
       }
     } catch (error) {
       console.error(`OAuth login failed for ${provider}:`, error);
+      onClick(); // Call the fallback onClick if provided
     }
   };
 

@@ -1,4 +1,3 @@
-
 from datetime import timedelta, datetime, timezone
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
@@ -25,10 +24,10 @@ class AuthService:
         existing_user = db.query(models.User).join(models.Email).filter(
             models.Email.email == payload.email
         ).first()
-        
+
         if existing_user:
             raise HTTPException(status_code=400, detail="Email already registered")
-        
+
         # Create user
         user = models.User(
             display_name=payload.full_name or payload.email.split('@')[0],
@@ -36,7 +35,7 @@ class AuthService:
         )
         db.add(user)
         db.flush()
-        
+
         # Create email
         email = models.Email(
             user_id=user.id,
@@ -45,7 +44,7 @@ class AuthService:
             is_verified=False
         )
         db.add(email)
-        
+
         # Create password credential
         if payload.password:
             password_cred = models.PasswordCredential(
@@ -53,27 +52,27 @@ class AuthService:
                 password_hash=hash_password(payload.password)
             )
             db.add(password_cred)
-        
+
         db.commit()
         db.refresh(user)
         return user
-    
+
     @staticmethod
     def authenticate_user(db: Session, email: str, password: str, ip_address: str = None, user_agent: str = None) -> models.User:
         user = db.query(models.User).join(models.Email).filter(
             models.Email.email == email,
             models.Email.is_primary == True
         ).first()
-        
+
         if not user:
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        
+
         if not user.password_credential or not verify_password(password, user.password_credential.password_hash):
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        
+
         if user.status != "active":
             raise HTTPException(status_code=401, detail="Account is not active")
-        
+
         return user
 
 class SessionService:
@@ -90,7 +89,7 @@ class SessionService:
         db.commit()
         db.refresh(session)
         return session
-    
+
     @staticmethod
     def issue_tokens(db: Session, user: models.User, session: models.Session) -> schemas.TokenPair:
         access_token = create_access_token(
@@ -99,18 +98,18 @@ class SessionService:
         refresh_token = create_refresh_token(
             data={"sub": str(user.id), "sid": str(session.id)}
         )
-        
+
         # Store refresh token hash
         session.refresh_token_hash = hash_token(refresh_token)
         db.commit()
-        
+
         return schemas.TokenPair(
             access_token=access_token,
             refresh_token=refresh_token,
             token_type="bearer",
             expires_in=settings.access_token_ttl_min * 60
         )
-    
+
     @staticmethod
     def rotate_refresh_token(db: Session, refresh_token: str) -> schemas.TokenPair:
         # Find session by refresh token hash
@@ -119,27 +118,27 @@ class SessionService:
             models.Session.refresh_token_hash == token_hash,
             models.Session.revoked_at.is_(None)
         ).first()
-        
+
         if not session:
             raise HTTPException(status_code=401, detail="Invalid refresh token")
-        
+
         user = db.query(models.User).filter(models.User.id == session.user_id).first()
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
-        
+
         return SessionService.issue_tokens(db, user, session)
-    
+
     @staticmethod
     def revoke_refresh_token(db: Session, refresh_token: str):
         token_hash = hash_token(refresh_token)
         session = db.query(models.Session).filter(
             models.Session.refresh_token_hash == token_hash
         ).first()
-        
+
         if session:
             session.revoked_at = datetime.now(timezone.utc)
             db.commit()
-    
+
     @staticmethod
     def revoke_session(db: Session, session_id: str):
         session = db.query(models.Session).filter(models.Session.id == session_id).first()
@@ -153,12 +152,12 @@ class OrganizationService:
         # Generate slug from name
         import re
         slug = re.sub(r'[^a-zA-Z0-9-]', '-', name.lower()).strip('-')
-        
+
         # Check if slug exists
         existing = db.query(models.Organisation).filter(models.Organisation.slug == slug).first()
         if existing:
             slug = f"{slug}-{secrets.token_hex(4)}"
-        
+
         org = models.Organisation(
             name=name,
             slug=slug,
@@ -166,7 +165,7 @@ class OrganizationService:
         )
         db.add(org)
         db.flush()
-        
+
         # Add owner as admin member
         member = models.OrgMember(
             organisation_id=org.id,
@@ -174,11 +173,11 @@ class OrganizationService:
             role="admin"
         )
         db.add(member)
-        
+
         db.commit()
         db.refresh(org)
         return org
-    
+
     @staticmethod
     def add_member(db: Session, user_id: str, org_id: str, role: str = "member"):
         member = models.OrgMember(

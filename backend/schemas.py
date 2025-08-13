@@ -1,4 +1,3 @@
-
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -44,7 +43,7 @@ class ChangePasswordRequest(BaseModel):
 # Response schemas
 class EmailResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    
+
     id: str
     email: str
     is_verified: bool
@@ -53,7 +52,7 @@ class EmailResponse(BaseModel):
 
 class UserResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    
+
     id: str
     display_name: Optional[str]
     avatar_url: Optional[str]
@@ -64,7 +63,7 @@ class UserResponse(BaseModel):
 
 class SessionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    
+
     id: str
     device_id: str
     user_agent: Optional[str]
@@ -81,7 +80,7 @@ class TokenResponse(BaseModel):
 
 class MeResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    
+
     id: str
     display_name: Optional[str]
     avatar_url: Optional[str]
@@ -94,7 +93,7 @@ class MeResponse(BaseModel):
 
 class OrganisationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    
+
     id: str
     name: str
     slug: str
@@ -102,7 +101,7 @@ class OrganisationResponse(BaseModel):
 
 class RoleResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    
+
     id: str
     key: str
     name: str
@@ -110,7 +109,7 @@ class RoleResponse(BaseModel):
 
 class AuditLogResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    
+
     id: str
     event: str
     ip: str
@@ -131,7 +130,7 @@ class TokenPair(BaseModel):
 
 class UserRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    
+
     id: str
     email: str
     full_name: Optional[str]
@@ -142,7 +141,7 @@ class OrgCreate(BaseModel):
 
 class OrgRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
-    
+
     id: str
     name: str
 
@@ -164,14 +163,11 @@ class UserContextsResponse(BaseModel):
     contexts: List[UserContextResponse]
 
 class SetContextRequest(BaseModel):
-    context: Dict[str, Any]
+    context: UserContextResponse
 
 class ContextResolutionResponse(BaseModel):
-    action: str  # redirect, show_picker, show_product_picker
-    context: Optional[Dict[str, Any]] = None
-    url: Optional[str] = None
-    contexts: Optional[List[UserContextResponse]] = None
-    product: Optional[str] = None
+    redirect_url: str
+    context: Optional[UserContextResponse] = None
 
 class RegisterWithIntentRequest(BaseModel):
     email: EmailStr
@@ -179,3 +175,10 @@ class RegisterWithIntentRequest(BaseModel):
     full_name: Optional[str] = Field(None, max_length=255)
     locale: str = Field("en", max_length=10)
     intent: str = Field(..., description="Registration intent: student, ngo, business, etc.")
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(..., min_length=8)

@@ -10,7 +10,7 @@ from database import get_db
 import schemas, models, service, security, oauth
 from config import settings
 from context_service import ContextService
-from service import OrganizationService, AuthService, SessionService
+from service import OrganizationService, AuthService, SessionService, PasswordResetService
 from security import decode_access_token
 
 logger = logging.getLogger(__name__)
@@ -231,6 +231,34 @@ def logout_all_sessions(
     except Exception as e:
         logger.error(f"Logout all error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to logout from all sessions")
+
+@router.post("/auth/forgot-password", tags=["Authentication"])
+def forgot_password(
+    payload: schemas.ForgotPasswordRequest,
+    db: Session = Depends(get_db)
+):
+    """Request password reset"""
+    try:
+        result = PasswordResetService.request_password_reset(db, payload.email)
+        return result
+    except Exception as e:
+        logger.error(f"Forgot password error: {str(e)}")
+        return {"message": "If the email exists, a reset link has been sent"}
+
+@router.post("/auth/reset-password", tags=["Authentication"])
+def reset_password(
+    payload: schemas.ResetPasswordRequest,
+    db: Session = Depends(get_db)
+):
+    """Reset password with token"""
+    try:
+        result = PasswordResetService.reset_password(db, payload.token, payload.new_password)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Reset password error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Password reset failed")
 
 # Context management endpoints
 @router.get("/me/contexts", response_model=schemas.UserContextsResponse, tags=["Contexts"])

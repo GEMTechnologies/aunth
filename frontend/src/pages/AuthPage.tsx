@@ -67,6 +67,7 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
   const [currentTestimonial, setCurrentTestimonial] = useState(0);
 
   useEffect(() => {
@@ -80,6 +81,7 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
     e.preventDefault();
     setLoading(true);
     setError("");
+    setMessage("");
 
     try {
       if (mode === "register") {
@@ -102,6 +104,11 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
         localStorage.setItem("refresh_token", response.refresh_token);
         const user = await apiMe();
         onLogin(user);
+      } else if (mode === "forgotPassword") {
+        const { apiForgotPassword } = await import("../lib/api");
+        const response = await apiForgotPassword(formData.email);
+        setMessage(response.message);
+        setFormData({ ...formData, email: "" });
       }
     } catch (err: any) {
       setError(err.message || "An error occurred");
@@ -158,6 +165,12 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                 </div>
               )}
 
+              {message && (
+                <div className="mb-6 p-3 bg-green-50 border border-green-200 text-green-600 rounded-lg text-sm">
+                  {message}
+                </div>
+              )}
+
               {/* Social Login Buttons */}
               {mode !== "forgotPassword" && (
                 <div className="space-y-3 mb-6">
@@ -197,15 +210,17 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                     className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
                   />
 
-                  <input
-                    type="password"
-                    name="password"
-                    placeholder="Password"
-                    value={formData.password}
-                    onChange={handleChange}
-                    required
-                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                  />
+                  {mode !== "forgotPassword" && (
+                    <input
+                      type="password"
+                      name="password"
+                      placeholder="Password"
+                      value={formData.password}
+                      onChange={handleChange}
+                      required
+                      className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                    />
+                  )}
 
                   {mode === "register" && (
                     <>

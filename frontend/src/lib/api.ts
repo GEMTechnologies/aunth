@@ -100,16 +100,33 @@ export const apiMe = async () => {
   return response.data;
 };
 
-export const apiRefresh = async (): Promise<AuthResponse> => {
+export const apiRefresh = async (): Promise<{ access_token: string; refresh_token: string }> => {
   const refreshToken = localStorage.getItem('refresh_token');
   if (!refreshToken) {
     throw new Error('No refresh token available');
   }
 
-  const response = await api.post('/auth/refresh', {
-    refresh_token: refreshToken
+  const response = await api.post('/auth/refresh', {}, {
+    headers: {
+      'Authorization': `Bearer ${refreshToken}`
+    }
   });
 
+  return response.data;
+};
+
+export const apiForgotPassword = async (email: string): Promise<{ message: string }> => {
+  const response = await api.post('/auth/forgot-password', { email });
+  return response.data;
+};
+
+export const apiResetPassword = async (token: string, new_password: string): Promise<{ message: string }> => {
+  const response = await api.post('/auth/reset-password', { token, new_password });
+  return response.data;
+};
+
+export const apiOAuthAuthorize = async (provider: string): Promise<{ authorization_url: string }> => {
+  const response = await api.get(`/auth/oauth/${provider}/authorize`);
   return response.data;
 };
 

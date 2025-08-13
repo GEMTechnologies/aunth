@@ -7,11 +7,11 @@ import secrets
 from datetime import datetime, timezone, timedelta
 import logging
 
-from . import models, schemas
-from .config import settings
-from .security import generate_secure_token, create_access_token, create_refresh_token
-from .database import get_db
-from .models import User, OAuthState, OAuthAccount, AuditLog
+import models, schemas
+from config import settings
+from security import generate_secure_token, create_access_token, create_refresh_token
+from database import get_db
+from models import User, OAuthState, OAuthAccount, AuditLog
 
 logger = logging.getLogger(__name__)
 

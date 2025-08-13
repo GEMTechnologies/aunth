@@ -1,4 +1,3 @@
-
 from sqlalchemy import create_engine, event, Engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 from sqlalchemy.pool import StaticPool
@@ -57,16 +56,16 @@ def drop_tables():
 
 class DatabaseManager:
     """Database management utilities"""
-    
+
     @staticmethod
     def get_connection():
         return engine.connect()
-    
+
     @staticmethod
     def execute_sql(sql: str, params: dict = None):
         with engine.connect() as conn:
             return conn.execute(sql, params or {})
-    
+
     @staticmethod
     def health_check() -> bool:
         try:
