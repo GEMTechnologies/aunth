@@ -15,7 +15,7 @@ from config import settings
 
 # Configure logging
 logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper()),
+    level=getattr(settings.log_level.upper()),
     format=settings.log_format
 )
 logger = logging.getLogger(__name__)

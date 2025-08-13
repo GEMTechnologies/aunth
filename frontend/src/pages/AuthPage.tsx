@@ -77,6 +77,40 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
     return () => clearInterval(interval);
   }, []);
 
+  // Handle OAuth callback
+  useEffect(() => {
+    const handleOAuthCallback = () => {
+      const urlParams = new URLSearchParams(window.location.search);
+      const accessToken = urlParams.get('access_token');
+      const refreshToken = urlParams.get('refresh_token');
+      const errorParam = urlParams.get('error');
+
+      if (errorParam) {
+        setError(`OAuth error: ${errorParam}`);
+        return;
+      }
+
+      if (accessToken && refreshToken) {
+        // Store tokens
+        localStorage.setItem('access_token', accessToken);
+        localStorage.setItem('refresh_token', refreshToken);
+
+        // Get user info and call onLogin
+        apiMe().then(user => {
+          onLogin(user);
+        }).catch(err => {
+          setError('Failed to get user information');
+          console.error('Error getting user info:', err);
+        });
+
+        // Clean up URL
+        window.history.replaceState({}, document.title, window.location.pathname);
+      }
+    };
+
+    handleOAuthCallback();
+  }, [onLogin]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
@@ -178,7 +212,7 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                   <SocialButton provider="github" onClick={() => console.log('GitHub login')} />
                   <button className="w-full flex items-center justify-center px-4 py-3 border border-gray-300 rounded-lg bg-white text-gray-700 text-sm font-medium hover:bg-gray-50 transition-colors">
                     <svg className="w-5 h-5 mr-3" viewBox="0 0 24 24" fill="currentColor">
-                      <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
+                      <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.244H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
                     </svg>
                     Continue with X
                   </button>

@@ -189,14 +189,14 @@ class OAuthService:
     def __init__(self):
         self.providers = {
             "google": GoogleOAuthProvider(
-                client_id=settings.google_client_id,
-                client_secret=settings.google_client_secret,
-                redirect_uri=f"{settings.api_url}/auth/oauth/google/callback"
+                client_id=getattr(settings, 'google_client_id', ''),
+                client_secret=getattr(settings, 'google_client_secret', ''),
+                redirect_uri=f"{getattr(settings, 'api_url', 'http://localhost:8000')}/api/auth/oauth/google/callback"
             ),
             "github": GitHubOAuthProvider(
-                client_id=settings.github_client_id,
-                client_secret=settings.github_client_secret,
-                redirect_uri=f"{settings.api_url}/auth/oauth/github/callback"
+                client_id=getattr(settings, 'github_client_id', ''),
+                client_secret=getattr(settings, 'github_client_secret', ''),
+                redirect_uri=f"{getattr(settings, 'api_url', 'http://localhost:8000')}/api/auth/oauth/github/callback"
             )
         }
 
@@ -300,7 +300,7 @@ class OAuthService:
         jwt_refresh_token = create_refresh_token(data={"sub": str(user.id)})
 
         # Redirect to frontend with tokens
-        redirect_url = f"{settings.FRONTEND_URL}?access_token={jwt_access_token}&refresh_token={jwt_refresh_token}"
+        redirect_url = f"{getattr(settings, 'frontend_url', 'http://localhost:3000')}?access_token={jwt_access_token}&refresh_token={jwt_refresh_token}"
         return RedirectResponse(url=redirect_url)
 
     async def _find_or_create_oauth_user(
@@ -413,7 +413,7 @@ class OAuthService:
 # Global OAuth service instance
 oauth_service = OAuthService()
 
-@router.get("/auth/initiate/{provider}")
+@router.get("/auth/oauth/{provider}/authorize")
 async def initiate_oauth(provider: str, db: Session = Depends(get_db)):
     """Initiate OAuth flow for a given provider"""
     try:

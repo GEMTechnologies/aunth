@@ -3,27 +3,44 @@ from typing import List, Optional
 import os
 
 class Settings(BaseSettings):
+    database_url: str = "sqlite:///./test.db"
+    secret_key: str = "your-secret-key-here"
+    jwt_secret: str = "your-jwt-secret-here"
+    jwt_algorithm: str = "HS256"
+    jwt_issuer: str = "granada-auth"
+    jwt_audience: str = "granada-users"
+    access_token_ttl_min: int = 30
+    refresh_token_ttl_days: int = 7
+    csrf_secret: str = "csrf-secret-key"
+    api_version: str = "1.0.0"
+
+    # Argon2 password hashing settings
+    argon2_memory: int = 65536  # 64MB
+    argon2_time: int = 3        # 3 iterations
+    argon2_parallelism: int = 1 # 1 thread
+
+    # OAuth settings
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    api_url: str = "http://localhost:8000"
+    frontend_url: str = "http://localhost:3000"
+
     # Environment
     app_env: str = "development"
     debug: bool = True
 
     # API Configuration
     api_title: str = "Granada Authentication Service"
-    api_version: str = "1.0.0"
-    api_url: str = "http://0.0.0.0:8000"
     web_url: str = "http://0.0.0.0:3001"
 
     # Database
-    database_url: str = "sqlite:///./granada_auth.db"
     redis_url: str = "redis://0.0.0.0:6379/0"
     database_echo: bool = False
 
-    # JWT Settings
-    jwt_secret: str = "your-very-secure-secret-key-change-in-production-minimum-32-chars"
-    jwt_algorithm: str = "HS256"
     jwt_issuer: str = "granada.auth"
     jwt_audience: List[str] = ["granada-web", "granada-api"]
-    access_token_ttl_min: int = 15
     refresh_token_ttl_days: int = 30
     token_rotation: bool = True
 
@@ -42,7 +59,6 @@ class Settings(BaseSettings):
     smtp_tls: bool = True
     smtp_ssl: bool = False
 
-    # OAuth Providers
     google_client_id: str = "your-google-client-id"
     google_client_secret: str = "your-google-client-secret"
     github_client_id: str = "your-github-client-id"
@@ -62,7 +78,7 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     cookie_samesite: str = "lax"
     allowed_origins: List[str] = [
-        "http://0.0.0.0:3001", 
+        "http://0.0.0.0:3001",
         "http://localhost:3001",
         "http://0.0.0.0:3000",
         "http://localhost:3000"
