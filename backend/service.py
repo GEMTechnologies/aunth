@@ -8,426 +8,189 @@ from typing import Optional, List, Dict, Any
 import secrets
 import logging
 
-from . import models, schemas
-from .security import (
+import models, schemas
+from security import (
     hash_password, verify_password, create_access_token, create_refresh_token, 
     hash_token, generate_verification_token, generate_device_id, SecurityManager
 )
-from .config import settings
-from .context_service import ContextService
+from config import settings
+from context_service import ContextService
 
 logger = logging.getLogger(__name__)
 
 class AuthService:
-    """Authentication service with comprehensive user management"""
-    
     @staticmethod
-    def register_user(db: Session, payload: schemas.UserCreate, ip_address: str = "127.0.0.1", intent: Optional[str] = None) -> models.User:
-        """Register new user with email and password"""
-        try:
-            # Check password strength
-            password_analysis = SecurityManager.check_password_strength(payload.password)
-            if password_analysis["score"] < 2:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="Password is too weak. Must contain at least 8 characters with mix of letters, numbers, and symbols."
-                )
-            
-            # Create user
-            user = models.User(
-                display_name=payload.full_name or payload.email.split('@')[0],
-                locale="en",
-                status="active",
-                registration_intent=intent
-            )
-            db.add(user)
-            db.flush()  # Get user ID
-            
-            # Create primary email
-            email = models.Email(
-                user_id=user.id,
-                email=payload.email.lower().strip(),
-                is_verified=False,
-                is_primary=True
-            )
-            db.add(email)
-            db.flush()
-            
-            # Set primary email reference
-            user.primary_email_id = email.id
-            
-            # Create password credential
-            password_cred = models.PasswordCredential(
-                user_id=user.id,
-                password_hash=hash_password(payload.password),
-                password_version=1
-            )
-            db.add(password_cred)
-            
-            # Create context based on intent
-            if intent == "student":
-                ContextService.create_student_context(db, user.id)
-            # For NGO/business intents, context will be created when org is created
-            
-            # Create audit log
-            audit_log = models.AuditLog(
-                user_id=user.id,
-                event="user.registered",
-                ip=ip_address,
-                payload_json={
-                    "email": payload.email,
-                    "registration_method": "email_password",
-                    "intent": intent
-                }
-            )
-            db.add(audit_log)
-            
-            db.commit()
-            db.refresh(user)
-            db.refresh(email)
-            
-            logger.info(f"User registered successfully: {user.id}")
-            return user
-            
-        except IntegrityError as e:
-            db.rollback()
-            if "email" in str(e):
-                raise HTTPException(status_code=400, detail="Email already registered")
-            raise HTTPException(status_code=400, detail="Registration failed")
-        except Exception as e:
-            db.rollback()
-            logger.error(f"Registration failed: {str(e)}")
-            raise
-    
-    @staticmethod
-    def authenticate_user(
-        db: Session, 
-        email: str, 
-        password: str, 
-        ip_address: str = "127.0.0.1",
-        user_agent: str = "Unknown"
-    ) -> models.User:
-        """Authenticate user with email and password"""
-        
-        # Find user by email
-        email_obj = db.query(models.Email).filter(
-            models.Email.email == email.lower().strip()
+    def register_user(db: Session, payload: schemas.UserCreate, ip_address: str = None) -> models.User:
+        # Check if user already exists
+        existing_user = db.query(models.User).join(models.Email).filter(
+            models.Email.email == payload.email
         ).first()
         
-        if not email_obj:
-            # Log failed attempt
-            audit_log = models.AuditLog(
-                event="auth.failed",
-                ip=ip_address,
-                user_agent=user_agent,
-                payload_json={"email": email, "reason": "email_not_found"}
-            )
-            db.add(audit_log)
-            db.commit()
-            raise HTTPException(status_code=401, detail="Invalid credentials")
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Email already registered")
         
-        user = email_obj.user
-        
-        # Check user status
-        if user.status != "active":
-            audit_log = models.AuditLog(
-                user_id=user.id,
-                event="auth.failed",
-                ip=ip_address,
-                user_agent=user_agent,
-                payload_json={"reason": "user_inactive", "status": user.status}
-            )
-            db.add(audit_log)
-            db.commit()
-            raise HTTPException(status_code=400, detail="Account is not active")
-        
-        # Check password
-        if not user.password_credential or not verify_password(password, user.password_credential.password_hash):
-            audit_log = models.AuditLog(
-                user_id=user.id,
-                event="auth.failed",
-                ip=ip_address,
-                user_agent=user_agent,
-                payload_json={"reason": "invalid_password"}
-            )
-            db.add(audit_log)
-            db.commit()
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        
-        # Log successful authentication
-        audit_log = models.AuditLog(
-            user_id=user.id,
-            event="auth.success",
-            ip=ip_address,
-            user_agent=user_agent,
-            payload_json={"login_method": "password"}
+        # Create user
+        user = models.User(
+            display_name=payload.full_name or payload.email.split('@')[0],
+            locale='en'
         )
-        db.add(audit_log)
-        db.commit()
+        db.add(user)
+        db.flush()
         
-        logger.info(f"User authenticated successfully: {user.id}")
+        # Create email
+        email = models.Email(
+            user_id=user.id,
+            email=payload.email,
+            is_primary=True,
+            is_verified=False
+        )
+        db.add(email)
+        
+        # Create password credential
+        if payload.password:
+            password_cred = models.PasswordCredential(
+                user_id=user.id,
+                password_hash=hash_password(payload.password)
+            )
+            db.add(password_cred)
+        
+        db.commit()
+        db.refresh(user)
+        return user
+    
+    @staticmethod
+    def authenticate_user(db: Session, email: str, password: str, ip_address: str = None, user_agent: str = None) -> models.User:
+        user = db.query(models.User).join(models.Email).filter(
+            models.Email.email == email,
+            models.Email.is_primary == True
+        ).first()
+        
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+        if not user.password_credential or not verify_password(password, user.password_credential.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+        if user.status != "active":
+            raise HTTPException(status_code=401, detail="Account is not active")
+        
         return user
 
 class SessionService:
-    """Session and token management service"""
-    
     @staticmethod
-    def create_session(
-        db: Session,
-        user: models.User,
-        ip_address: str = "127.0.0.1",
-        user_agent: str = "Unknown"
-    ) -> models.Session:
-        """Create new user session"""
-        
-        # Generate device ID
-        device_id = generate_device_id(user_agent, ip_address)
-        
-        # Check for existing session on same device
-        existing_session = db.query(models.Session).filter(
-            models.Session.user_id == user.id,
-            models.Session.device_id == device_id,
-            models.Session.revoked_at.is_(None)
-        ).first()
-        
-        if existing_session:
-            # Update existing session
-            existing_session.ip_last = ip_address
-            existing_session.last_seen_at = datetime.now(timezone.utc)
-            existing_session.user_agent = user_agent
-            db.commit()
-            return existing_session
-        
-        # Create new session
+    def create_session(db: Session, user: models.User, ip_address: str = None, user_agent: str = None) -> models.Session:
         session = models.Session(
             user_id=user.id,
-            device_id=device_id,
-            user_agent=user_agent,
-            ip_first=ip_address,
-            ip_last=ip_address
+            device_id=generate_device_id(),
+            ip_created=ip_address or "unknown",
+            ip_last=ip_address or "unknown",
+            user_agent=user_agent or "unknown"
         )
         db.add(session)
-        db.flush()
-        
-        # Clean up old sessions if user has too many
-        user_sessions = db.query(models.Session).filter(
-            models.Session.user_id == user.id,
-            models.Session.revoked_at.is_(None)
-        ).order_by(desc(models.Session.last_seen_at)).all()
-        
-        if len(user_sessions) > settings.max_sessions_per_user:
-            # Revoke oldest sessions
-            sessions_to_revoke = user_sessions[settings.max_sessions_per_user:]
-            for old_session in sessions_to_revoke:
-                old_session.revoked_at = datetime.now(timezone.utc)
-        
         db.commit()
+        db.refresh(session)
         return session
     
     @staticmethod
-    def issue_tokens(
-        db: Session, 
-        user: models.User, 
-        session: models.Session,
-        org_id: Optional[str] = None
-    ) -> schemas.TokenPair:
-        """Issue access and refresh tokens for session"""
-        
-        # Get user permissions (implement based on your RBAC needs)
-        roles = []  # TODO: Implement role fetching
-        permissions = []  # TODO: Implement permission fetching
-        
-        # Create access token
+    def issue_tokens(db: Session, user: models.User, session: models.Session) -> schemas.TokenPair:
         access_token = create_access_token(
-            subject=user.id,
-            org_id=org_id,
-            roles=roles,
-            permissions=permissions,
-            session_id=session.id
+            data={"sub": str(user.id), "sid": str(session.id)}
+        )
+        refresh_token = create_refresh_token(
+            data={"sub": str(user.id), "sid": str(session.id)}
         )
         
-        # Create refresh token
-        refresh_token = create_refresh_token()
-        
-        # Store refresh token
-        refresh_token_obj = models.RefreshToken(
-            session_id=session.id,
-            token_hash=hash_token(refresh_token),
-            expires_at=datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_ttl_days)
-        )
-        db.add(refresh_token_obj)
-        
-        # Revoke old refresh tokens for this session if token rotation is enabled
-        if settings.token_rotation:
-            old_tokens = db.query(models.RefreshToken).filter(
-                models.RefreshToken.session_id == session.id,
-                models.RefreshToken.revoked_at.is_(None)
-            ).all()
-            
-            for old_token in old_tokens[:-1]:  # Keep the newest one
-                old_token.revoked_at = datetime.now(timezone.utc)
-        
+        # Store refresh token hash
+        session.refresh_token_hash = hash_token(refresh_token)
         db.commit()
         
         return schemas.TokenPair(
             access_token=access_token,
             refresh_token=refresh_token,
+            token_type="bearer",
             expires_in=settings.access_token_ttl_min * 60
         )
     
     @staticmethod
     def rotate_refresh_token(db: Session, refresh_token: str) -> schemas.TokenPair:
-        """Rotate refresh token and issue new token pair"""
-        
-        # Find refresh token
+        # Find session by refresh token hash
         token_hash = hash_token(refresh_token)
-        refresh_obj = db.query(models.RefreshToken).options(
-            joinedload(models.RefreshToken.session).joinedload(models.Session.user)
-        ).filter(
-            models.RefreshToken.token_hash == token_hash,
-            models.RefreshToken.revoked_at.is_(None),
-            models.RefreshToken.expires_at > datetime.now(timezone.utc)
+        session = db.query(models.Session).filter(
+            models.Session.refresh_token_hash == token_hash,
+            models.Session.revoked_at.is_(None)
         ).first()
         
-        if not refresh_obj:
-            raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+        if not session:
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
         
-        # Check for token reuse
-        if refresh_obj.reuse_flag:
-            # Token reuse detected - revoke all tokens for this session
-            db.query(models.RefreshToken).filter(
-                models.RefreshToken.session_id == refresh_obj.session_id
-            ).update({"revoked_at": datetime.now(timezone.utc)})
-            
-            refresh_obj.session.revoked_at = datetime.now(timezone.utc)
-            db.commit()
-            
-            logger.warning(f"Token reuse detected for session: {refresh_obj.session_id}")
-            raise HTTPException(status_code=401, detail="Token reuse detected")
+        user = db.query(models.User).filter(models.User.id == session.user_id).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
         
-        user = refresh_obj.session.user
-        session = refresh_obj.session
-        
-        # Mark current token as used
-        refresh_obj.reuse_flag = True
-        refresh_obj.revoked_at = datetime.now(timezone.utc)
-        
-        # Update session last seen
-        session.last_seen_at = datetime.now(timezone.utc)
-        
-        # Issue new tokens
-        new_tokens = SessionService.issue_tokens(db, user, session)
-        
-        return new_tokens
+        return SessionService.issue_tokens(db, user, session)
     
     @staticmethod
     def revoke_refresh_token(db: Session, refresh_token: str):
-        """Revoke a specific refresh token"""
         token_hash = hash_token(refresh_token)
-        refresh_obj = db.query(models.RefreshToken).filter(
-            models.RefreshToken.token_hash == token_hash,
-            models.RefreshToken.revoked_at.is_(None)
+        session = db.query(models.Session).filter(
+            models.Session.refresh_token_hash == token_hash
         ).first()
         
-        if refresh_obj:
-            refresh_obj.revoked_at = datetime.now(timezone.utc)
+        if session:
+            session.revoked_at = datetime.now(timezone.utc)
             db.commit()
     
     @staticmethod
     def revoke_session(db: Session, session_id: str):
-        """Revoke entire session and all associated tokens"""
-        session = db.query(models.Session).filter(
-            models.Session.id == session_id,
-            models.Session.revoked_at.is_(None)
-        ).first()
-        
+        session = db.query(models.Session).filter(models.Session.id == session_id).first()
         if session:
-            # Revoke session
             session.revoked_at = datetime.now(timezone.utc)
-            
-            # Revoke all refresh tokens for this session
-            db.query(models.RefreshToken).filter(
-                models.RefreshToken.session_id == session_id,
-                models.RefreshToken.revoked_at.is_(None)
-            ).update({"revoked_at": datetime.now(timezone.utc)})
-            
             db.commit()
 
 class OrganizationService:
-    """Organization and membership management"""
-    
     @staticmethod
     def create_organization(db: Session, name: str, owner: models.User) -> models.Organisation:
-        """Create new organization with owner"""
-        # Generate unique slug
-        base_slug = name.lower().replace(" ", "-").replace("_", "-")
-        slug = base_slug
-        counter = 1
+        # Generate slug from name
+        import re
+        slug = re.sub(r'[^a-zA-Z0-9-]', '-', name.lower()).strip('-')
         
-        while db.query(models.Organisation).filter(models.Organisation.slug == slug).first():
-            slug = f"{base_slug}-{counter}"
-            counter += 1
+        # Check if slug exists
+        existing = db.query(models.Organisation).filter(models.Organisation.slug == slug).first()
+        if existing:
+            slug = f"{slug}-{secrets.token_hex(4)}"
         
-        # Create organization
         org = models.Organisation(
             name=name,
             slug=slug,
-            owner_user_id=owner.id
+            created_by=owner.id
         )
         db.add(org)
         db.flush()
         
-        # Create owner role (you'll need to implement role system)
-        # For now, we'll skip the role creation
-        
-        # Add owner as member
-        OrganizationService.add_member(db, owner.id, org.id, "owner")
-        
-        # Create audit log
-        audit_log = models.AuditLog(
+        # Add owner as admin member
+        member = models.OrgMember(
+            organisation_id=org.id,
             user_id=owner.id,
-            actor_user_id=owner.id,
-            event="org.created",
-            payload_json={
-                "org_id": org.id,
-                "org_name": name,
-                "org_slug": slug
-            }
+            role="admin"
         )
-        db.add(audit_log)
+        db.add(member)
         
         db.commit()
         db.refresh(org)
-        
-        logger.info(f"Organization created: {org.id} by user: {owner.id}")
         return org
     
     @staticmethod
-    def add_member(db: Session, user_id: str, org_id: str, role: str = "member") -> models.OrgMember:
-        """Add user to organization with specified role"""
-        
-        # Check if user is already a member
-        existing = db.query(models.OrgMember).filter(
-            models.OrgMember.user_id == user_id,
-            models.OrgMember.org_id == org_id
-        ).first()
-        
-        if existing:
-            raise HTTPException(status_code=400, detail="User is already a member")
-        
-        # Create membership (simplified - you'll need proper role system)
+    def add_member(db: Session, user_id: str, org_id: str, role: str = "member"):
         member = models.OrgMember(
+            organisation_id=org_id,
             user_id=user_id,
-            org_id=org_id,
-            role_id="placeholder"  # TODO: Implement proper role system
+            role=role
         )
         db.add(member)
         db.commit()
-        db.refresh(member)
-        
         return member
 
-# Legacy functions for backward compatibility
+# Legacy compatibility functions
 def register_user(db: Session, payload: schemas.UserCreate) -> models.User:
     return AuthService.register_user(db, payload)
 
@@ -445,8 +208,6 @@ def revoke_refresh(db: Session, refresh_token: str):
     SessionService.revoke_refresh_token(db, refresh_token)
 
 def create_org(db: Session, name: str) -> models.Organisation:
-    # This needs an owner - you'll need to pass it properly
-    # For now, return a placeholder
     raise HTTPException(status_code=501, detail="Use OrganizationService.create_organization")
 
 def add_member(db: Session, user_id: str, org_id: str, role: str = "member"):

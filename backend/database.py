@@ -2,7 +2,7 @@
 from sqlalchemy import create_engine, event, Engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 from sqlalchemy.pool import StaticPool
-from .config import settings
+from config import settings
 import sqlite3
 
 # SQLite WAL mode optimization

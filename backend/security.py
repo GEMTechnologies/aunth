@@ -242,3 +242,96 @@ def decode_token(token: str, expected_scope: str = "access") -> Dict[str, Any]:
     if payload.get("scope") != expected_scope:
         raise ValueError(f"Expected scope '{expected_scope}', got '{payload.get('scope')}'")
     return payload
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any
+from passlib.context import CryptContext
+from jose import jwt, JWTError
+import secrets
+import hashlib
+
+from config import settings
+
+# Password hashing
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+
+def hash_password(password: str) -> str:
+    """Hash a password using Argon2"""
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a password against its hash"""
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
+    """Create a JWT access token"""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.access_token_ttl_min)
+    
+    to_encode.update({
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+        "iss": settings.jwt_issuer,
+        "aud": settings.jwt_audience,
+        "type": "access"
+    })
+    
+    return jwt.encode(to_encode, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+def create_refresh_token(data: Dict[str, Any]) -> str:
+    """Create a JWT refresh token"""
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_ttl_days)
+    
+    to_encode.update({
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+        "iss": settings.jwt_issuer,
+        "aud": settings.jwt_audience,
+        "type": "refresh"
+    })
+    
+    return jwt.encode(to_encode, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+def decode_access_token(token: str) -> Dict[str, Any]:
+    """Decode and verify an access token"""
+    try:
+        payload = jwt.decode(
+            token, 
+            settings.jwt_secret, 
+            algorithms=[settings.jwt_algorithm],
+            issuer=settings.jwt_issuer,
+            audience=settings.jwt_audience
+        )
+        
+        if payload.get("type") != "access":
+            raise JWTError("Invalid token type")
+        
+        return payload
+    except JWTError:
+        raise
+
+def hash_token(token: str) -> str:
+    """Hash a token for storage"""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def generate_verification_token() -> str:
+    """Generate a verification token"""
+    return secrets.token_urlsafe(32)
+
+def generate_device_id() -> str:
+    """Generate a device ID"""
+    return secrets.token_hex(16)
+
+class SecurityManager:
+    """Security utilities"""
+    
+    @staticmethod
+    def generate_csrf_token() -> str:
+        return secrets.token_hex(32)
+    
+    @staticmethod
+    def verify_csrf_token(token: str, expected: str) -> bool:
+        return secrets.compare_digest(token, expected)
