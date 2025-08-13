@@ -44,12 +44,12 @@ class Settings(BaseSettings):
     smtp_ssl: bool = False
     
     # OAuth Providers
-    google_client_id: str = ""
-    google_client_secret: str = ""
-    github_client_id: str = ""
-    github_client_secret: str = ""
-    facebook_client_id: str = ""
-    facebook_client_secret: str = ""
+    google_client_id: str = "your-google-client-id"
+    google_client_secret: str = "your-google-client-secret"
+    github_client_id: str = "your-github-client-id"
+    github_client_secret: str = "your-github-client-secret"
+    facebook_client_id: str = "your-facebook-client-id"
+    facebook_client_secret: str = "your-facebook-client-secret"
     
     # SSO/SAML Configuration
     saml_sp_entity_id: str = "granada-auth"

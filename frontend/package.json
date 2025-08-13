@@ -6,14 +6,14 @@
     "start": "npm run dev",
     "dev": "webpack serve --config webpack.config.js --mode development",
     "build": "webpack --config webpack.config.js --mode production",
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "install": "npm install --legacy-peer-deps"
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "framer-motion": "^12.23.9",
+    "axios": "^1.7.2",
+    "framer-motion": "^11.5.4",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "typescript": "^5.8.3",
@@ -24,14 +24,13 @@
     "@types/react": "^18.2.79",
     "@types/react-dom": "^18.2.25",
     "ts-loader": "^9.5.2",
-    "@tailwindcss/postcss": "^4.1.11",
     "autoprefixer": "^10.4.21",
     "css-loader": "^7.1.2",
     "html-webpack-plugin": "^5.6.3",
     "postcss": "^8.4.39",
     "postcss-loader": "^8.1.1",
     "style-loader": "^4.0.0",
-    "tailwindcss": "^4.1.11",
+    "tailwindcss": "^3.4.4",
     "webpack": "^5.100.2",
     "webpack-cli": "^6.0.1",
     "webpack-dev-server": "^5.2.2"
