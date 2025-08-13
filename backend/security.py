@@ -86,3 +86,8 @@ def generate_device_id(user_agent: str, ip: str) -> str:
     """Generate device fingerprint"""
     device_string = f"{user_agent}:{ip}"
     return hashlib.sha256(device_string.encode()).hexdigest()[:16]
+
+# Backward compatibility alias
+def decode_token(token: str, expected_scope: str = "access") -> Dict[str, Any]:
+    """Backward compatibility function"""
+    return decode_access_token(token)

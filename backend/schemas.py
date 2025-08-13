@@ -118,6 +118,34 @@ class AuditLogResponse(BaseModel):
     payload_json: Optional[Dict[str, Any]]
     created_at: datetime
 
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=8)
+    full_name: Optional[str] = Field(None, max_length=255)
+
+class TokenPair(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "Bearer"
+    expires_in: int = 15 * 60  # 15 minutes default
+
+class UserRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
+    id: str
+    email: str
+    full_name: Optional[str]
+    is_verified: bool
+
+class OrgCreate(BaseModel):
+    name: str = Field(..., max_length=255)
+
+class OrgRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
+    id: str
+    name: str
+
 class ErrorResponse(BaseModel):
     detail: str
     error_code: Optional[str] = None

@@ -5,7 +5,7 @@ from typing import Optional
 from jose import JWTError
 from .database import get_db
 from . import schemas, service, models
-from .security import decode_token
+from .security import decode_access_token
 from .config import settings
 
 router = APIRouter()
@@ -13,10 +13,10 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
 def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)) -> models.User:
     try:
-        data = decode_token(token, expected_scope="access")
-    except JWTError:
+        data = decode_access_token(token)
+    except (JWTError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid token")
-    user = db.query(models.User).get(data.get("sub"))
+    user = db.query(models.User).filter(models.User.id == data.get("sub")).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     return user
@@ -24,7 +24,12 @@ def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_
 @router.post("/auth/register", response_model=schemas.UserRead, tags=["Authentication"])
 def register(payload: schemas.UserCreate, db: Session = Depends(get_db)):
     user = service.register_user(db, payload)
-    return schemas.UserRead(id=user.id, email=user.email, full_name=user.full_name, is_verified=user.is_verified)
+    return schemas.UserRead(
+        id=user.id, 
+        email=user.primary_email.email if user.primary_email else "", 
+        full_name=user.display_name, 
+        is_verified=user.primary_email.is_verified if user.primary_email else False
+    )
 
 @router.post("/auth/login", response_model=schemas.TokenPair, tags=["Authentication"])
 def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
@@ -47,7 +52,12 @@ def logout(authorization: Optional[str] = Header(default=None), db: Session = De
 
 @router.get("/users/me", response_model=schemas.UserRead, tags=["Users"])
 def me(current: models.User = Depends(get_current_user)):
-    return schemas.UserRead(id=current.id, email=current.email, full_name=current.full_name, is_verified=current.is_verified)
+    return schemas.UserRead(
+        id=current.id, 
+        email=current.primary_email.email if current.primary_email else "", 
+        full_name=current.display_name, 
+        is_verified=current.primary_email.is_verified if current.primary_email else False
+    )
 
 @router.post("/orgs", response_model=schemas.OrgRead, tags=["Organizations"])
 def create_org(payload: schemas.OrgCreate, db: Session = Depends(get_db), current: models.User = Depends(get_current_user)):
