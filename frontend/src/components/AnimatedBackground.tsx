@@ -3,34 +3,42 @@ import React from 'react';
 import { motion } from 'framer-motion';
 
 const AnimatedBackground: React.FC = () => {
+  const particles = Array.from({ length: 15 }, (_, i) => i);
+
   return (
-    <div className="flex-1 relative overflow-hidden flex items-center justify-center p-10 bg-gradient-to-br from-blue-700 via-purple-600 to-fuchsia-500 animate-gradient-x">
-      <motion.div
-        className="absolute inset-0 z-0 pointer-events-none"
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 0.25 }}
-        transition={{ duration: 2 }}
-      >
-        <div className="absolute top-1/4 left-1/4 w-60 h-60 bg-white/10 rounded-full blur-2xl animate-pulse" />
-        <div className="absolute bottom-10 right-10 w-40 h-40 bg-white/20 rounded-full blur-2xl animate-pulse" />
-      </motion.div>
-      <div className="text-center text-white z-10 drop-shadow-xl">
-        <motion.p
-          className="text-5xl md:text-6xl font-extrabold leading-tight mb-4 tracking-tight"
-          initial={{ opacity: 0, y: 40 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.8, type: 'spring' }}
-        >
-          "The Operating System for Impact."
-        </motion.p>
-        <motion.p
-          className="text-2xl md:text-3xl font-medium"
-          initial={{ opacity: 0, y: 40 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 1, delay: 0.2, type: 'spring' }}
-        >
-          Plan. Fund. Execute. Measure.
-        </motion.p>
+    <div className="fixed inset-0 overflow-hidden pointer-events-none">
+      <div className="absolute inset-0 bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50" />
+      
+      {/* Animated particles */}
+      {particles.map((particle) => (
+        <motion.div
+          key={particle}
+          className="absolute w-2 h-2 bg-gradient-to-r from-blue-400 to-indigo-400 rounded-full opacity-20"
+          initial={{
+            x: Math.random() * window.innerWidth,
+            y: Math.random() * window.innerHeight,
+          }}
+          animate={{
+            x: Math.random() * window.innerWidth,
+            y: Math.random() * window.innerHeight,
+          }}
+          transition={{
+            duration: Math.random() * 10 + 20,
+            repeat: Infinity,
+            repeatType: "reverse",
+            ease: "linear",
+          }}
+        />
+      ))}
+
+      {/* Gradient orbs */}
+      <div className="absolute top-0 -left-4 w-72 h-72 bg-purple-300 rounded-full mix-blend-multiply filter blur-xl opacity-20 animate-blob" />
+      <div className="absolute top-0 -right-4 w-72 h-72 bg-yellow-300 rounded-full mix-blend-multiply filter blur-xl opacity-20 animate-blob animation-delay-2000" />
+      <div className="absolute -bottom-8 left-20 w-72 h-72 bg-pink-300 rounded-full mix-blend-multiply filter blur-xl opacity-20 animate-blob animation-delay-4000" />
+      
+      {/* Grid pattern */}
+      <div className="absolute inset-0 opacity-[0.02]">
+        <div className="h-full w-full bg-grid-pattern bg-[size:50px_50px]" />
       </div>
     </div>
   );

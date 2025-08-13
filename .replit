@@ -2,3 +2,15 @@ modules = ["nodejs-20", "python-3.12", "web"]
 
 [nix]
 channel = "stable-25_05"
+
+[workflows]
+runButton = "Frontend Dev Server"
+
+[[workflows.workflow]]
+name = "Frontend Dev Server"
+author = 44960339
+mode = "sequential"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "cd frontend && npm install && npm start"
