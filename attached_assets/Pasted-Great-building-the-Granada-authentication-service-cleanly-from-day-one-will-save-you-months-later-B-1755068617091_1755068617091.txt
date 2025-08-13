@@ -1,0 +1,295 @@
+Great—building the Granada authentication service cleanly from day one will save you months later. Below is a compact-but-complete blueprint you can implement immediately with your current stack (FastAPI backend already exists; frontend is Vite + React + Tailwind + shadcn/ui). It covers scope, flows, API contracts, data model, security controls, and the DevOps bits people usually forget.
+1) Scope and guiding principles
+
+The authentication service should provide a single identity across all Granada apps and tenants (NGOs, businesses, students, general users), support email/password + social logins, multi-factor auth, secure session management, organisation membership & roles, and auditing. Prefer short-lived access tokens + rotating refresh tokens, Argon2id password hashing, device-aware session management, and zero-trust defaults (explicit permissions for everything).
+2) Core features (what must be there)
+
+Accounts & identity. A canonical users record per human; support for multiple verified emails and linked providers (Google, GitHub, Facebook, optional phone).
+Email/password auth. Strong hashing (Argon2id) and configurable password policy.
+Email verification. Time-boxed, one-use tokens; resend limits.
+Social login (OIDC/OAuth 2.0). Google, GitHub, Facebook to start; PKCE everywhere; account linking if provider email already exists.
+Passwordless (optional but recommended). Magic link by email; rate-limited, single use.
+MFA. TOTP (e.g., Google Authenticator), backup codes, and WebAuthn/passkeys for high-security roles.
+Sessions & tokens. Short-lived access JWT (5–15 min) + rotating refresh token (30–90 days) stored in HttpOnly, Secure, SameSite=Lax cookies for web. Refresh token rotation with reuse detection and global logout.
+Org & roles. Multi-tenant organisations, membership, RBAC with fine-grained permissions; role templates per user type (NGO admin, Officer, Student, Business owner, General user).
+Invites. Email invites to organisations with pre-assigned role; expiration + single use.
+Profile & devices. Update profile, manage sessions/devices, revoke tokens per device.
+Recovery. Start reset (email), complete reset; throttle attempts.
+Security controls. Rate limits, IP/device risk signals, CSRF protection when using cookie auth, strict CORS, request signing for internal APIs.
+Auditing. Append-only audit trail for auth events and admin actions.
+Admin console. Search users, reset MFA, force verify, revoke sessions, view audit.
+Notifications. Email templates for verify, welcome, password reset, invite, security alerts (new device, MFA added/removed).
+Compliance basics. Consent + privacy notices, data export/delete, minimal PII.
+3) API contract (FastAPI; cookie-based for browser, token for mobile)
+
+All endpoints return JSON; where noted, set/clear cookies (Access-Token, Refresh-Token).
+
+Public auth
+
+    POST /auth/register → create user; send verification email.
+
+    POST /auth/login → verify credentials; set cookies; return user & session meta.
+
+    POST /auth/logout → revoke current session; clear cookies.
+
+    POST /auth/refresh → rotate refresh; new access; detect reuse; may force global logout.
+
+    POST /auth/password/forgot → issue reset email (one-time token).
+
+    POST /auth/password/reset → set new password using valid token.
+
+    POST /auth/verify-email/request → resend verification.
+
+    POST /auth/verify-email/confirm → confirm using token.
+
+Magic link (optional)
+
+    POST /auth/magiclink/request
+
+    POST /auth/magiclink/consume
+
+MFA
+
+    POST /auth/mfa/totp/enrol/start → return secret + QR (base32); pending.
+
+    POST /auth/mfa/totp/enrol/confirm → verify TOTP; enable; mint backup codes.
+
+    POST /auth/mfa/totp/disable
+
+    POST /auth/mfa/backup/consume
+
+    POST /auth/webauthn/registration/start / /finish
+
+    POST /auth/webauthn/assertion/start / /finish
+
+Social/OIDC
+
+    GET /oauth/{provider}/authorize → redirect
+
+    GET /oauth/{provider}/callback → exchange code (PKCE); create/link user; set cookies
+
+Org & roles
+
+    POST /orgs → create org (owner = caller)
+
+    GET /orgs/:id/members / POST /orgs/:id/members → add member with role
+
+    POST /orgs/:id/invites → send invite
+
+    POST /orgs/:id/invites/accept
+
+    GET /roles / POST /roles → define roles; assign permissions
+
+    POST /orgs/:id/members/:uid/role → change member role
+
+User & sessions
+
+    GET /me → current user profile + memberships + active sessions
+
+    PATCH /me → update profile (name, avatar, locale)
+
+    GET /me/sessions → list; device info, created_at, last_ip
+
+    POST /me/sessions/:sid/revoke → per-device revoke
+
+    POST /me/change-password → old + new; rehash
+
+Admin (protected)
+
+    GET /admin/users?query=...
+
+    POST /admin/users/:id/revoke-all
+
+    POST /admin/users/:id/verify-email
+
+    GET /admin/audit?user_id=...&event=...
+
+4) Token and session model (recommended)
+
+Access token: JWT, 5–15 minutes, audience granada-web, granada-api, includes sub, org_id (current context), roles, permissions_hash, sid (session id), ver (policy version).
+Refresh token: opaque random 256-bit, stored server-side with jti, sid, device_id, rotated_at, expires_at. On refresh, rotate and blacklist old; if an old token reappears, flag token reuse → revoke entire session.
+Cookies: __Host-access (short), __Host-refresh (httpOnly, Secure, SameSite=Lax). For mobile/native, return tokens in body and store securely (Keychain/Keystore).
+5) Security baseline
+
+Passwords hashed with Argon2id (memory-hard, tuned to your infra).
+Email verification required before privileged actions.
+MFA enforcement for staff/admin and NGO owners.
+CSRF: if you use cookies for access tokens, protect state-changing routes with CSRF token.
+CORS: strict allowed origins (your web domains only).
+Rate limiting: per IP + per account + per route category (login/verify/reset).
+Brute-force defence: exponential back-off + “soft lock” after N failures, with email notice.
+Device fingerprints: store user-agent + IP + derived device id to show users “Where you’re logged in”.
+Secrets: never in repo; load via env + secret manager.
+Validation: pydantic models; reject unexpected fields.
+Logging: structured JSON only; never log secrets, tokens, or full emails.
+Auditing: append-only log for LOGIN_SUCCESS, LOGIN_FAIL, TOKEN_REFRESH, TOKEN_REUSE, PASSWORD_RESET_REQUEST, PASSWORD_CHANGED, MFA_ENABLED, MFA_DISABLED, INVITE_SENT, INVITE_ACCEPTED, ROLE_CHANGED, SESSION_REVOKED.
+6) Data model (PostgreSQL + Redis)
+
+Core tables (Postgres):
+
+    users(id, primary_email_id, display_name, avatar_url, locale, created_at, status)
+
+    emails(id, user_id, email, is_verified, created_at, verified_at, is_primary)
+
+    password_credentials(user_id, password_hash, password_version, updated_at)
+
+    factors_totp(id, user_id, secret, created_at, last_used_at, is_active)
+
+    factors_webauthn(id, user_id, credential_id, public_key, sign_count, label, created_at)
+
+    backup_codes(id, user_id, code_hash, used_at)
+
+    providers(id, user_id, provider, provider_user_id, email_at_signup, linked_at)
+
+    sessions(id, user_id, device_id, user_agent, ip_first, ip_last, created_at, last_seen_at, revoked_at)
+
+    refresh_tokens(id, session_id, token_hash, rotated_at, expires_at, revoked_at, reuse_flag)
+
+    organisations(id, name, slug, owner_user_id, created_at)
+
+    org_members(org_id, user_id, role_id, joined_at, invited_by)
+
+    roles(id, org_id_nullable, key, name, is_system)
+
+    permissions(id, key, description)
+
+    role_permissions(role_id, permission_id)
+
+    invites(id, org_id, email, role_id, token_hash, expires_at, accepted_at, cancelled_at)
+
+    password_resets(id, user_id, token_hash, expires_at, used_at)
+
+    audit_logs(id, user_id_nullable, actor_user_id_nullable, event, ip, user_agent, payload_json, created_at)
+
+    api_keys(id, org_id_nullable, name, key_hash, created_at, last_used_at, revoked_at, scope_json)
+
+Caching / throttling (Redis):
+
+    Rate limit counters, short-lived verify/reset tokens, CSRF tokens, session lookups, PKCE verifiers.
+
+7) Folder layout (monorepo-friendly)
+
+auth/
+  src/
+    api/                # FastAPI routers (auth, mfa, oauth, orgs, admin)
+    services/           # business logic (tokens, mailer, providers, mfa)
+    models/             # SQLAlchemy models
+    schemas/            # pydantic request/response
+    security/           # hashers, csrf, cors, ratelimit, risk
+    integrations/       # email, sms(optional), oauth clients
+    workers/            # background jobs (emails, cleanup)
+  migrations/           # Alembic
+  tests/
+    unit/
+    integration/
+    e2e/
+  infra/
+    docker/compose.yml  # postgres, redis, mailhog
+    k8s/                # manifests or helm chart (later)
+  scripts/
+  .env.example
+  README.md
+
+8) Frontend pages (Vite + React + Tailwind + shadcn/ui)
+
+    /auth/login (password, social buttons, “use magic link”)
+
+    /auth/register (password strength, policy tips)
+
+    /auth/verify-email (token handler + “resend”)
+
+    /auth/magic-link (request & consumed)
+
+    /auth/mfa/setup (QR + code entry + backup codes download)
+
+    /auth/mfa/verify (during step-up)
+
+    /auth/recovery (forgot/ reset)
+
+    /account (profile)
+
+    /account/security (password change, MFA status, backup codes)
+
+    /account/sessions (list + revoke)
+
+    /orgs/:id/invite (invite form)
+
+    /admin/users, /admin/audit (restricted)
+
+Use shadcn/ui for cards, forms, toasts, dialogs; client-side form validation (zod + react-hook-form). Always show role & org context in the topbar.
+9) Email templates you need on day one
+
+    Verify email
+
+    Welcome
+
+    Password reset request
+
+    Password changed confirmation (security notice)
+
+    New sign-in from a new device/location
+
+    Organisation invite
+
+    Invite accepted
+    Keep them short, include device/IP/time, and provide a “not you?” link.
+
+10) DevOps, environments, and secrets
+
+Env keys (.env.example):
+
+APP_ENV=dev
+API_URL=http://localhost:8000
+WEB_URL=http://localhost:5173
+
+DB_URL=postgresql+psycopg://granada:granada@db:5432/granada_auth
+REDIS_URL=redis://cache:6379/0
+
+JWT_ISS=granada.auth
+JWT_AUD=granada-web,granada-api
+ACCESS_TOKEN_TTL_MIN=10
+REFRESH_TOKEN_TTL_DAYS=60
+TOKEN_ROTATION=true
+
+ARGON2_MEMORY=65536
+ARGON2_TIME=3
+ARGON2_PARALLELISM=2
+
+EMAIL_FROM=noreply@granada.example
+SMTP_HOST=mailhog
+SMTP_PORT=1025
+SMTP_USER=
+SMTP_PASS=
+
+OAUTH_GOOGLE_CLIENT_ID=...
+OAUTH_GOOGLE_CLIENT_SECRET=...
+OAUTH_GITHUB_CLIENT_ID=...
+OAUTH_GITHUB_CLIENT_SECRET=...
+
+CSRF_SECRET=...
+COOKIE_DOMAIN=.granada.local
+
+Local compose: Postgres, Redis, Mailhog.
+Migrations: Alembic on deploy.
+CI/CD: run pytest -q, ruff/black, mypy, OWASP dependency check, then build & push container.
+Runtime: health checks, readiness probes, rolling deploy, DB migrations gated.
+11) Testing strategy (don’t skip)
+
+Unit: token mint/verify, password hashing, rate-limit logic, MFA verification.
+Integration: happy-paths and edge cases for login, refresh rotation (including reuse), invite accept, role checks.
+E2E (Playwright): full flows—register → verify → login → enable MFA → logout → login with MFA; invite → accept → role-based access.
+12) Authorisation model (clean, evolvable)
+
+Use RBAC with permission keys, e.g., org:read, org:invite, user:read, user:write, billing:view, journal:manage (adapt to Granada modules). Tokens carry roles and a permissions_hash. On role changes, increment a policy version so existing sessions must fetch a fresh access token (or you can enforce on refresh).
+13) Risk & fraud signals (simple but effective)
+
+Score sign-ins using IP reputation, geo change, UA change, time-of-day anomalies. If score is high → require step-up MFA even if the route normally wouldn’t.
+14) SSO (phase-2, optional)
+
+Add OIDC for enterprise tenants and SAML 2.0 if requested. Keep a clean abstraction now (providers table, claims mapping) so adding SAML later is a small diff.
+15) Privacy & lifecycle
+
+Data minimisation (store what is needed only), configurable retention for logs (e.g., 180 days), Delete account flow with soft-delete window (30 days), and Export my data download (JSON).
+16) What to implement first (practical order of work)
+
+    Data model + migrations → 2) Register/verify/login/password reset → 3) Access/refresh rotation + reuse detection → 4) Org/membership/roles → 5) MFA (TOTP first) → 6) Social login (Google) → 7) Sessions/device management → 8) Admin console → 9) WebAuthn → 10) Magic links.
