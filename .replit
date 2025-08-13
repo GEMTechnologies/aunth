@@ -2,6 +2,7 @@ modules = ["nodejs-20", "python-3.12", "web"]
 
 [nix]
 channel = "stable-25_05"
+packages = ["libxcrypt"]
 
 [workflows]
 runButton = "Full Stack Dev"
