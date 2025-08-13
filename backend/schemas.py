@@ -149,3 +149,33 @@ class OrgRead(BaseModel):
 class ErrorResponse(BaseModel):
     detail: str
     error_code: Optional[str] = None
+
+# Context management schemas
+class UserContextResponse(BaseModel):
+    type: str
+    product: Optional[str] = None
+    role: Optional[str] = None
+    org_id: Optional[str] = None
+    org_slug: Optional[str] = None
+    org_name: Optional[str] = None
+
+class UserContextsResponse(BaseModel):
+    last_active_context: Optional[Dict[str, Any]] = None
+    contexts: List[UserContextResponse]
+
+class SetContextRequest(BaseModel):
+    context: Dict[str, Any]
+
+class ContextResolutionResponse(BaseModel):
+    action: str  # redirect, show_picker, show_product_picker
+    context: Optional[Dict[str, Any]] = None
+    url: Optional[str] = None
+    contexts: Optional[List[UserContextResponse]] = None
+    product: Optional[str] = None
+
+class RegisterWithIntentRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=8)
+    full_name: Optional[str] = Field(None, max_length=255)
+    locale: str = Field("en", max_length=10)
+    intent: str = Field(..., description="Registration intent: student, ngo, business, etc.")

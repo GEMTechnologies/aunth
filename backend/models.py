@@ -20,6 +20,8 @@ class User(Base):
     locale: Mapped[str] = mapped_column(String(10), default="en")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     status: Mapped[str] = mapped_column(String(20), default="active")  # active, suspended, deleted
+    last_active_context: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # Store user's last active context
+    registration_intent: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # student, ngo, business, etc.
 
     # Relationships
     emails: Mapped[List["Email"]] = relationship("Email", back_populates="user", foreign_keys="Email.user_id")
@@ -237,6 +239,23 @@ class SAMLAssertion(Base):
     # Relationships
     user: Mapped["User"] = relationship("User")
     provider: Mapped["SAMLProvider"] = relationship("SAMLProvider")
+
+class UserContext(Base):
+    """Track available contexts/workspaces for users"""
+    __tablename__ = "user_contexts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    context_type: Mapped[str] = mapped_column(String(50), nullable=False)  # student, org
+    org_id: Mapped[Optional[str]] = mapped_column(ForeignKey("organisations.id"), nullable=True)
+    product: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # ngos, business, jobs
+    role: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    # Relationships
+    user: Mapped["User"] = relationship("User")
+    organisation: Mapped[Optional["Organisation"]] = relationship("Organisation")
 
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)

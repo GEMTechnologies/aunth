@@ -14,6 +14,7 @@ from .security import (
     hash_token, generate_verification_token, generate_device_id, SecurityManager
 )
 from .config import settings
+from .context_service import ContextService
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,7 @@ class AuthService:
     """Authentication service with comprehensive user management"""
     
     @staticmethod
-    def register_user(db: Session, payload: schemas.UserCreate, ip_address: str = "127.0.0.1") -> models.User:
+    def register_user(db: Session, payload: schemas.UserCreate, ip_address: str = "127.0.0.1", intent: Optional[str] = None) -> models.User:
         """Register new user with email and password"""
         try:
             # Check password strength
@@ -36,7 +37,8 @@ class AuthService:
             user = models.User(
                 display_name=payload.full_name or payload.email.split('@')[0],
                 locale="en",
-                status="active"
+                status="active",
+                registration_intent=intent
             )
             db.add(user)
             db.flush()  # Get user ID
@@ -62,6 +64,11 @@ class AuthService:
             )
             db.add(password_cred)
             
+            # Create context based on intent
+            if intent == "student":
+                ContextService.create_student_context(db, user.id)
+            # For NGO/business intents, context will be created when org is created
+            
             # Create audit log
             audit_log = models.AuditLog(
                 user_id=user.id,
@@ -69,7 +76,8 @@ class AuthService:
                 ip=ip_address,
                 payload_json={
                     "email": payload.email,
-                    "registration_method": "email_password"
+                    "registration_method": "email_password",
+                    "intent": intent
                 }
             )
             db.add(audit_log)

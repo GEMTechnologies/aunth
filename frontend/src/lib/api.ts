@@ -100,12 +100,45 @@ export const apiMe = async () => {
   return response.data;
 };
 
-export async function apiRefresh(refresh_token: string): Promise<AuthResponse> {
-  const response = await axios.post(`${AUTH_URL}/api/v1/auth/refresh`, {}, {
-    headers: { Authorization: `Bearer ${refresh_token}` }
+export const apiRefresh = async (): Promise<AuthResponse> => {
+  const refreshToken = localStorage.getItem('refresh_token');
+  if (!refreshToken) {
+    throw new Error('No refresh token available');
+  }
+
+  const response = await api.post('/auth/refresh', {
+    refresh_token: refreshToken
+  });
+
+  return response.data;
+};
+
+// Context management
+export const apiGetContexts = async () => {
+  const response = await api.get('/me/contexts');
+  return response.data;
+};
+
+export const apiSetLastContext = async (context: any) => {
+  const response = await api.post('/me/last-context', { context });
+  return response.data;
+};
+
+export const apiResolveContext = async (redirectUri?: string) => {
+  const params = redirectUri ? `?redirect_uri=${encodeURIComponent(redirectUri)}` : '';
+  const response = await api.get(`/me/resolve-context${params}`);
+  return response.data;
+};
+
+export const apiRegisterWithIntent = async (email: string, password: string, fullName: string, intent: string): Promise<AuthResponse> => {
+  const response = await api.post('/auth/register-with-intent', {
+    email,
+    password,
+    full_name: fullName,
+    intent
   });
   return response.data;
-}
+};
 
 export async function apiLogout() {
   const refreshToken = localStorage.getItem('refresh_token');

@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect } from 'react';
 import AuthPage from './pages/AuthPage';
 import ProfilePage from './pages/ProfilePage';
@@ -6,6 +5,10 @@ import OrganizationPage from './pages/OrganizationPage';
 import SecurityPage from './pages/SecurityPage';
 import { apiMe } from './lib/api';
 import './index.css';
+
+// Assume these components are defined elsewhere and handle context selection and routing
+import ContextRouter from './components/ContextRouter'; // Placeholder for ContextRouter component
+import ContextPicker from './components/ContextPicker'; // Placeholder for ContextPicker component
 
 type Page = 'auth' | 'profile' | 'organizations' | 'security';
 
@@ -25,6 +28,8 @@ function App() {
   const [currentPage, setCurrentPage] = useState<Page>('auth');
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [currentContext, setCurrentContext] = useState<any>(null);
+  const [showContextRouter, setShowContextRouter] = useState(false);
 
   useEffect(() => {
     checkAuth();
@@ -52,7 +57,7 @@ function App() {
 
   const handleLogin = (userData: User) => {
     setUser(userData);
-    setCurrentPage('profile');
+    setShowContextRouter(true);
   };
 
   const handleLogout = () => {
@@ -60,6 +65,13 @@ function App() {
     localStorage.removeItem('refresh_token');
     setUser(null);
     setCurrentPage('auth');
+    setCurrentContext(null); // Reset context on logout
+    setShowContextRouter(false); // Hide context router on logout
+  };
+
+  const handleContextResolved = (context: any) => {
+    setCurrentContext(context);
+    setShowContextRouter(false);
   };
 
   if (loading) {
@@ -77,6 +89,12 @@ function App() {
     return <AuthPage onLogin={handleLogin} />;
   }
 
+  // Render ContextPicker if user is logged in and context needs to be selected
+  if (showContextRouter && user) {
+    return <ContextPicker user={user} onContextResolved={handleContextResolved} />;
+  }
+
+  // Render main application if context is resolved or not needed
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Navigation */}
@@ -130,9 +148,16 @@ function App() {
 
       {/* Page Content */}
       <main className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
-        {currentPage === 'profile' && <ProfilePage user={user} onUserUpdate={setUser} />}
-        {currentPage === 'organizations' && <OrganizationPage />}
-        {currentPage === 'security' && <SecurityPage user={user} />}
+        {/* Render ContextRouter if a context is selected, otherwise render the specific page */}
+        {currentContext ? (
+          <ContextRouter currentContext={currentContext} user={user} />
+        ) : (
+          <>
+            {currentPage === 'profile' && <ProfilePage user={user} onUserUpdate={setUser} />}
+            {currentPage === 'organizations' && <OrganizationPage />}
+            {currentPage === 'security' && <SecurityPage user={user} />}
+          </>
+        )}
       </main>
     </div>
   );
