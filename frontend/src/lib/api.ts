@@ -69,10 +69,26 @@ export async function apiLogin(email: string, password: string): Promise<AuthRes
   return response.data;
 }
 
-export async function apiRegister(email: string, password: string, full_name?: string): Promise<AuthResponse> {
-  const response = await api.post('/auth/register', { email, password, full_name });
-  return response.data;
-}
+export const apiRegister = async (email: string, password: string, displayName: string = '') => {
+  const response = await fetch(`${API_BASE_URL}/auth/register`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      email,
+      password,
+      display_name: displayName,
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || 'Registration failed');
+  }
+
+  return response.json();
+};
 
 export const apiMe = async () => {
   const token = localStorage.getItem('access_token');

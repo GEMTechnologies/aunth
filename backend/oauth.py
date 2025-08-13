@@ -1,6 +1,6 @@
-
 from typing import Optional, Dict, Any, List
-from fastapi import HTTPException, status
+from fastapi import HTTPException, status, Depends, APIRouter
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 import httpx
 import secrets
@@ -9,40 +9,44 @@ import logging
 
 from . import models, schemas
 from .config import settings
-from .security import generate_secure_token
+from .security import generate_secure_token, create_access_token, create_refresh_token
+from .database import get_db
+from .models import User, OAuthState, OAuthAccount, AuditLog
 
 logger = logging.getLogger(__name__)
 
+router = APIRouter()
+
 class OAuthProvider:
     """Base OAuth provider class"""
-    
+
     def __init__(self, client_id: str, client_secret: str, redirect_uri: str):
         self.client_id = client_id
         self.client_secret = client_secret
         self.redirect_uri = redirect_uri
-    
+
     async def get_authorization_url(self, state: str) -> str:
         """Generate OAuth authorization URL"""
         raise NotImplementedError
-    
+
     async def exchange_code(self, code: str, state: str) -> Dict[str, Any]:
         """Exchange authorization code for tokens"""
         raise NotImplementedError
-    
+
     async def get_user_info(self, access_token: str) -> Dict[str, Any]:
         """Get user info from OAuth provider"""
         raise NotImplementedError
 
 class GoogleOAuthProvider(OAuthProvider):
     """Google OAuth 2.0 provider"""
-    
+
     def __init__(self, client_id: str, client_secret: str, redirect_uri: str):
         super().__init__(client_id, client_secret, redirect_uri)
         self.auth_url = "https://accounts.google.com/o/oauth2/v2/auth"
         self.token_url = "https://oauth2.googleapis.com/token"
         self.user_info_url = "https://www.googleapis.com/oauth2/v2/userinfo"
         self.scope = "openid email profile"
-    
+
     async def get_authorization_url(self, state: str) -> str:
         """Generate Google OAuth authorization URL"""
         params = {
@@ -54,10 +58,10 @@ class GoogleOAuthProvider(OAuthProvider):
             "access_type": "offline",
             "prompt": "consent"
         }
-        
+
         query_string = "&".join([f"{k}={v}" for k, v in params.items()])
         return f"{self.auth_url}?{query_string}"
-    
+
     async def exchange_code(self, code: str, state: str) -> Dict[str, Any]:
         """Exchange authorization code for Google tokens"""
         data = {
@@ -67,36 +71,38 @@ class GoogleOAuthProvider(OAuthProvider):
             "grant_type": "authorization_code",
             "redirect_uri": self.redirect_uri
         }
-        
+
         async with httpx.AsyncClient() as client:
             response = await client.post(self.token_url, data=data)
-            
+
             if response.status_code != 200:
+                logger.error(f"Google token exchange failed: {response.status_code} - {response.text}")
                 raise HTTPException(
-                    status_code=400, 
-                    detail="Failed to exchange authorization code"
+                    status_code=400,
+                    detail="Failed to exchange authorization code with Google"
                 )
-            
+
             return response.json()
-    
+
     async def get_user_info(self, access_token: str) -> Dict[str, Any]:
         """Get user info from Google"""
         headers = {"Authorization": f"Bearer {access_token}"}
-        
+
         async with httpx.AsyncClient() as client:
             response = await client.get(self.user_info_url, headers=headers)
-            
+
             if response.status_code != 200:
+                logger.error(f"Google user info retrieval failed: {response.status_code} - {response.text}")
                 raise HTTPException(
-                    status_code=400, 
+                    status_code=400,
                     detail="Failed to get user info from Google"
                 )
-            
+
             return response.json()
 
 class GitHubOAuthProvider(OAuthProvider):
     """GitHub OAuth provider"""
-    
+
     def __init__(self, client_id: str, client_secret: str, redirect_uri: str):
         super().__init__(client_id, client_secret, redirect_uri)
         self.auth_url = "https://github.com/login/oauth/authorize"
@@ -104,7 +110,7 @@ class GitHubOAuthProvider(OAuthProvider):
         self.user_info_url = "https://api.github.com/user"
         self.user_email_url = "https://api.github.com/user/emails"
         self.scope = "user:email"
-    
+
     async def get_authorization_url(self, state: str) -> str:
         """Generate GitHub OAuth authorization URL"""
         params = {
@@ -114,10 +120,10 @@ class GitHubOAuthProvider(OAuthProvider):
             "state": state,
             "allow_signup": "true"
         }
-        
+
         query_string = "&".join([f"{k}={v}" for k, v in params.items()])
         return f"{self.auth_url}?{query_string}"
-    
+
     async def exchange_code(self, code: str, state: str) -> Dict[str, Any]:
         """Exchange authorization code for GitHub tokens"""
         data = {
@@ -125,53 +131,61 @@ class GitHubOAuthProvider(OAuthProvider):
             "client_secret": self.client_secret,
             "code": code
         }
-        
+
         headers = {"Accept": "application/json"}
-        
+
         async with httpx.AsyncClient() as client:
             response = await client.post(self.token_url, data=data, headers=headers)
-            
+
             if response.status_code != 200:
+                logger.error(f"GitHub token exchange failed: {response.status_code} - {response.text}")
                 raise HTTPException(
-                    status_code=400, 
-                    detail="Failed to exchange authorization code"
+                    status_code=400,
+                    detail="Failed to exchange authorization code with GitHub"
                 )
-            
+
             return response.json()
-    
+
     async def get_user_info(self, access_token: str) -> Dict[str, Any]:
         """Get user info from GitHub"""
         headers = {
             "Authorization": f"token {access_token}",
             "Accept": "application/vnd.github.v3+json"
         }
-        
+
         async with httpx.AsyncClient() as client:
             # Get user profile
             user_response = await client.get(self.user_info_url, headers=headers)
             if user_response.status_code != 200:
+                logger.error(f"GitHub user profile retrieval failed: {user_response.status_code} - {user_response.text}")
                 raise HTTPException(
-                    status_code=400, 
+                    status_code=400,
                     detail="Failed to get user info from GitHub"
                 )
-            
+
             user_data = user_response.json()
-            
+
             # Get user emails
             email_response = await client.get(self.user_email_url, headers=headers)
             if email_response.status_code == 200:
                 emails = email_response.json()
                 primary_email = next(
-                    (email["email"] for email in emails if email["primary"]), 
+                    (email["email"] for email in emails if email["primary"]),
                     user_data.get("email")
                 )
                 user_data["email"] = primary_email
-            
+            elif user_data.get("email") is None:
+                 logger.error(f"GitHub email retrieval failed and no primary email found in profile: {email_response.status_code} - {email_response.text}")
+                 raise HTTPException(
+                    status_code=400,
+                    detail="Failed to retrieve primary email from GitHub"
+                 )
+
             return user_data
 
 class OAuthService:
     """OAuth authentication service"""
-    
+
     def __init__(self):
         self.providers = {
             "google": GoogleOAuthProvider(
@@ -185,23 +199,23 @@ class OAuthService:
                 redirect_uri=f"{settings.api_url}/auth/oauth/github/callback"
             )
         }
-    
+
     def get_provider(self, provider_name: str) -> OAuthProvider:
         """Get OAuth provider by name"""
         if provider_name not in self.providers:
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail=f"Unsupported OAuth provider: {provider_name}"
             )
         return self.providers[provider_name]
-    
+
     async def initiate_oauth_flow(self, provider_name: str, db: Session) -> Dict[str, str]:
         """Initiate OAuth flow"""
         provider = self.get_provider(provider_name)
-        
+
         # Generate state token
         state = generate_secure_token(32)
-        
+
         # Store state in database for validation
         oauth_state = models.OAuthState(
             state=state,
@@ -210,24 +224,24 @@ class OAuthService:
         )
         db.add(oauth_state)
         db.commit()
-        
+
         # Get authorization URL
         auth_url = await provider.get_authorization_url(state)
-        
+
         return {
             "authorization_url": auth_url,
             "state": state
         }
-    
+
     async def handle_oauth_callback(
-        self, 
-        provider_name: str, 
-        code: str, 
-        state: str, 
+        self,
+        provider_name: str,
+        code: str,
+        state: str,
         db: Session
-    ) -> models.User:
+    ) -> RedirectResponse:
         """Handle OAuth callback and create/login user"""
-        
+
         # Validate state
         oauth_state = db.query(models.OAuthState).filter(
             models.OAuthState.state == state,
@@ -235,96 +249,129 @@ class OAuthService:
             models.OAuthState.used_at.is_(None),
             models.OAuthState.expires_at > datetime.now(timezone.utc)
         ).first()
-        
+
         if not oauth_state:
-            raise HTTPException(status_code=400, detail="Invalid or expired state")
-        
+            logger.warning(f"Invalid or expired state received for provider: {provider_name}, state: {state}")
+            return RedirectResponse(url=f"{settings.FRONTEND_URL}?error=Invalid or expired state")
+
         # Mark state as used
         oauth_state.used_at = datetime.now(timezone.utc)
-        
+        db.commit() # Commit state usage immediately
+
         provider = self.get_provider(provider_name)
-        
+
         # Exchange code for tokens
-        token_data = await provider.exchange_code(code, state)
+        try:
+            token_data = await provider.exchange_code(code, state)
+        except HTTPException as e:
+            logger.error(f"Error during token exchange for {provider_name}: {e.detail}")
+            return RedirectResponse(url=f"{settings.FRONTEND_URL}?error={e.detail}")
+        except Exception as e:
+            logger.error(f"Unexpected error during token exchange for {provider_name}: {e}")
+            return RedirectResponse(url=f"{settings.FRONTEND_URL}?error=An unexpected error occurred during authentication.")
+
+
         access_token = token_data.get("access_token")
-        
+
         if not access_token:
-            raise HTTPException(status_code=400, detail="Failed to get access token")
-        
+            logger.error(f"Access token not found in response from {provider_name}: {token_data}")
+            return RedirectResponse(url=f"{settings.FRONTEND_URL}?error=Failed to retrieve access token.")
+
         # Get user info
-        user_info = await provider.get_user_info(access_token)
-        
+        try:
+            user_info = await provider.get_user_info(access_token)
+        except HTTPException as e:
+            logger.error(f"Error retrieving user info from {provider_name}: {e.detail}")
+            return RedirectResponse(url=f"{settings.FRONTEND_URL}?error={e.detail}")
+        except Exception as e:
+            logger.error(f"Unexpected error retrieving user info from {provider_name}: {e}")
+            return RedirectResponse(url=f"{settings.FRONTEND_URL}?error=An unexpected error occurred while fetching user information.")
+
+
         # Find or create user
         user = await self._find_or_create_oauth_user(
             db, provider_name, user_info, token_data
         )
-        
-        db.commit()
-        return user
-    
+
+        db.commit() # Commit user creation/update
+
+        # Create JWT tokens
+        jwt_access_token = create_access_token(data={"sub": str(user.id)})
+        jwt_refresh_token = create_refresh_token(data={"sub": str(user.id)})
+
+        # Redirect to frontend with tokens
+        redirect_url = f"{settings.FRONTEND_URL}?access_token={jwt_access_token}&refresh_token={jwt_refresh_token}"
+        return RedirectResponse(url=redirect_url)
+
     async def _find_or_create_oauth_user(
-        self, 
-        db: Session, 
-        provider_name: str, 
+        self,
+        db: Session,
+        provider_name: str,
         user_info: Dict[str, Any],
         token_data: Dict[str, Any]
     ) -> models.User:
         """Find existing user or create new one from OAuth data"""
-        
+
         provider_user_id = str(user_info.get("id"))
         email = user_info.get("email")
-        
+
         if not email:
+            logger.error(f"Email missing from user_info for provider {provider_name}: {user_info}")
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail="Email not provided by OAuth provider"
             )
-        
+
         # Check for existing OAuth connection
         oauth_account = db.query(models.OAuthAccount).filter(
             models.OAuthAccount.provider == provider_name,
             models.OAuthAccount.provider_user_id == provider_user_id
         ).first()
-        
+
         if oauth_account:
-            # Update tokens
+            # Update tokens and provider data
             oauth_account.access_token = token_data.get("access_token")
             oauth_account.refresh_token = token_data.get("refresh_token")
             oauth_account.token_expires_at = self._calculate_token_expiry(token_data)
+            oauth_account.provider_data = user_info # Update provider data
             oauth_account.last_login_at = datetime.now(timezone.utc)
-            
+            logger.info(f"Updated existing OAuth account for user ID: {oauth_account.user_id}, provider: {provider_name}")
             return oauth_account.user
-        
+
         # Check for existing user by email
         email_obj = db.query(models.Email).filter(
             models.Email.email == email.lower().strip()
         ).first()
-        
+
         if email_obj:
             # Link OAuth account to existing user
             user = email_obj.user
+            logger.info(f"Linking OAuth account to existing user ID: {user.id} via email: {email}")
         else:
             # Create new user
+            display_name = user_info.get("name") or user_info.get("login") or email.split("@")[0]
             user = models.User(
-                display_name=user_info.get("name") or user_info.get("login") or email.split("@")[0],
-                locale="en",
+                display_name=display_name,
+                locale="en", # Default locale, can be updated later if provider sends it
                 status="active"
             )
             db.add(user)
-            db.flush()
-            
+            db.flush() # Flush to get user.id before creating email and OAuthAccount
+
+            logger.info(f"Created new user with ID: {user.id}, display name: {display_name}")
+
             # Create email
             email_obj = models.Email(
                 user_id=user.id,
                 email=email.lower().strip(),
-                is_verified=True,  # OAuth emails are pre-verified
+                is_verified=True,  # OAuth emails are generally considered pre-verified
                 is_primary=True
             )
             db.add(email_obj)
-            db.flush()
-            
-            user.primary_email_id = email_obj.id
-        
+            db.flush() # Flush to get email_obj.id
+
+            user.primary_email_id = email_obj.id # Set primary email
+
         # Create OAuth account link
         oauth_account = models.OAuthAccount(
             user_id=user.id,
@@ -336,27 +383,71 @@ class OAuthService:
             provider_data=user_info
         )
         db.add(oauth_account)
-        
+
         # Create audit log
         audit_log = models.AuditLog(
             user_id=user.id,
-            event="oauth.account_linked",
+            event="oauth.account_linked", # or "oauth.login_success" if user existed
             payload_json={
                 "provider": provider_name,
                 "provider_user_id": provider_user_id,
-                "email": email
+                "email": email,
+                "new_user_created": email_obj.user_id == user.id and not oauth_account.user_id == user.id # A bit complex, better to have a flag
             }
         )
         db.add(audit_log)
-        
+        logger.info(f"Created OAuth account link for user ID: {user.id}, provider: {provider_name}, provider user ID: {provider_user_id}")
+
         return user
-    
+
     def _calculate_token_expiry(self, token_data: Dict[str, Any]) -> Optional[datetime]:
         """Calculate token expiry from OAuth response"""
         expires_in = token_data.get("expires_in")
         if expires_in:
-            return datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
+            try:
+                return datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
+            except ValueError:
+                logger.warning(f"Could not convert expires_in to int: {expires_in}")
         return None
 
 # Global OAuth service instance
 oauth_service = OAuthService()
+
+@router.get("/auth/initiate/{provider}")
+async def initiate_oauth(provider: str, db: Session = Depends(get_db)):
+    """Initiate OAuth flow for a given provider"""
+    try:
+        result = await oauth_service.initiate_oauth_flow(provider, db)
+        return result
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error initiating OAuth flow for {provider}: {e}")
+        raise HTTPException(status_code=500, detail="An internal error occurred during OAuth initiation.")
+
+
+@router.get("/auth/oauth/{provider}/callback")
+async def oauth_callback(
+    provider: str,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Handle OAuth callback and create/login user"""
+    if error:
+        logger.error(f"OAuth callback error for {provider}: {error}")
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}?error={error}")
+
+    if not code or not state:
+        logger.error(f"Missing code or state in OAuth callback for {provider}")
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}?error=Authentication parameters missing")
+
+    try:
+        return await oauth_service.handle_oauth_callback(provider, code, state, db)
+    except HTTPException as e:
+        logger.error(f"HTTP Exception during OAuth callback for {provider}: {e.detail}")
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}?error={e.detail}")
+    except Exception as e:
+        logger.exception(f"Unexpected error during OAuth callback for {provider}") # Log the full traceback
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}?error=An unexpected error occurred during authentication.")

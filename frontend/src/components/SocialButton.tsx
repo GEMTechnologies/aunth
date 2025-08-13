@@ -66,6 +66,9 @@ const SocialButton: React.FC<SocialButtonProps> = ({ provider, onClick, disabled
       window.location.href = authorization_url;
     } catch (error) {
       console.error(`OAuth login failed for ${provider}:`, error);
+      // Fallback: redirect directly to backend OAuth endpoint
+      const backendUrl = 'http://localhost:8000'; // or your backend URL
+      window.location.href = `${backendUrl}/auth/${provider}`;
     }
   };
 
