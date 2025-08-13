@@ -1,0 +1,170 @@
+Here’s a clean, deterministic way your shared Auth + independent services should behave for registration, login, and routing—covering Student, NGO, and the case where a user has multiple services.
+1) How a person who registers as Student “ends up in Student”
+
+When the person chooses Student during sign-up, the Auth service records intent=student and emits UserRegistered. Your Academia service (student domain) consumes that event and creates a Student profile for the user_id, then your Policy service assigns the student role and entitlements. Two small pieces make the landing deterministic:
+
+    Last active context
+    After first successful sign-in (and email verify if required), set:
+
+    users.last_active_context = { type: "student" }
+
+    Keep this in Auth (or a tiny Profile service) so it’s available at login.
+
+    Student landing route
+    The gateway (or frontend after /me/contexts) checks last_active_context. If it’s {type:"student"}, redirect to the Student app:
+
+        Subdomain pattern: https://academia.granada.tld/app
+
+        Or monolith path: https://app.granada.tld/student
+
+Result: a new Student always lands on the Student dashboard immediately after sign-up and on the next login, unless they later pick a different workspace.
+2) If a person registers as NGO (owner or invitee), how do they land in the NGO space later?
+
+During NGO creation or invite acceptance, persist an org membership row and set:
+
+users.last_active_context = { type: "org", org_id: "<org_123>", role: "ngo_owner" | "ngo_staff" }
+
+On the next login, your gateway resolves this context and redirects to the NGO app:
+
+    Subdomain per product: https://ngos.granada.tld/<org-slug>/dashboard
+
+    Or path: https://app.granada.tld/orgs/<org-slug>
+
+If the user follows a deep link (e.g., an email to a specific NGO page), the gateway honours that link if the token claims allow access; otherwise it returns a safe 403 and offers the context picker.
+3) When a user belongs to several services (Student, NGO, Business, Jobs)
+
+Treat each distinct place they can “be” as a context. Examples:
+
+    { type: "student" }
+
+    { type: "org", org_id: "org_123", role: "ngo_owner" }
+
+    { type: "org", org_id: "org_777", role: "business_staff" }
+
+On login, resolve the landing deterministically using this Context Resolution Algorithm:
+
+A. Honour explicit destination
+If the request has an approved redirect_uri or the user hit a product subdomain (e.g., academia. or ngos.), route there if the user has access to a matching context.
+If the subdomain says ngos. but the user has multiple NGOs, open that NGO chooser (org list under the NGO product).
+
+B. Use last active context
+If no explicit destination, and last_active_context is still valid, route to it.
+
+C. Single available context
+If exactly one context is available, route to it.
+
+D. Multiple contexts
+Open a Workspace Picker that lists:
+
+    “Student (Academia)”
+
+    “<NGO Name> (NGOs)”
+
+    “<Business Name> (Business)”
+    …and let the user set “Make this my default”. Persist the choice to last_active_context.
+
+E. If a remembered context is no longer valid
+(E.g., user removed from an NGO.) Drop to the picker and clear last_active_context.
+4) Minimal data and APIs to make this work
+
+Auth (or Profile) stores:
+
+    users.last_active_context (JSON): e.g., {"type":"org","org_id":"org_123"}
+
+    Optional users.last_product if you want a product-level default separate from org.
+
+Auth exposes:
+
+    GET /me/contexts → returns all resolvable contexts for the user:
+
+    {
+      "last_active_context": {"type":"org","org_id":"org_123"},
+      "contexts": [
+        {"type":"student"},
+        {"type":"org","org_id":"org_123","product":"ngos","org_slug":"acacia-foundation","role":"ngo_owner"},
+        {"type":"org","org_id":"org_777","product":"business","org_slug":"moyo-trading","role":"business_staff"}
+      ]
+    }
+
+    POST /me/last-context → body = a context object. Validates ownership and saves it.
+
+JWT claims (short-lived access token):
+
+    sub, sid, iss, aud
+
+    roles and ent (entitlements)
+
+    org (current org context, nullable for student)
+
+    ver (policy version; forces refresh when permissions change)
+
+Note: the current org goes into the JWT only when the user is in an org context. For pure Student, org is null and the Academia app authorises by roles/ent alone.
+5) Gateway/router logic (concise pseudo-code)
+
+// login-complete handler (after token issued/refreshed)
+const q = parseQuery(req);
+const host = req.hostname;               // e.g., academia.granada.tld
+const meta = await GET('/me/contexts');  // from Auth
+const target = resolveContext({ host, redirect: q.redirect_uri, meta });
+
+if (!target) return showPicker(meta); // multiple contexts or mismatch
+
+// Persist chosen context if it changed
+if (!equal(meta.last_active_context, target.ctx)) {
+  await POST('/me/last-context', target.ctx);
+}
+
+// Mint/refetch access token bound to org if ctx.type === 'org'
+await ensureTokenContext(target.ctx);
+
+// Send 302 to the computed URL
+return redirect(target.url);
+
+// ---
+function resolveContext({ host, redirect, meta }) {
+  // A) explicit deep link (validated against allowlist)
+  if (redirect && userHasRights(meta, redirect)) return { ctx: ctxFor(redirect, meta), url: redirect };
+
+  // subdomain hint
+  const product = subdomainToProduct(host); // academia|ngos|business|jobs|null
+  if (product) {
+    const matches = contextsForProduct(meta.contexts, product);
+    if (matches.length === 1) return { ctx: matches[0], url: urlFor(matches[0]) };
+    if (matches.length > 1)  return null; // open product-specific chooser
+  }
+
+  // B) last active context
+  if (meta.last_active_context && stillValid(meta)) return { ctx: meta.last_active_context, url: urlFor(meta.last_active_context) };
+
+  // C) only one context overall
+  if (meta.contexts.length === 1) return { ctx: meta.contexts[0], url: urlFor(meta.contexts[0]) };
+
+  // D) multiple — force picker
+  return null;
+}
+
+6) Examples that cover your three questions
+
+A. “Registers as Student—how do they end up in Student?”
+Registration with intent=student → Student profile created → Policy assigns student role → last_active_context set to {type:"student"} → gateway redirects to academia.* on first run and on subsequent logins unless changed.
+
+B. “Registers as NGO—how will login route them to the NGO platform?”
+On org creation/invite acceptance, set last_active_context = {type:"org", org_id:..., role:...}. On login, gateway sees this and redirects to ngos.*/<org-slug> (or path variant). If the user arrived on ngos.*, that also acts as a product hint.
+
+C. “What if the user has registered for all services?”
+At first login after they have multiple contexts, show a Workspace Picker (Student, each NGO org, each Business org, Jobs). When they click one and tick “make default,” persist it to last_active_context. Future logins jump straight there. They can always switch via a top-bar quick switcher; switching updates context and, if moving into an org, refreshes the token so org in JWT matches the new workspace.
+7) Two small UX touches that remove confusion
+
+    Persistent quick switcher in the top bar showing current context (e.g., “Acacia Foundation • NGOs” or “Student • Academia”).
+
+    Context badge in the JWT viewer (dev tools) or account page so engineers can sanity-check which org/service the token is bound to.
+
+8) Failure and edge cases
+
+    If an NGO membership is revoked, clear last_active_context on the next login and drop the user to the picker.
+
+    If a user hits ngos.* but has no NGO memberships, send them to the picker with an info banner (“No NGO workspaces yet. Create or accept an invite.”).
+
+    If token ver is stale (roles changed), the gateway forces a silent refresh before routing so the claims match the target context.
+
+With this in place, a person who signs up as Student lands in Academia; a person who signs up as NGO lands in the correct NGO workspace; and a person who has several services always lands in their remembered last active context (or a clear picker when there’s ambiguity). The services remain independent, and your shared Auth stays the single source of identity and session truth.
