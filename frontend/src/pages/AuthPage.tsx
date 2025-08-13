@@ -1,4 +1,3 @@
-
 import React, { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { apiLogin, apiRegister, apiMe, apiRefresh } from "../lib/api";
@@ -19,11 +18,11 @@ const Input: React.FC<React.InputHTMLAttributes<HTMLInputElement> & {
 }> = ({ label, error, ...props }) => (
   <div className="space-y-1">
     <label className="block text-sm font-medium text-gray-700">{label}</label>
-    <input 
-      {...props} 
+    <input
+      {...props}
       className={`w-full px-4 py-3 rounded-xl border ${
         error ? 'border-red-300 focus:ring-red-500' : 'border-gray-200 focus:ring-blue-500'
-      } bg-white/80 backdrop-blur-sm shadow-sm focus:outline-none focus:ring-2 focus:border-transparent transition-all duration-200`} 
+      } bg-white/80 backdrop-blur-sm shadow-sm focus:outline-none focus:ring-2 focus:border-transparent transition-all duration-200`}
     />
     {error && <p className="text-sm text-red-600">{error}</p>}
   </div>
@@ -32,11 +31,11 @@ const Input: React.FC<React.InputHTMLAttributes<HTMLInputElement> & {
 const Button: React.FC<React.ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: 'primary' | 'secondary';
 }> = ({ children, variant = 'primary', ...props }) => (
-  <button 
-    {...props} 
+  <button
+    {...props}
     className={`w-full px-4 py-3 rounded-xl font-semibold shadow-sm transition-all duration-200 ${
-      variant === 'primary' 
-        ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700 hover:shadow-lg transform hover:-translate-y-0.5' 
+      variant === 'primary'
+        ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700 hover:shadow-lg transform hover:-translate-y-0.5'
         : 'bg-white text-gray-700 border border-gray-200 hover:bg-gray-50'
     } disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none`}
   />
@@ -62,20 +61,26 @@ const AuthPage: React.FC = () => {
   const [me, setMe] = useState<any>(null);
   const [message, setMessage] = useState<string>("");
 
+  // Placeholder for the onLogin function, assuming it's passed as a prop or defined elsewhere
+  const onLogin = (userData: any) => {
+    console.log("User logged in:", userData);
+    // Potentially navigate to a dashboard or other page
+  };
+
   useEffect(() => {
-    const refresh = localStorage.getItem("refresh");
-    const access = sessionStorage.getItem("access");
+    const refresh = localStorage.getItem("refresh_token"); // Changed from "refresh"
+    const access = localStorage.getItem("access_token"); // Changed from "access" in sessionStorage
     if (access) {
-      apiMe(access).then(setMe).catch(async () => {
+      apiMe().then(setMe).catch(async () => {
         if (refresh) {
           try {
             const t = await apiRefresh(refresh);
-            sessionStorage.setItem("access", t.access_token);
-            setMe(await apiMe(t.access_token));
+            localStorage.setItem("access_token", t.access_token); // Changed from sessionStorage
+            setMe(await apiMe()); // Changed from apiMe(t.access_token)
           } catch {
             // Clear invalid tokens
-            localStorage.removeItem("refresh");
-            sessionStorage.removeItem("access");
+            localStorage.removeItem("refresh_token"); // Changed from "refresh"
+            localStorage.removeItem("access_token"); // Changed from "access"
           }
         }
       });
@@ -84,20 +89,20 @@ const AuthPage: React.FC = () => {
 
   const validateForm = (): boolean => {
     const newErrors: Partial<FormData> = {};
-    
+
     if (!formData.email) newErrors.email = "Email is required";
     else if (!/\S+@\S+\.\S+/.test(formData.email)) newErrors.email = "Email is invalid";
-    
+
     if (!formData.password) newErrors.password = "Password is required";
     else if (formData.password.length < 8) newErrors.password = "Password must be at least 8 characters";
-    
+
     if (mode === "register") {
       if (!formData.fullName) newErrors.fullName = "Full name is required";
       if (formData.password !== formData.confirmPassword) {
         newErrors.confirmPassword = "Passwords don't match";
       }
     }
-    
+
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
@@ -112,22 +117,26 @@ const AuthPage: React.FC = () => {
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setMessage("");
-    
+
     if (!validateForm()) return;
-    
+
     setLoading(true);
     try {
       if (mode === "login") {
         const t = await apiLogin(formData.email, formData.password);
-        sessionStorage.setItem("access", t.access_token);
-        localStorage.setItem("refresh", t.refresh_token);
-        setMe(await apiMe(t.access_token));
+        localStorage.setItem("access_token", t.access_token);
+        localStorage.setItem("refresh_token", t.refresh_token);
+        const userData = await apiMe();
+        setMe(userData);
+        onLogin(userData);
       } else if (mode === "register") {
         await apiRegister(formData.email, formData.password, formData.fullName);
         const t = await apiLogin(formData.email, formData.password);
-        sessionStorage.setItem("access", t.access_token);
-        localStorage.setItem("refresh", t.refresh_token);
-        setMe(await apiMe(t.access_token));
+        localStorage.setItem("access_token", t.access_token);
+        localStorage.setItem("refresh_token", t.refresh_token);
+        const userData = await apiMe();
+        setMe(userData);
+        onLogin(userData);
       } else if (mode === "forgotPassword") {
         // TODO: Implement password reset
         setMessage("Password reset link sent to your email!");
@@ -140,8 +149,8 @@ const AuthPage: React.FC = () => {
   };
 
   const logout = () => {
-    sessionStorage.removeItem("access");
-    localStorage.removeItem("refresh");
+    localStorage.removeItem("access_token"); // Changed from sessionStorage
+    localStorage.removeItem("refresh_token"); // Changed from "refresh"
     setMe(null);
     setFormData({
       email: "",
@@ -162,9 +171,9 @@ const AuthPage: React.FC = () => {
     <div className="min-h-screen bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50 flex items-center justify-center p-4">
       <div className="max-w-7xl w-full grid lg:grid-cols-2 gap-12 items-center">
         {/* Left Column - Branding */}
-        <motion.div 
-          initial={{ opacity: 0, x: -50 }} 
-          animate={{ opacity: 1, x: 0 }} 
+        <motion.div
+          initial={{ opacity: 0, x: -50 }}
+          animate={{ opacity: 1, x: 0 }}
           transition={{ duration: 0.6 }}
           className="text-center lg:text-left space-y-8"
         >
@@ -180,7 +189,7 @@ const AuthPage: React.FC = () => {
               The operating system for impact. Secure, scalable identity management for organizations, students, NGOs, and businesses.
             </p>
           </div>
-          
+
           <div className="space-y-4 text-gray-700">
             <div className="flex items-center space-x-3">
               <div className="w-2 h-2 bg-green-500 rounded-full"></div>
@@ -202,9 +211,9 @@ const AuthPage: React.FC = () => {
         </motion.div>
 
         {/* Right Column - Auth Form */}
-        <motion.div 
-          initial={{ opacity: 0, x: 50 }} 
-          animate={{ opacity: 1, x: 0 }} 
+        <motion.div
+          initial={{ opacity: 0, x: 50 }}
+          animate={{ opacity: 1, x: 0 }}
           transition={{ duration: 0.6, delay: 0.2 }}
           className="w-full max-w-md mx-auto"
         >
@@ -213,18 +222,18 @@ const AuthPage: React.FC = () => {
               <>
                 {/* Mode Switcher */}
                 <div className="flex rounded-xl bg-gray-100 p-1 mb-8">
-                  <button 
+                  <button
                     className={`flex-1 rounded-lg px-4 py-2 font-semibold transition-all ${
                       mode === "login" ? "bg-white shadow-sm text-gray-900" : "text-gray-600"
-                    }`} 
+                    }`}
                     onClick={() => setMode("login")}
                   >
                     Sign In
                   </button>
-                  <button 
+                  <button
                     className={`flex-1 rounded-lg px-4 py-2 font-semibold transition-all ${
                       mode === "register" ? "bg-white shadow-sm text-gray-900" : "text-gray-600"
-                    }`} 
+                    }`}
                     onClick={() => setMode("register")}
                   >
                     Sign Up
@@ -251,48 +260,48 @@ const AuthPage: React.FC = () => {
 
                     {mode === "register" && (
                       <>
-                        <Input 
-                          label="Full Name" 
-                          placeholder="John Doe" 
-                          value={formData.fullName} 
+                        <Input
+                          label="Full Name"
+                          placeholder="John Doe"
+                          value={formData.fullName}
                           onChange={(e) => handleInputChange('fullName', e.target.value)}
                           error={errors.fullName}
                         />
-                        <Input 
-                          label="Organization Name (Optional)" 
-                          placeholder="Acme Inc" 
-                          value={formData.organizationName} 
+                        <Input
+                          label="Organization Name (Optional)"
+                          placeholder="Acme Inc"
+                          value={formData.organizationName}
                           onChange={(e) => handleInputChange('organizationName', e.target.value)}
                         />
                       </>
                     )}
 
-                    <Input 
-                      label="Email" 
-                      type="email" 
-                      placeholder="you@example.com" 
-                      value={formData.email} 
+                    <Input
+                      label="Email"
+                      type="email"
+                      placeholder="you@example.com"
+                      value={formData.email}
                       onChange={(e) => handleInputChange('email', e.target.value)}
                       error={errors.email}
                     />
 
                     {mode !== "forgotPassword" && (
-                      <Input 
-                        label="Password" 
-                        type="password" 
-                        placeholder="••••••••" 
-                        value={formData.password} 
+                      <Input
+                        label="Password"
+                        type="password"
+                        placeholder="••••••••"
+                        value={formData.password}
                         onChange={(e) => handleInputChange('password', e.target.value)}
                         error={errors.password}
                       />
                     )}
 
                     {mode === "register" && (
-                      <Input 
-                        label="Confirm Password" 
-                        type="password" 
-                        placeholder="••••••••" 
-                        value={formData.confirmPassword} 
+                      <Input
+                        label="Confirm Password"
+                        type="password"
+                        placeholder="••••••••"
+                        value={formData.confirmPassword}
                         onChange={(e) => handleInputChange('confirmPassword', e.target.value)}
                         error={errors.confirmPassword}
                       />
@@ -307,9 +316,9 @@ const AuthPage: React.FC = () => {
                     )}
 
                     <Button disabled={loading} type="submit">
-                      {loading ? "Please wait..." : 
-                        mode === "login" ? "Sign In" : 
-                        mode === "register" ? "Create Account" : 
+                      {loading ? "Please wait..." :
+                        mode === "login" ? "Sign In" :
+                        mode === "register" ? "Create Account" :
                         "Send Reset Link"}
                     </Button>
 
@@ -319,18 +328,18 @@ const AuthPage: React.FC = () => {
                           <>
                             <p>
                               Don't have an account?{" "}
-                              <button 
+                              <button
                                 type="button"
-                                className="text-blue-600 font-semibold hover:underline" 
+                                className="text-blue-600 font-semibold hover:underline"
                                 onClick={() => setMode("register")}
                               >
                                 Sign up
                               </button>
                             </p>
                             <p>
-                              <button 
+                              <button
                                 type="button"
-                                className="text-blue-600 font-semibold hover:underline" 
+                                className="text-blue-600 font-semibold hover:underline"
                                 onClick={() => setMode("forgotPassword")}
                               >
                                 Forgot password?
@@ -340,9 +349,9 @@ const AuthPage: React.FC = () => {
                         ) : (
                           <p>
                             Already have an account?{" "}
-                            <button 
+                            <button
                               type="button"
-                              className="text-blue-600 font-semibold hover:underline" 
+                              className="text-blue-600 font-semibold hover:underline"
                               onClick={() => setMode("login")}
                             >
                               Sign in
@@ -354,9 +363,9 @@ const AuthPage: React.FC = () => {
 
                     {mode === "forgotPassword" && (
                       <div className="text-center">
-                        <button 
+                        <button
                           type="button"
-                          className="text-blue-600 font-semibold hover:underline text-sm" 
+                          className="text-blue-600 font-semibold hover:underline text-sm"
                           onClick={() => setMode("login")}
                         >
                           Back to sign in

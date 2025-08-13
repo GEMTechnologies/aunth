@@ -1,4 +1,3 @@
-
 import axios, { AxiosInstance } from 'axios';
 import { AUTH_URL } from '../config';
 
@@ -28,21 +27,21 @@ api.interceptors.response.use(
   (response) => response,
   async (error) => {
     const original = error.config;
-    
+
     if (error.response?.status === 401 && !original._retry) {
       original._retry = true;
-      
+
       const refreshToken = localStorage.getItem('refresh_token');
       if (refreshToken) {
         try {
           const response = await axios.post(`${AUTH_URL}/api/v1/auth/refresh`, {}, {
             headers: { Authorization: `Bearer ${refreshToken}` }
           });
-          
+
           const { access_token, refresh_token } = response.data;
           localStorage.setItem('access_token', access_token);
           localStorage.setItem('refresh_token', refresh_token);
-          
+
           return api(original);
         } catch (refreshError) {
           localStorage.removeItem('access_token');
@@ -52,7 +51,7 @@ api.interceptors.response.use(
         }
       }
     }
-    
+
     return Promise.reject(error);
   }
 );
@@ -68,10 +67,15 @@ export async function apiRegister(email: string, password: string, full_name?: s
   return response.data;
 }
 
-export async function apiMe() {
-  const response = await api.get('/users/me');
+export const apiMe = async () => {
+  const token = localStorage.getItem('access_token');
+  if (!token) throw new Error('No access token');
+
+  const response = await api.get('/me', {
+    headers: { Authorization: `Bearer ${token}` }
+  });
   return response.data;
-}
+};
 
 export async function apiRefresh(refresh_token: string) {
   const response = await axios.post(`${AUTH_URL}/api/v1/auth/refresh`, {}, {
