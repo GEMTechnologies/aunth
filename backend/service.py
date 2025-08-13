@@ -161,6 +161,7 @@ class OrganizationService:
         org = models.Organisation(
             name=name,
             slug=slug,
+            owner_user_id=owner.id,
             created_by=owner.id
         )
         db.add(org)
@@ -208,6 +209,99 @@ def revoke_refresh(db: Session, refresh_token: str):
 
 def create_org(db: Session, name: str) -> models.Organisation:
     raise HTTPException(status_code=501, detail="Use OrganizationService.create_organization")
+
+class PasswordResetService:
+    @staticmethod
+    def request_password_reset(db: Session, email: str) -> Dict[str, str]:
+        """Request password reset for email"""
+        user = db.query(models.User).join(models.Email).filter(
+            models.Email.email == email.lower().strip(),
+            models.Email.is_primary == True
+        ).first()
+        
+        if not user:
+            # Don't reveal if email exists - always return success message
+            return {"message": "If the email exists, a reset link has been sent"}
+        
+        # Generate reset token
+        reset_token = generate_verification_token()
+        token_hash = hash_token(reset_token)
+        
+        # Create password reset record
+        reset_record = models.PasswordReset(
+            user_id=user.id,
+            token_hash=token_hash,
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1)
+        )
+        db.add(reset_record)
+        
+        # Create audit log
+        audit_log = models.AuditLog(
+            user_id=user.id,
+            event="password.reset_requested",
+            payload_json={"email": email}
+        )
+        db.add(audit_log)
+        
+        db.commit()
+        
+        # TODO: Send email with reset_token
+        logger.info(f"Password reset requested for user: {user.id}")
+        
+        return {"message": "If the email exists, a reset link has been sent"}
+    
+    @staticmethod
+    def reset_password(db: Session, token: str, new_password: str) -> Dict[str, str]:
+        """Reset password using token"""
+        token_hash = hash_token(token)
+        
+        reset_record = db.query(models.PasswordReset).filter(
+            models.PasswordReset.token_hash == token_hash,
+            models.PasswordReset.used_at.is_(None),
+            models.PasswordReset.expires_at > datetime.now(timezone.utc)
+        ).first()
+        
+        if not reset_record:
+            raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+        
+        user = db.query(models.User).filter(models.User.id == reset_record.user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Update password
+        if user.password_credential:
+            user.password_credential.password_hash = hash_password(new_password)
+            user.password_credential.updated_at = datetime.now(timezone.utc)
+        else:
+            password_cred = models.PasswordCredential(
+                user_id=user.id,
+                password_hash=hash_password(new_password)
+            )
+            db.add(password_cred)
+        
+        # Mark reset token as used
+        reset_record.used_at = datetime.now(timezone.utc)
+        
+        # Revoke all sessions for security
+        active_sessions = db.query(models.Session).filter(
+            models.Session.user_id == user.id,
+            models.Session.revoked_at.is_(None)
+        ).all()
+        
+        for session in active_sessions:
+            session.revoked_at = datetime.now(timezone.utc)
+        
+        # Create audit log
+        audit_log = models.AuditLog(
+            user_id=user.id,
+            event="password.reset_completed",
+            payload_json={"sessions_revoked": len(active_sessions)}
+        )
+        db.add(audit_log)
+        
+        db.commit()
+        
+        return {"message": "Password reset successfully"}
 
 def add_member(db: Session, user_id: str, org_id: str, role: str = "member"):
     return OrganizationService.add_member(db, user_id, org_id, role)

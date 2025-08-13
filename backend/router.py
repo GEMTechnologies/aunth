@@ -428,6 +428,226 @@ def list_user_organizations(
         logger.error(f"Organization listing error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to list organizations")
 
+@router.get("/orgs/{org_id}/members", tags=["Organizations"])
+def list_organization_members(
+    org_id: str,
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """List members of an organization"""
+    try:
+        # Check if user is member of organization
+        membership = db.query(models.OrgMember).filter(
+            models.OrgMember.organisation_id == org_id,
+            models.OrgMember.user_id == current_user.id
+        ).first()
+        
+        if not membership:
+            raise HTTPException(status_code=403, detail="Access denied to organization")
+        
+        # Get all members
+        members = db.query(models.OrgMember).options(
+            joinedload(models.OrgMember.user).joinedload(models.User.primary_email)
+        ).filter(models.OrgMember.organisation_id == org_id).all()
+        
+        return [
+            {
+                "user_id": member.user_id,
+                "role": member.role,
+                "joined_at": member.created_at,
+                "user": {
+                    "id": member.user.id,
+                    "display_name": member.user.display_name,
+                    "primary_email": {
+                        "email": member.user.primary_email.email,
+                        "is_verified": member.user.primary_email.is_verified
+                    } if member.user.primary_email else None
+                }
+            } for member in members
+        ]
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Member listing error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to list members")
+
+@router.post("/orgs/{org_id}/invites", tags=["Organizations"])
+def invite_member(
+    org_id: str,
+    payload: schemas.InviteMemberRequest,
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Invite new member to organization"""
+    try:
+        # Check if user has admin role
+        membership = db.query(models.OrgMember).filter(
+            models.OrgMember.organisation_id == org_id,
+            models.OrgMember.user_id == current_user.id,
+            models.OrgMember.role.in_(["admin", "owner"])
+        ).first()
+        
+        if not membership:
+            raise HTTPException(status_code=403, detail="Admin access required")
+        
+        # Check if user already exists and add them directly
+        existing_user = db.query(models.User).join(models.Email).filter(
+            models.Email.email == payload.email.lower().strip(),
+            models.Email.is_primary == True
+        ).first()
+        
+        if existing_user:
+            # Check if already a member
+            existing_member = db.query(models.OrgMember).filter(
+                models.OrgMember.organisation_id == org_id,
+                models.OrgMember.user_id == existing_user.id
+            ).first()
+            
+            if existing_member:
+                raise HTTPException(status_code=400, detail="User is already a member")
+            
+            # Add as member
+            new_member = models.OrgMember(
+                organisation_id=org_id,
+                user_id=existing_user.id,
+                role=payload.role
+            )
+            db.add(new_member)
+            db.commit()
+            
+            return {"message": "User added to organization successfully"}
+        else:
+            # TODO: Create invitation record and send email
+            return {"message": "Invitation sent successfully"}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Member invitation error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to invite member")
+
+@router.patch("/orgs/{org_id}/members/{user_id}", tags=["Organizations"])
+def update_member_role(
+    org_id: str,
+    user_id: str,
+    payload: schemas.UpdateMemberRoleRequest,
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Update member role in organization"""
+    try:
+        # Check if current user has admin role
+        admin_membership = db.query(models.OrgMember).filter(
+            models.OrgMember.organisation_id == org_id,
+            models.OrgMember.user_id == current_user.id,
+            models.OrgMember.role.in_(["admin", "owner"])
+        ).first()
+        
+        if not admin_membership:
+            raise HTTPException(status_code=403, detail="Admin access required")
+        
+        # Find member to update
+        member = db.query(models.OrgMember).filter(
+            models.OrgMember.organisation_id == org_id,
+            models.OrgMember.user_id == user_id
+        ).first()
+        
+        if not member:
+            raise HTTPException(status_code=404, detail="Member not found")
+        
+        # Update role
+        member.role = payload.role
+        
+        # Create audit log
+        audit_log = models.AuditLog(
+            user_id=current_user.id,
+            actor_user_id=current_user.id,
+            event="org.member_role_updated",
+            payload_json={
+                "org_id": org_id,
+                "target_user_id": user_id,
+                "new_role": payload.role
+            }
+        )
+        db.add(audit_log)
+        
+        db.commit()
+        
+        return {"message": "Member role updated successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Member role update error: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to update member role")
+
+@router.delete("/orgs/{org_id}/members/{user_id}", status_code=204, tags=["Organizations"])
+def remove_member(
+    org_id: str,
+    user_id: str,
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Remove member from organization"""
+    try:
+        # Check if current user has admin role
+        admin_membership = db.query(models.OrgMember).filter(
+            models.OrgMember.organisation_id == org_id,
+            models.OrgMember.user_id == current_user.id,
+            models.OrgMember.role.in_(["admin", "owner"])
+        ).first()
+        
+        if not admin_membership:
+            raise HTTPException(status_code=403, detail="Admin access required")
+        
+        # Find member to remove
+        member = db.query(models.OrgMember).filter(
+            models.OrgMember.organisation_id == org_id,
+            models.OrgMember.user_id == user_id
+        ).first()
+        
+        if not member:
+            raise HTTPException(status_code=404, detail="Member not found")
+        
+        # Don't allow removing the last owner
+        if member.role == "owner":
+            owner_count = db.query(models.OrgMember).filter(
+                models.OrgMember.organisation_id == org_id,
+                models.OrgMember.role == "owner"
+            ).count()
+            
+            if owner_count <= 1:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Cannot remove the last owner"
+                )
+        
+        db.delete(member)
+        
+        # Create audit log
+        audit_log = models.AuditLog(
+            user_id=current_user.id,
+            actor_user_id=current_user.id,
+            event="org.member_removed",
+            payload_json={
+                "org_id": org_id,
+                "removed_user_id": user_id,
+                "removed_role": member.role
+            }
+        )
+        db.add(audit_log)
+        
+        db.commit()
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Member removal error: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to remove member")
+
 # OAuth/Social Login endpoints
 @router.get("/auth/oauth/{provider}/authorize", tags=["OAuth"])
 async def oauth_authorize(
@@ -543,6 +763,122 @@ def unlink_oauth_account(
         logger.error(f"OAuth unlink error: {str(e)}")
         db.rollback()
         raise HTTPException(status_code=500, detail="Failed to unlink OAuth account")
+
+# Session management endpoints
+@router.post("/me/change-password", tags=["Users"])
+def change_password(
+    payload: schemas.ChangePasswordRequest,
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Change user password"""
+    try:
+        # Verify old password
+        if not current_user.password_credential or not verify_password(
+            payload.old_password, current_user.password_credential.password_hash
+        ):
+            raise HTTPException(status_code=400, detail="Current password is incorrect")
+        
+        # Update password
+        current_user.password_credential.password_hash = hash_password(payload.new_password)
+        current_user.password_credential.updated_at = datetime.now(timezone.utc)
+        
+        # Create audit log
+        audit_log = models.AuditLog(
+            user_id=current_user.id,
+            actor_user_id=current_user.id,
+            event="user.password_changed",
+            payload_json={}
+        )
+        db.add(audit_log)
+        
+        db.commit()
+        
+        return {"message": "Password changed successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Password change error: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to change password")
+
+@router.post("/me/sessions/{session_id}/revoke", status_code=204, tags=["Users"])
+def revoke_user_session(
+    session_id: str,
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Revoke a specific session"""
+    try:
+        session = db.query(models.Session).filter(
+            models.Session.id == session_id,
+            models.Session.user_id == current_user.id,
+            models.Session.revoked_at.is_(None)
+        ).first()
+        
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        SessionService.revoke_session(db, session_id)
+        
+        # Create audit log
+        audit_log = models.AuditLog(
+            user_id=current_user.id,
+            actor_user_id=current_user.id,
+            event="user.session_revoked",
+            payload_json={"session_id": session_id}
+        )
+        db.add(audit_log)
+        db.commit()
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Session revocation error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to revoke session")
+
+@router.post("/me/sessions/revoke-others", status_code=204, tags=["Users"])
+def revoke_other_sessions(
+    request: Request,
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Revoke all other sessions except current one"""
+    try:
+        # Get current session ID from token
+        token = request.headers.get("Authorization", "").replace("Bearer ", "")
+        payload = decode_access_token(token)
+        current_session_id = payload.get("sid")
+        
+        # Revoke all other sessions
+        other_sessions = db.query(models.Session).filter(
+            models.Session.user_id == current_user.id,
+            models.Session.revoked_at.is_(None)
+        )
+        
+        if current_session_id:
+            other_sessions = other_sessions.filter(models.Session.id != current_session_id)
+        
+        revoked_count = 0
+        for session in other_sessions:
+            session.revoked_at = datetime.now(timezone.utc)
+            revoked_count += 1
+        
+        # Create audit log
+        audit_log = models.AuditLog(
+            user_id=current_user.id,
+            actor_user_id=current_user.id,
+            event="user.other_sessions_revoked",
+            payload_json={"revoked_count": revoked_count}
+        )
+        db.add(audit_log)
+        
+        db.commit()
+        
+    except Exception as e:
+        logger.error(f"Other sessions revocation error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to revoke other sessions")
 
 # Health check endpoint
 @router.get("/health", tags=["System"])

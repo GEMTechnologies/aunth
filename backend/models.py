@@ -27,6 +27,7 @@ class User(Base):
     emails: Mapped[List["Email"]] = relationship("Email", back_populates="user", foreign_keys="Email.user_id")
     primary_email: Mapped[Optional["Email"]] = relationship("Email", foreign_keys=[primary_email_id], post_update=True)
     password_credential: Mapped[Optional["PasswordCredential"]] = relationship("PasswordCredential", back_populates="user")
+    password_resets: Mapped[List["PasswordReset"]] = relationship("PasswordReset", back_populates="user", cascade="all, delete-orphan")
     sessions: Mapped[List["Session"]] = relationship("Session", back_populates="user")
     org_memberships: Mapped[List["OrgMember"]] = relationship("OrgMember", back_populates="user")
     owned_orgs: Mapped[List["Organisation"]] = relationship("Organisation", back_populates="owner")
@@ -96,11 +97,13 @@ class Organisation(Base):
     name: Mapped[str] = mapped_column(String(255))
     slug: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     owner_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    created_by: Mapped[str] = mapped_column(String(36), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     # Relationships
     owner = relationship("User", back_populates="owned_orgs")
-    members = relationship("OrgMember", back_populates="organisation")
+    members = relationship("OrgMember", back_populates="organisation", cascade="all, delete-orphan")
+    contexts: Mapped[List["UserContext"]] = relationship("UserContext", back_populates="organisation", cascade="all, delete-orphan")
     audit_logs = relationship("AuditLog", back_populates="organisation")
     saml_providers = relationship("SAMLProvider", back_populates="organisation")
 
@@ -173,6 +176,9 @@ class PasswordReset(Base):
     used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
+    # Relationships
+    user: Mapped["User"] = relationship(back_populates="password_resets")
+
 class OAuthAccount(Base):
     """OAuth account connections for social login"""
     __tablename__ = "oauth_accounts"
@@ -200,11 +206,11 @@ class OAuthState(Base):
     __tablename__ = "oauth_states"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
-    state: Mapped[str] = mapped_column(String, unique=True, nullable=False)
-    provider: Mapped[str] = mapped_column(String, nullable=False)
+    state: Mapped[str] = mapped_column(String(64), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(50))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 class SAMLProvider(Base):
     """SAML identity providers for SSO"""
