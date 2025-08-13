@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -10,7 +9,8 @@ import time
 import uuid
 
 from .database import engine, Base, create_tables, DatabaseManager
-from .router import router
+from router import router
+from oauth import oauth_router
 from .config import settings
 
 # Configure logging
@@ -25,7 +25,7 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     # Startup
     logger.info("Starting Granada Authentication Service...")
-    
+
     # Create database tables
     try:
         create_tables()
@@ -33,18 +33,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to create database tables: {e}")
         raise
-    
+
     # Verify database connection
     if DatabaseManager.health_check():
         logger.info("Database connection verified")
     else:
         logger.error("Database connection failed")
         raise Exception("Database connection failed")
-    
+
     logger.info("Granada Authentication Service started successfully")
-    
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down Granada Authentication Service...")
 
@@ -61,7 +61,7 @@ app = FastAPI(
 # Security middleware
 if settings.app_env == "production":
     app.add_middleware(
-        TrustedHostMiddleware, 
+        TrustedHostMiddleware,
         allowed_hosts=["*.granada.example", "granada.example"]
     )
 
@@ -81,16 +81,16 @@ async def add_request_id(request: Request, call_next):
     """Add unique request ID for tracking"""
     request_id = str(uuid.uuid4())
     request.state.request_id = request_id
-    
+
     start_time = time.time()
-    
+
     response = await call_next(request)
-    
+
     process_time = time.time() - start_time
-    
+
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Process-Time"] = str(process_time)
-    
+
     # Log request
     logger.info(
         f"Request: {request.method} {request.url.path} - "
@@ -98,7 +98,7 @@ async def add_request_id(request: Request, call_next):
         f"Duration: {process_time:.4f}s - "
         f"Request-ID: {request_id}"
     )
-    
+
     return response
 
 # Exception handlers
@@ -106,7 +106,7 @@ async def add_request_id(request: Request, call_next):
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle validation errors"""
     logger.warning(f"Validation error on {request.method} {request.url.path}: {exc}")
-    
+
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
@@ -120,7 +120,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 async def general_exception_handler(request: Request, exc: Exception):
     """Handle unexpected errors"""
     logger.error(f"Unexpected error on {request.method} {request.url.path}: {exc}")
-    
+
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
@@ -131,6 +131,7 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 # Include router
 app.include_router(router, prefix="/api/v1")
+app.include_router(oauth_router, prefix="/api/v1")
 
 # Root endpoints
 @app.get("/")
@@ -159,7 +160,7 @@ async def api_health_check():
     """Comprehensive health check with database"""
     try:
         db_healthy = DatabaseManager.health_check()
-        
+
         return {
             "status": "healthy" if db_healthy else "degraded",
             "service": "granada-auth",
@@ -184,7 +185,7 @@ async def api_health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    
+
     uvicorn.run(
         "main:app",
         host="0.0.0.0",

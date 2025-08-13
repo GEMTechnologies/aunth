@@ -1,12 +1,12 @@
-
 import React from 'react';
 import { api } from '../lib/api';
 
 interface SocialButtonProps {
-  provider: 'google' | 'github';
+  provider: 'google' | 'github' | 'twitter';
+  onClick?: () => void;
 }
 
-const SocialButton: React.FC<SocialButtonProps> = ({ provider }) => {
+const SocialButton: React.FC<SocialButtonProps> = ({ provider, onClick = () => {} }) => {
   const handleSocialLogin = async () => {
     try {
       const response = await api.get(`/auth/oauth/${provider}/authorize`);
