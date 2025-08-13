@@ -186,65 +186,64 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
 
               {/* Email & Password Form */}
               <form onSubmit={handleSubmit} className="space-y-4">
-                {/* Regular form fields */}
-              <div className="space-y-4">
-                <input
-                  type="email"
-                  name="email"
-                  placeholder="Email address"
-                  value={formData.email}
-                  onChange={handleChange}
-                  required
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                />
+                <div className="space-y-4">
+                  <input
+                    type="email"
+                    name="email"
+                    placeholder="Email address"
+                    value={formData.email}
+                    onChange={handleChange}
+                    required
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                  />
 
-                <input
-                  type="password"
-                  name="password"
-                  placeholder="Password"
-                  value={formData.password}
-                  onChange={handleChange}
-                  required
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                />
+                  <input
+                    type="password"
+                    name="password"
+                    placeholder="Password"
+                    value={formData.password}
+                    onChange={handleChange}
+                    required
+                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                  />
 
-                {mode === "register" && (
-                  <>
-                    <input
-                      type="text"
-                      name="displayName"
-                      placeholder="Full Name"
-                      value={formData.displayName}
-                      onChange={handleChange}
-                      className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                    />
+                  {mode === "register" && (
+                    <>
+                      <input
+                        type="text"
+                        name="displayName"
+                        placeholder="Full Name"
+                        value={formData.displayName}
+                        onChange={handleChange}
+                        className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                      />
 
-                    <select
-                      name="intent"
-                      value={formData.intent}
-                      onChange={handleChange}
-                      required
-                      className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                    >
-                      <option value="">I want to...</option>
-                      <option value="student">Study and learn (Student)</option>
-                      <option value="ngo">Run a non-profit organization</option>
-                      <option value="business">Manage a business</option>
-                      <option value="jobs">Find employment opportunities</option>
-                    </select>
+                      <select
+                        name="intent"
+                        value={formData.intent}
+                        onChange={handleChange}
+                        required
+                        className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                      >
+                        <option value="">I want to...</option>
+                        <option value="student">Study and learn (Student)</option>
+                        <option value="ngo">Run a non-profit organization</option>
+                        <option value="business">Manage a business</option>
+                        <option value="jobs">Find employment opportunities</option>
+                      </select>
 
-                    <input
-                      type="password"
-                      name="confirmPassword"
-                      placeholder="Confirm Password"
-                      value={formData.confirmPassword}
-                      onChange={handleChange}
-                      required
-                      className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-                    />
-                  </>
-                )}
-              </form>
+                      <input
+                        type="password"
+                        name="confirmPassword"
+                        placeholder="Confirm Password"
+                        value={formData.confirmPassword}
+                        onChange={handleChange}
+                        required
+                        className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                      />
+                    </>
+                  )}
+                </div></old_str>
 
                 <button
                   type="submit"
