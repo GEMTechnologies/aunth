@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { apiLogin, apiRegister, apiMe, apiRefresh } from "../lib/api";
+import SocialButton from "../components/SocialButton";
 
 type Mode = "login" | "register" | "forgotPassword";
 
@@ -48,11 +49,11 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
         if (formData.password !== formData.confirmPassword) {
           throw new Error("Passwords don't match");
         }
-        const response = await apiRegister({
-          email: formData.email,
-          password: formData.password,
-          display_name: formData.displayName || "",
-        });
+        const response = await apiRegister(
+          formData.email,
+          formData.password,
+          formData.displayName || ""
+        );
         localStorage.setItem("access_token", response.access_token);
         localStorage.setItem("refresh_token", response.refresh_token);
         const user = await apiMe();
@@ -169,6 +170,25 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                 )}
               </button>
             </form>
+
+            {/* Social Login */}
+            {mode !== "forgotPassword" && (
+              <div className="mt-6">
+                <div className="relative">
+                  <div className="absolute inset-0 flex items-center">
+                    <div className="w-full border-t border-gray-300" />
+                  </div>
+                  <div className="relative flex justify-center text-sm">
+                    <span className="px-2 bg-white text-gray-500">Or continue with</span>
+                  </div>
+                </div>
+                
+                <div className="mt-6 space-y-3">
+                  <SocialButton provider="google" />
+                  <SocialButton provider="github" />
+                </div>
+              </div>
+            )}
 
             <div className="mt-6 space-y-2">
               {mode === "login" && (

@@ -4,7 +4,7 @@ modules = ["nodejs-20", "python-3.12", "web"]
 channel = "stable-25_05"
 
 [workflows]
-runButton = "Frontend Dev Server"
+runButton = "Full Stack Dev"
 
 [[workflows.workflow]]
 name = "Frontend Dev Server"

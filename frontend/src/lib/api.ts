@@ -1,6 +1,13 @@
 import axios, { AxiosInstance } from 'axios';
 import { AUTH_URL } from '../config';
 
+// Define AuthResponse type for clarity
+interface AuthResponse {
+  access_token: string;
+  refresh_token: string;
+  user: any; // Define a more specific user type if possible
+}
+
 // Create axios instance
 const api: AxiosInstance = axios.create({
   baseURL: `${AUTH_URL}/api/v1`,
@@ -57,12 +64,12 @@ api.interceptors.response.use(
 );
 
 // Auth API functions
-export async function apiLogin(email: string, password: string) {
+export async function apiLogin(email: string, password: string): Promise<AuthResponse> {
   const response = await api.post('/auth/login', { email, password });
   return response.data;
 }
 
-export async function apiRegister(email: string, password: string, full_name?: string) {
+export async function apiRegister(email: string, password: string, full_name?: string): Promise<AuthResponse> {
   const response = await api.post('/auth/register', { email, password, full_name });
   return response.data;
 }
@@ -77,7 +84,7 @@ export const apiMe = async () => {
   return response.data;
 };
 
-export async function apiRefresh(refresh_token: string) {
+export async function apiRefresh(refresh_token: string): Promise<AuthResponse> {
   const response = await axios.post(`${AUTH_URL}/api/v1/auth/refresh`, {}, {
     headers: { Authorization: `Bearer ${refresh_token}` }
   });
@@ -103,6 +110,12 @@ export const initiateOAuth = async (provider: string): Promise<{authorization_ur
 
 export const unlinkOAuthAccount = async (provider: string): Promise<{message: string}> => {
   const response = await api.post(`/auth/oauth/${provider}/unlink`);
+  return response.data;
+};
+
+// Handle OAuth callback
+export const handleOAuthCallback = async (provider: string, code: string, state: string): Promise<AuthResponse> => {
+  const response = await api.post(`/auth/oauth/${provider}/callback`, { code, state });
   return response.data;
 };
 
