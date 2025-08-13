@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "start": "pnpm webpack serve --config webpack.config.js",
+    "start": "npm run dev",
+    "dev": "webpack serve --config webpack.config.js --mode development",
+    "build": "webpack --config webpack.config.js --mode production",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -15,7 +17,9 @@
     "framer-motion": "^12.23.9",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "lucide-react": "^0.263.1",
+    "clsx": "^2.0.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.1.11",
