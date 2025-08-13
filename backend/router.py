@@ -6,10 +6,11 @@ from jose import JWTError
 from datetime import datetime, timezone
 import logging
 
-from .database import get_db
-from . import schemas, models, service, security, oauth
-from .config import settings
-from .context_service import ContextService
+from database import get_db
+import schemas, models, service, security, oauth
+from config import settings
+from context_service import ContextService
+from service import OrganizationService
 
 logger = logging.getLogger(__name__)
 

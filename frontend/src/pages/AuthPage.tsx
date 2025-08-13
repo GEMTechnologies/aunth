@@ -243,7 +243,7 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
                       />
                     </>
                   )}
-                </div></old_str>
+                </div>
 
                 <button
                   type="submit"

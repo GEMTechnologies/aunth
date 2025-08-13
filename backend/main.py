@@ -8,10 +8,10 @@ import logging
 import time
 import uuid
 
-from .database import engine, Base, create_tables, DatabaseManager
+from database import engine, Base, create_tables, DatabaseManager
 from router import router
 from oauth import oauth_router
-from .config import settings
+from config import settings
 
 # Configure logging
 logging.basicConfig(
