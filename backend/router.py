@@ -11,6 +11,7 @@ from .database import get_db
 from . import schemas, models
 from .security import decode_access_token
 from .service import AuthService, SessionService, OrganizationService
+from .oauth import oauth_service
 from .config import settings
 
 logger = logging.getLogger(__name__)
@@ -372,6 +373,122 @@ def list_user_organizations(
     except Exception as e:
         logger.error(f"Organization listing error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to list organizations")
+
+# OAuth/Social Login endpoints
+@router.get("/auth/oauth/{provider}/authorize", tags=["OAuth"])
+async def oauth_authorize(
+    provider: str,
+    db: Session = Depends(get_db)
+):
+    """Initiate OAuth flow with provider"""
+    try:
+        result = await oauth_service.initiate_oauth_flow(provider, db)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"OAuth authorize error: {str(e)}")
+        raise HTTPException(status_code=500, detail="OAuth initiation failed")
+
+@router.get("/auth/oauth/{provider}/callback", tags=["OAuth"])
+async def oauth_callback(
+    provider: str,
+    code: str,
+    state: str,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Handle OAuth callback from provider"""
+    try:
+        user = await oauth_service.handle_oauth_callback(provider, code, state, db)
+        
+        # Create session and tokens
+        session = SessionService.create_session(
+            db, 
+            user,
+            ip_address=get_client_ip(request),
+            user_agent=get_user_agent(request)
+        )
+        
+        tokens = SessionService.issue_tokens(db, user, session)
+        
+        return schemas.TokenResponse(
+            access_token=tokens.access_token,
+            refresh_token=tokens.refresh_token,
+            token_type=tokens.token_type,
+            expires_in=tokens.expires_in,
+            user=schemas.UserResponse(
+                id=user.id,
+                display_name=user.display_name,
+                avatar_url=user.avatar_url,
+                locale=user.locale,
+                created_at=user.created_at,
+                status=user.status,
+                primary_email=schemas.EmailResponse(
+                    id=user.primary_email.id,
+                    email=user.primary_email.email,
+                    is_verified=user.primary_email.is_verified,
+                    is_primary=user.primary_email.is_primary,
+                    created_at=user.primary_email.created_at
+                ) if user.primary_email else None
+            )
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"OAuth callback error: {str(e)}")
+        raise HTTPException(status_code=500, detail="OAuth callback failed")
+
+@router.post("/auth/oauth/{provider}/unlink", tags=["OAuth"])
+def unlink_oauth_account(
+    provider: str,
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Unlink OAuth account from user"""
+    try:
+        oauth_account = db.query(models.OAuthAccount).filter(
+            models.OAuthAccount.user_id == current_user.id,
+            models.OAuthAccount.provider == provider
+        ).first()
+        
+        if not oauth_account:
+            raise HTTPException(status_code=404, detail="OAuth account not found")
+        
+        # Check if user has password - don't allow unlinking if it's their only auth method
+        if not current_user.password_credential:
+            other_oauth = db.query(models.OAuthAccount).filter(
+                models.OAuthAccount.user_id == current_user.id,
+                models.OAuthAccount.provider != provider
+            ).first()
+            
+            if not other_oauth:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Cannot unlink - set a password first"
+                )
+        
+        db.delete(oauth_account)
+        
+        # Create audit log
+        audit_log = models.AuditLog(
+            user_id=current_user.id,
+            actor_user_id=current_user.id,
+            event="oauth.account_unlinked",
+            payload_json={"provider": provider}
+        )
+        db.add(audit_log)
+        
+        db.commit()
+        return {"message": "OAuth account unlinked successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"OAuth unlink error: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to unlink OAuth account")
 
 # Health check endpoint
 @router.get("/health", tags=["System"])

@@ -1,10 +1,11 @@
 
 import React from 'react';
 import { motion } from 'framer-motion';
+import { initiateOAuth } from '../lib/api';
 
 interface SocialButtonProps {
   provider: 'google' | 'github' | 'facebook';
-  onClick: () => void;
+  onClick?: () => void;
   disabled?: boolean;
 }
 
@@ -54,11 +55,25 @@ const SocialButton: React.FC<SocialButtonProps> = ({ provider, onClick, disabled
 
   const config = getProviderConfig();
 
+  const handleOAuthLogin = async () => {
+    if (onClick) {
+      onClick();
+      return;
+    }
+
+    try {
+      const { authorization_url } = await initiateOAuth(provider);
+      window.location.href = authorization_url;
+    } catch (error) {
+      console.error(`OAuth login failed for ${provider}:`, error);
+    }
+  };
+
   return (
     <motion.button
       whileHover={{ scale: 1.02 }}
       whileTap={{ scale: 0.98 }}
-      onClick={onClick}
+      onClick={handleOAuthLogin}
       disabled={disabled}
       className={`
         flex items-center justify-center w-full px-4 py-3 rounded-xl border border-gray-200

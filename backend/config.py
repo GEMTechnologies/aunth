@@ -43,6 +43,20 @@ class Settings(BaseSettings):
     smtp_tls: bool = True
     smtp_ssl: bool = False
     
+    # OAuth Providers
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    facebook_client_id: str = ""
+    facebook_client_secret: str = ""
+    
+    # SSO/SAML Configuration
+    saml_sp_entity_id: str = "granada-auth"
+    saml_sp_acs_url: str = ""
+    saml_sp_x509_cert: str = ""
+    saml_sp_private_key: str = ""
+    
     # Security
     csrf_secret: str = "csrf-secret-key-change-in-production"
     cookie_domain: str = ".localhost"
