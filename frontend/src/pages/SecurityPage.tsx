@@ -1,32 +1,57 @@
+
 import React from 'react';
 
-const SecurityPage = () => {
+interface User {
+  id: string;
+  display_name: string;
+  avatar_url?: string;
+  locale: string;
+  status: string;
+  primary_email?: {
+    email: string;
+    is_verified: boolean;
+  };
+}
+
+interface SecurityPageProps {
+  user: User;
+}
+
+const SecurityPage: React.FC<SecurityPageProps> = ({ user }) => {
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-purple-600 to-blue-500 font-sans text-gray-800">
-      <div className="max-w-lg w-full bg-white/80 backdrop-blur-lg p-10 rounded-3xl shadow-2xl text-center border border-white/40 mx-4 transition-all duration-300">
-        <img src="https://via.placeholder.com/120x50.png?text=Granada" alt="Granada Logo" className="max-w-[120px] mx-auto mb-8 drop-shadow-lg" />
-        <h1 className="text-3xl font-extrabold text-gray-900 mb-2 tracking-tight">Security</h1>
-        <p className="text-gray-600 mb-8">Manage your account security and change your password.</p>
-        <div className="bg-white/90 rounded-2xl shadow p-6 mb-6 border border-gray-100">
-          <h3 className="text-lg font-semibold text-gray-900 mb-2">Change Password</h3>
-          <p className="text-sm text-gray-500 mb-4">Update your password to keep your account secure.</p>
-          <form className="mt-2 flex flex-col gap-4 items-center">
-            <input
-              type="password"
-              name="password"
-              id="password"
-              className="shadow-sm focus:ring-indigo-500 focus:border-indigo-500 block w-full sm:text-sm border-gray-300 rounded-md px-4 py-3 transition-all duration-200"
-              placeholder="New Password"
-            />
-            <button
-              type="submit"
-              className="w-full inline-flex items-center justify-center px-4 py-3 border border-transparent shadow-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 text-base transition-all duration-200"
-            >
-              Save
-            </button>
-          </form>
+    <div className="max-w-4xl mx-auto p-6">
+      <div className="bg-white shadow rounded-lg">
+        <div className="px-6 py-4 border-b border-gray-200">
+          <h1 className="text-2xl font-bold text-gray-900">Security</h1>
         </div>
-        <div className="mt-6 text-xs text-gray-400">Granada Platform &copy; {new Date().getFullYear()}</div>
+        <div className="p-6 space-y-6">
+          <div className="border border-gray-200 rounded-lg p-4">
+            <h3 className="text-lg font-medium text-gray-900 mb-2">Password</h3>
+            <p className="text-gray-600 mb-4">Update your password to keep your account secure.</p>
+            <button className="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700">
+              Change Password
+            </button>
+          </div>
+          
+          <div className="border border-gray-200 rounded-lg p-4">
+            <h3 className="text-lg font-medium text-gray-900 mb-2">Two-Factor Authentication</h3>
+            <p className="text-gray-600 mb-4">Add an extra layer of security to your account.</p>
+            <button className="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700">
+              Enable 2FA
+            </button>
+          </div>
+          
+          <div className="border border-gray-200 rounded-lg p-4">
+            <h3 className="text-lg font-medium text-gray-900 mb-2">Active Sessions</h3>
+            <p className="text-gray-600 mb-4">Manage your active sessions across devices.</p>
+            <div className="space-y-2">
+              <div className="flex justify-between items-center p-2 bg-gray-50 rounded">
+                <span className="text-sm">Current Session</span>
+                <span className="text-xs text-gray-500">Active now</span>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );
