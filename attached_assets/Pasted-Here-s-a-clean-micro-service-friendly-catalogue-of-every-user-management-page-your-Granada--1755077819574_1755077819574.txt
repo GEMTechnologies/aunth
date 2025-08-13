@@ -1,0 +1,204 @@
+Here’s a clean, **micro-service friendly** catalogue of every **user-management page** your Granada stack should expose, plus exactly what each page **must** include so routing, permissions, and UX remain consistent across *Auth*, *Academia (Student)*, *NGOs*, *Business*, and *Jobs*. Use it as your build checklist and IA (information architecture).
+
+# Global context surfaces (always available)
+
+## Workspace picker (`/workspaces`)
+
+**Purpose:** choose where to go when a person has more than one context.
+**Must have:** a list of contexts (e.g., *Student (Academia)*; each NGO or Business workspace by name and logo); search and quick filter; a **“Make this my default”** action that writes `last_active_context`; graceful empty state with links to *Create organisation* or *Accept invite*.
+**Back end:** `GET /me/contexts`, `POST /me/last-context`.
+
+## Context switcher (top-bar component)
+
+**Purpose:** instant move between contexts without logging out.
+**Must have:** current context badge, dropdown of recent contexts, *Manage workspaces* link, token refresh when switching into an org so the JWT carries `org`.
+**Back end:** lightweight call to `POST /me/last-context` then silent `/auth/refresh`.
+
+# Personal account (every user)
+
+## Account home (`/account`)
+
+**Purpose:** one glance summary of identity and security.
+**Must have:** verified email status, MFA status, last login/device, quick links to *Security*, *Sessions*, *Privacy*, and *Delete account*; banners for critical actions (e.g., “Enable MFA”).
+**Back end:** `GET /me`.
+
+## Profile (`/account/profile`)
+
+**Purpose:** basic identity data that all products can read.
+**Must have:** display name, primary email indicator, optional photo, locale/time-zone; secondary emails with **verify/make primary/remove**; save requires recent re-auth for sensitive changes.
+**Back end:** `GET/PATCH /me`, `POST /emails/add`, `POST /emails/verify/request`, `POST /emails/verify/confirm`.
+
+## Password (`/account/security/password`)
+
+**Purpose:** change password securely.
+**Must have:** current password + new password with server-enforced policy, breach check, re-auth requirement, success banner that prompts to review sessions (option to sign out everywhere).
+**Back end:** `POST /me/change-password`, then `POST /me/sessions/revoke-all` (optional).
+
+## Multi-factor authentication (`/account/security/mfa`)
+
+**Purpose:** enrol and manage MFA.
+**Must have:** TOTP enrol (QR + code), show codes left and last used; **downloadable backup codes** (re-auth to reveal/regenerate); WebAuthn/passkeys enrol and label management; enforce MFA for high-risk roles; clear recovery guidance.
+**Back end:** `/auth/mfa/totp/enrol/*`, `/auth/mfa/totp/disable`, `/auth/mfa/backup/*`, `/auth/webauthn/*`.
+
+## Sessions & devices (`/account/security/sessions`)
+
+**Purpose:** transparency and control over where the account is signed in.
+**Must have:** table of active sessions with device, location (approx), created, last seen, IP; **Revoke** per session; **Sign out of all other devices**; highlight current session.
+**Back end:** `GET /me/sessions`, `POST /me/sessions/:sid/revoke`, `POST /me/sessions/revoke-others`.
+
+## Sign-in methods (`/account/security/sign-in-methods`)
+
+**Purpose:** manage how the user logs in.
+**Must have:** email/password status; connected providers (Google, GitHub, etc.) with **Link/Unlink**; passwordless toggle if enabled; guard unlink to avoid lockout (require at least one method + MFA).
+**Back end:** `GET /me/providers`, `POST /providers/link/start|finish`, `POST /providers/:id/unlink`.
+
+## Notifications & preferences (`/account/notifications`)
+
+**Purpose:** control email and in-app alerts.
+**Must have:** categories (security, invites, activity, announcements) with opt-in/out toggles; timezone and digest frequency; “test email” action.
+**Back end:** `GET/PATCH /me/preferences/notifications`.
+
+## Privacy, consents & data (`/account/privacy`)
+
+**Purpose:** transparency and self-service privacy actions.
+**Must have:** consent records with timestamps and versions; **Download my data** (export job with email when ready); **Delete my account** with cooldown and warnings about org ownership; list of third-party integrations authorised.
+**Back end:** `GET /me/consents`, `POST /me/consents/accept`, `POST /me/data/export`, `POST /me/data/delete/start`.
+
+## Security log (`/account/security/log`)
+
+**Purpose:** show important auth events.
+**Must have:** entries like login success/fail, password reset, MFA changes, new device, token reuse detection; filters by date/event/IP; export CSV.
+**Back end:** `GET /me/audit?event=...`.
+
+## API keys (optional, developer users) (`/account/developer/api-keys`)
+
+**Purpose:** machine integrations on behalf of the user.
+**Must have:** create key (scope, expiry), show once, rotate, revoke; IP allowlist; usage stats.
+**Back end:** `GET/POST/DELETE /me/api-keys`.
+
+# Student (Academia) specific
+
+## Student profile (`/student/profile`)
+
+**Purpose:** the student’s academic identity used by Academia.
+**Must have:** institution, programme, level, expected graduation, country, research interests (tags), optional ORCID; visibility controls for portfolio; progress checklist (e.g., “complete profile”, “enable MFA”).
+**Back end:** `GET/POST /students/profile`.
+
+## Portfolio settings (`/student/portfolio/settings`)
+
+**Purpose:** publishing controls for student work.
+**Must have:** public/private toggle, custom slug, featured items order, link accounts (e.g., Google Drive, GitHub) with OAuth status, danger zone to unpublish.
+**Back end:** `GET/PATCH /students/portfolio/settings`, provider OAuth endpoints.
+
+# Organisation (NGOs & Business workspaces)
+
+## Organisation overview (`/orgs/:slug/settings/overview`)
+
+**Purpose:** identity and branding for the workspace.
+**Must have:** name, slug, logo, country, default currency/time-zone, description; transfer ownership (two-step with re-auth); delete org (soft-delete with checks for billing and projects).
+**Back end:** `GET/PATCH /orgs/:id`.
+
+## Members (`/orgs/:slug/members`)
+
+**Purpose:** who is in the workspace.
+**Must have:** member list with role and status, invite button, search, **Change role**, **Remove member**, **Resend invite**; CSV import for bulk invites.
+**Back end:** `GET /orgs/:id/members`, `POST /orgs/:id/invites`, `POST /orgs/:id/members/:uid/role`, `DELETE /orgs/:id/members/:uid`.
+
+## Invites (`/orgs/:slug/invites`)
+
+**Purpose:** manage pending access.
+**Must have:** outstanding invites with email, role, expiry; **Cancel**; **Copy invite link** with one-time token; domain allowlist hint.
+**Back end:** `GET /orgs/:id/invites`, `DELETE /orgs/:id/invites/:iid`.
+
+## Roles & permissions (`/orgs/:slug/roles`)
+
+**Purpose:** RBAC administration.
+**Must have:** role catalogue (Owner, Admin, Finance, M\&E, Staff, Viewer, custom); permission checklist per role; **Create role**, **Clone**, **Delete** (guarded); bump **policy version** so tokens refresh.
+**Back end:** `GET/POST/PATCH /roles`, `GET/POST /roles/:id/permissions`, emits `PermissionsChanged`.
+
+## Teams / groups (`/orgs/:slug/teams`)
+
+**Purpose:** group members for simpler permissions.
+**Must have:** create team, add/remove users, attach team to roles or specific resources; show effective permissions.
+**Back end:** `GET/POST /orgs/:id/teams`, `POST /orgs/:id/teams/:tid/members`.
+
+## Access requests (`/orgs/:slug/access-requests`)
+
+**Purpose:** request-to-join workflow when invites are not used.
+**Must have:** queue with applicant email, note, date; **Approve** (assign role) or **Reject** with reason; auto-expiry.
+**Back end:** `GET/POST /orgs/:id/access-requests`.
+
+## Domains & SSO (phase-2) (`/orgs/:slug/security/sso`)
+
+**Purpose:** enterprise sign-in.
+**Must have:** SAML/OIDC config, ACS/metadata download, test connection, assign default role for IdP users, domain verification (DNS/TXT).
+**Back end:** `/sso/:org/*` plus verification endpoints.
+
+## Security settings (`/orgs/:slug/security`)
+
+**Purpose:** workspace security posture.
+**Must have:** required MFA policy, session lifetime overrides, IP allow/deny lists, export of security log for the org, enforce verified email.
+**Back end:** `GET/PATCH /orgs/:id/security`, `GET /orgs/:id/audit`.
+
+## Integrations (`/orgs/:slug/integrations`)
+
+**Purpose:** connect third-party tools.
+**Must have:** connectors (Google, Microsoft, Slack, payment, storage); OAuth status, **Connect/Disconnect**, permission scopes; per-connector settings.
+**Back end:** provider-specific endpoints behind the gateway.
+
+## Billing (if applicable) (`/orgs/:slug/billing`)
+
+**Purpose:** plans and invoices.
+**Must have:** current plan, usage, payment method, invoice history, download invoice, change plan, cancel; regional tax fields.
+**Back end:** `GET/PATCH /billing/subscription`, `GET /billing/invoices`.
+
+# Platform-wide admin (internal staff only)
+
+## User directory (`/admin/users`)
+
+**Purpose:** search and manage users.
+**Must have:** advanced filters (email, status, role, MFA), export; click through to **User detail**.
+**Back end:** `GET /admin/users?query=...`.
+
+## User detail (`/admin/users/:id`)
+
+**Purpose:** full lifecycle actions on one account.
+**Must have:** identity panel, emails, providers, sessions, MFA factors; **Force verify**, **Revoke all sessions**, **Reset MFA**, **Deactivate/Reactivate**, view audit; impersonation (if allowed) with strict logging and time-boxed tokens.
+**Back end:** `GET /admin/users/:id`, `POST /admin/users/:id/*`.
+
+## Organisation directory & detail (`/admin/orgs`, `/admin/orgs/:id`)
+
+**Purpose:** oversight of workspaces.
+**Must have:** owner, member count, plan, security posture; actions to transfer ownership, enforce MFA, lock or delete workspace.
+**Back end:** admin variants of org endpoints.
+
+## Risk & abuse centre (`/admin/risk`)
+
+**Purpose:** monitor suspicious activity.
+**Must have:** failed login spikes, token reuse incidents, geo anomalies, IP reputation; **Require MFA** flag per user; blocklist management.
+**Back end:** `GET /admin/risk/*`, actions that toggle enforcement flags.
+
+## Email & notification status (`/admin/notifications`)
+
+**Purpose:** delivery debugging.
+**Must have:** logs for verify and reset mails, bounces, complaints, resend actions, provider status.
+
+# Jobs (applicant-facing) — user management touchpoints
+
+## Applicant profile (`/jobs/profile`)
+
+**Purpose:** CV and preferences for Jobs microservice.
+**Must have:** personal summary, skills/tags, CV upload, visibility; link to **Account → Privacy** for data rights.
+**Back end:** service-local profile endpoints, guarded by JWT.
+
+# Critical cross-cutting rules (apply to all pages)
+
+**Re-authentication for sensitive actions:** changing password, email, unlinking last sign-in method, generating backup codes, deleting account, transferring org ownership.
+**MFA step-up on risk:** if risk score is high, challenge even when page normally wouldn’t.
+**Authorisation by claims, not UI:** pages render from server-authorised data; never “hide to secure”.
+**Idempotency on all mutating endpoints:** every major action accepts an idempotency key to prevent double-submits.
+**Audit everything that changes auth state:** success and failure, with actor, IP, user-agent, and trace id.
+
+---
+
+If you want this turned into a **routing map + file checklist** for each folder in your repo (e.g., pages for Vite/React and FastAPI routers with stub handlers), say the word and I’ll draft the exact paths, components, and endpoint stubs you can paste into *Auth*, *Academia*, *NGOs*, *Business*, and *Jobs*.
