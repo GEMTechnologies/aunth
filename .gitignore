@@ -1,0 +1,35 @@
+# ---- Secrets and local configuration ----
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# ---- Python ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+htmlcov/
+
+# ---- Node / frontend ----
+node_modules/
+.pnpm-store/
+dist/
+build/
+
+# ---- Local artefacts ----
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# ---- Archives left by tooling ----
+Auth.zip
+*.zip
