@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Header, Request
 from fastapi.security import OAuth2PasswordBearer, HTTPBearer
 from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import text
 from typing import Optional, List
 from jose import JWTError
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ from database import get_db
 import schemas, models, service, security, oauth
 from config import settings
 from context_service import ContextService
-from service import OrganizationService, AuthService, SessionService, PasswordResetService
+from service import OrganizationService, AuthService, SessionService, PasswordResetService, AuditService
 from security import decode_access_token
 
 logger = logging.getLogger(__name__)
@@ -344,16 +345,15 @@ def update_user_profile(
             current_user.locale = payload.locale
 
         # Create audit log
-        audit_log = models.AuditLog(
-            user_id=current_user.id,
-            actor_user_id=current_user.id,
+        AuditService.record(
+            db,
             event="user.profile_updated",
-            payload_json={
+            user_id=current_user.id,
+            payload={
                 "display_name": payload.display_name,
-                "locale": payload.locale
-            }
+                "locale": payload.locale,
+            },
         )
-        db.add(audit_log)
 
         db.commit()
         db.refresh(current_user)
@@ -438,7 +438,7 @@ def list_organization_members(
     try:
         # Check if user is member of organization
         membership = db.query(models.OrgMember).filter(
-            models.OrgMember.organisation_id == org_id,
+            models.OrgMember.org_id == org_id,
             models.OrgMember.user_id == current_user.id
         ).first()
         
@@ -447,14 +447,15 @@ def list_organization_members(
         
         # Get all members
         members = db.query(models.OrgMember).options(
-            joinedload(models.OrgMember.user).joinedload(models.User.primary_email)
-        ).filter(models.OrgMember.organisation_id == org_id).all()
+            joinedload(models.OrgMember.user).joinedload(models.User.primary_email),
+            joinedload(models.OrgMember.role),
+        ).filter(models.OrgMember.org_id == org_id).all()
         
         return [
             {
                 "user_id": member.user_id,
-                "role": member.role,
-                "joined_at": member.created_at,
+                "role": member.role.key if member.role else None,
+                "joined_at": member.joined_at,
                 "user": {
                     "id": member.user.id,
                     "display_name": member.user.display_name,
@@ -483,7 +484,7 @@ def invite_member(
     try:
         # Check if user has admin role
         membership = db.query(models.OrgMember).filter(
-            models.OrgMember.organisation_id == org_id,
+            models.OrgMember.org_id == org_id,
             models.OrgMember.user_id == current_user.id,
             models.OrgMember.role.in_(["admin", "owner"])
         ).first()
@@ -492,15 +493,20 @@ def invite_member(
             raise HTTPException(status_code=403, detail="Admin access required")
         
         # Check if user already exists and add them directly
-        existing_user = db.query(models.User).join(models.Email).filter(
-            models.Email.email == payload.email.lower().strip(),
-            models.Email.is_primary == True
-        ).first()
+        existing_user = (
+            db.query(models.User)
+            .join(models.Email, models.Email.user_id == models.User.id)
+            .filter(
+                models.Email.email == payload.email.lower().strip(),
+                models.Email.is_primary.is_(True),
+            )
+            .first()
+        )
         
         if existing_user:
             # Check if already a member
             existing_member = db.query(models.OrgMember).filter(
-                models.OrgMember.organisation_id == org_id,
+                models.OrgMember.org_id == org_id,
                 models.OrgMember.user_id == existing_user.id
             ).first()
             
@@ -508,10 +514,14 @@ def invite_member(
                 raise HTTPException(status_code=400, detail="User is already a member")
             
             # Add as member
+            # OrgMember stores a role_id foreign key; the old `role=` string
+            # column no longer exists, so resolve the key to a Role row.
+            role_key = (payload.role or "member").lower()
+            role_row = OrganizationService._ensure_role(db, role_key, role_key)
             new_member = models.OrgMember(
-                organisation_id=org_id,
+                org_id=org_id,
                 user_id=existing_user.id,
-                role=payload.role
+                role_id=role_row.id,
             )
             db.add(new_member)
             db.commit()
@@ -538,18 +548,23 @@ def update_member_role(
     """Update member role in organization"""
     try:
         # Check if current user has admin role
-        admin_membership = db.query(models.OrgMember).filter(
-            models.OrgMember.organisation_id == org_id,
-            models.OrgMember.user_id == current_user.id,
-            models.OrgMember.role.in_(["admin", "owner"])
-        ).first()
+        admin_membership = (
+            db.query(models.OrgMember)
+            .join(models.Role, models.Role.id == models.OrgMember.role_id)
+            .filter(
+                models.OrgMember.org_id == org_id,
+                models.OrgMember.user_id == current_user.id,
+                models.Role.key.in_(["admin", "owner"]),
+            )
+            .first()
+        )
         
         if not admin_membership:
             raise HTTPException(status_code=403, detail="Admin access required")
         
         # Find member to update
         member = db.query(models.OrgMember).filter(
-            models.OrgMember.organisation_id == org_id,
+            models.OrgMember.org_id == org_id,
             models.OrgMember.user_id == user_id
         ).first()
         
@@ -557,20 +572,20 @@ def update_member_role(
             raise HTTPException(status_code=404, detail="Member not found")
         
         # Update role
-        member.role = payload.role
+        new_role_key = (payload.role or "member").lower()
+        member.role_id = OrganizationService._ensure_role(db, new_role_key, new_role_key).id
         
         # Create audit log
-        audit_log = models.AuditLog(
-            user_id=current_user.id,
-            actor_user_id=current_user.id,
+        AuditService.record(
+            db,
             event="org.member_role_updated",
-            payload_json={
-                "org_id": org_id,
+            user_id=current_user.id,
+            org_id=org_id,
+            payload={
                 "target_user_id": user_id,
-                "new_role": payload.role
-            }
+                "new_role": new_role_key,
+            },
         )
-        db.add(audit_log)
         
         db.commit()
         
@@ -593,18 +608,23 @@ def remove_member(
     """Remove member from organization"""
     try:
         # Check if current user has admin role
-        admin_membership = db.query(models.OrgMember).filter(
-            models.OrgMember.organisation_id == org_id,
-            models.OrgMember.user_id == current_user.id,
-            models.OrgMember.role.in_(["admin", "owner"])
-        ).first()
+        admin_membership = (
+            db.query(models.OrgMember)
+            .join(models.Role, models.Role.id == models.OrgMember.role_id)
+            .filter(
+                models.OrgMember.org_id == org_id,
+                models.OrgMember.user_id == current_user.id,
+                models.Role.key.in_(["admin", "owner"]),
+            )
+            .first()
+        )
         
         if not admin_membership:
             raise HTTPException(status_code=403, detail="Admin access required")
         
         # Find member to remove
         member = db.query(models.OrgMember).filter(
-            models.OrgMember.organisation_id == org_id,
+            models.OrgMember.org_id == org_id,
             models.OrgMember.user_id == user_id
         ).first()
         
@@ -612,11 +632,17 @@ def remove_member(
             raise HTTPException(status_code=404, detail="Member not found")
         
         # Don't allow removing the last owner
-        if member.role == "owner":
-            owner_count = db.query(models.OrgMember).filter(
-                models.OrgMember.organisation_id == org_id,
-                models.OrgMember.role == "owner"
-            ).count()
+        member_role_key = member.role.key if member.role else None
+        if member_role_key == "owner":
+            owner_count = (
+                db.query(models.OrgMember)
+                .join(models.Role, models.Role.id == models.OrgMember.role_id)
+                .filter(
+                    models.OrgMember.org_id == org_id,
+                    models.Role.key == "owner",
+                )
+                .count()
+            )
             
             if owner_count <= 1:
                 raise HTTPException(
@@ -627,17 +653,16 @@ def remove_member(
         db.delete(member)
         
         # Create audit log
-        audit_log = models.AuditLog(
-            user_id=current_user.id,
-            actor_user_id=current_user.id,
+        AuditService.record(
+            db,
             event="org.member_removed",
-            payload_json={
-                "org_id": org_id,
+            user_id=current_user.id,
+            org_id=org_id,
+            payload={
                 "removed_user_id": user_id,
-                "removed_role": member.role
-            }
+                "removed_role": member_role_key,
+            },
         )
-        db.add(audit_log)
         
         db.commit()
         
@@ -746,13 +771,12 @@ def unlink_oauth_account(
         db.delete(oauth_account)
 
         # Create audit log
-        audit_log = models.AuditLog(
-            user_id=current_user.id,
-            actor_user_id=current_user.id,
+        AuditService.record(
+            db,
             event="oauth.account_unlinked",
-            payload_json={"provider": provider}
+            user_id=current_user.id,
+            payload={"provider": provider},
         )
-        db.add(audit_log)
 
         db.commit()
         return {"message": "OAuth account unlinked successfully"}
@@ -784,13 +808,12 @@ def change_password(
         current_user.password_credential.updated_at = datetime.now(timezone.utc)
         
         # Create audit log
-        audit_log = models.AuditLog(
-            user_id=current_user.id,
-            actor_user_id=current_user.id,
+        AuditService.record(
+            db,
             event="user.password_changed",
-            payload_json={}
+            user_id=current_user.id,
+            payload={},
         )
-        db.add(audit_log)
         
         db.commit()
         
@@ -823,13 +846,12 @@ def revoke_user_session(
         SessionService.revoke_session(db, session_id)
         
         # Create audit log
-        audit_log = models.AuditLog(
-            user_id=current_user.id,
-            actor_user_id=current_user.id,
+        AuditService.record(
+            db,
             event="user.session_revoked",
-            payload_json={"session_id": session_id}
+            user_id=current_user.id,
+            payload={"session_id": session_id},
         )
-        db.add(audit_log)
         db.commit()
         
     except HTTPException:
@@ -866,13 +888,12 @@ def revoke_other_sessions(
             revoked_count += 1
         
         # Create audit log
-        audit_log = models.AuditLog(
-            user_id=current_user.id,
-            actor_user_id=current_user.id,
+        AuditService.record(
+            db,
             event="user.other_sessions_revoked",
-            payload_json={"revoked_count": revoked_count}
+            user_id=current_user.id,
+            payload={"revoked_count": revoked_count},
         )
-        db.add(audit_log)
         
         db.commit()
         
@@ -886,7 +907,7 @@ def health_check(db: Session = Depends(get_db)):
     """Health check endpoint"""
     try:
         # Test database connection
-        db.execute("SELECT 1")
+        db.execute(text("SELECT 1"))
         return {
             "status": "healthy",
             "service": "granada-auth",

@@ -320,6 +320,24 @@ def resolve_tenant(payload: Dict[str, Any], required: bool = True) -> Optional[s
     return None
 
 
+def require_tenant(payload: Dict[str, Any], org_id: str) -> str:
+    """Assert the token is scoped to exactly ``org_id`` and return it.
+
+    ``resolve_tenant`` answers "does this token carry a tenant". This answers
+    the question every tenant-scoped endpoint actually needs to ask: is this
+    token scoped to the organisation whose data was requested. A token from
+    another organisation, or one carrying no tenant at all, is denied.
+    """
+    if not org_id:
+        raise TenantScopeError(
+            "No organisation was specified for a tenant-scoped operation"
+        )
+    scoped = resolve_tenant(payload, required=True)
+    if str(scoped) != str(org_id):
+        raise TenantScopeError(f"Token is not scoped to organisation {org_id}")
+    return str(scoped)
+
+
 # ---------------------------------------------------------------------------
 # Refresh tokens (opaque, rotated, reuse-detected)
 # ---------------------------------------------------------------------------

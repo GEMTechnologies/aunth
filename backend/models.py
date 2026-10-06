@@ -29,7 +29,14 @@ class User(Base):
     password_credential: Mapped[Optional["PasswordCredential"]] = relationship("PasswordCredential", back_populates="user")
     password_resets: Mapped[List["PasswordReset"]] = relationship("PasswordReset", back_populates="user", cascade="all, delete-orphan")
     sessions: Mapped[List["Session"]] = relationship("Session", back_populates="user")
-    org_memberships: Mapped[List["OrgMember"]] = relationship("OrgMember", back_populates="user")
+    # users -> org_members has one path, but Organisation.owner_user_id is
+    # also a FK to users. Without an explicit foreign_keys SQLAlchemy raises
+    # AmbiguousForeignKeysError the first time this relationship is used.
+    org_memberships: Mapped[List["OrgMember"]] = relationship(
+        "OrgMember",
+        back_populates="user",
+        foreign_keys="OrgMember.user_id",
+    )
     owned_orgs: Mapped[List["Organisation"]] = relationship("Organisation", back_populates="owner")
     audit_logs: Mapped[List["AuditLog"]] = relationship("AuditLog", foreign_keys="AuditLog.user_id", back_populates="user")
     oauth_accounts: Mapped[List["OAuthAccount"]] = relationship("OAuthAccount", back_populates="user")
@@ -102,9 +109,17 @@ class Organisation(Base):
 
     # Relationships
     owner = relationship("User", back_populates="owned_orgs")
-    members = relationship("OrgMember", back_populates="organisation", cascade="all, delete-orphan")
-    contexts: Mapped[List["UserContext"]] = relationship("UserContext", back_populates="organisation", cascade="all, delete-orphan")
-    audit_logs = relationship("AuditLog", back_populates="organisation")
+    # organisations -> org_members is unambiguous, but AuditLog and
+    # UserContext both also point at organisations; naming the foreign key
+    # keeps this stable if those tables gain further paths.
+    members = relationship(
+        "OrgMember",
+        back_populates="organisation",
+        foreign_keys="OrgMember.org_id",
+        cascade="all, delete-orphan",
+    )
+    contexts: Mapped[List["UserContext"]] = relationship("UserContext", back_populates="organisation", cascade="all, delete-orphan", foreign_keys="UserContext.org_id")
+    audit_logs = relationship("AuditLog", back_populates="organisation", foreign_keys="AuditLog.org_id")
     saml_providers = relationship("SAMLProvider", back_populates="organisation")
 
 class Role(Base):
@@ -145,8 +160,23 @@ class OrgMember(Base):
     invited_by: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
 
     # Relationships
-    organisation: Mapped["Organisation"] = relationship("Organisation", back_populates="members")
-    user: Mapped["User"] = relationship("User", back_populates="org_memberships")
+    # org_members carries two FKs to users (user_id and invited_by) and two to
+    # organisations/roles, so every relationship on this class must name its
+    # foreign key explicitly.
+    organisation: Mapped["Organisation"] = relationship(
+        "Organisation",
+        back_populates="members",
+        foreign_keys=[org_id],
+    )
+    user: Mapped["User"] = relationship(
+        "User",
+        back_populates="org_memberships",
+        foreign_keys=[user_id],
+    )
+    role: Mapped["Role"] = relationship("Role", foreign_keys=[role_id])
+    inviter: Mapped[Optional["User"]] = relationship(
+        "User", foreign_keys=[invited_by], viewonly=True
+    )
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
@@ -156,7 +186,12 @@ class AuditLog(Base):
     actor_user_id: Mapped[Optional[str]] = mapped_column(ForeignKey("users.id"))
     org_id: Mapped[Optional[str]] = mapped_column(ForeignKey("organisations.id"))
     event: Mapped[str] = mapped_column(String(50), index=True)
-    ip: Mapped[str] = mapped_column(String(45))
+    # NOT NULL in the schema, yet every one of the ten construction sites
+    # omitted it, so each INSERT raised IntegrityError and the surrounding
+    # transaction rolled back. The default guarantees the audit row survives
+    # even when the caller cannot supply an address; AuditService.record()
+    # should be preferred so the real client IP is captured.
+    ip: Mapped[str] = mapped_column(String(45), default="unknown")
     user_agent: Mapped[Optional[str]] = mapped_column(Text)
     payload_json: Mapped[Optional[dict]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
@@ -262,6 +297,34 @@ class UserContext(Base):
     # Relationships
     user: Mapped["User"] = relationship("User")
     organisation: Mapped[Optional["Organisation"]] = relationship("Organisation")
+
+class OAuthAuthCode(Base):
+    """One-time code handed to the browser after an OAuth redirect.
+
+    The callback used to place the access and refresh tokens directly in the
+    redirect URL query string. URLs leak: they land in browser history, in the
+    Referer header of any third-party request, in browser extensions, and in
+    every access log between the provider and here. The redirect now carries
+    only this short-lived, single-use code; the frontend exchanges it over
+    POST for the tokens themselves.
+
+    Only the hash of the code is stored, so a database disclosure does not
+    yield usable credentials.
+    """
+    __tablename__ = "oauth_auth_codes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    code_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    session_id: Mapped[Optional[str]] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), nullable=True)
+    redirect_to: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    # Relationships
+    user: Mapped["User"] = relationship("User")
+
 
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)

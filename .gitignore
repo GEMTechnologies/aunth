@@ -29,6 +29,10 @@ build/
 *.sqlite
 *.sqlite3
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.check
 
 # ---- Archives left by tooling ----
 Auth.zip

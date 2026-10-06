@@ -1,6 +1,7 @@
 from typing import Optional, Dict, Any, List
 from fastapi import HTTPException, status, Depends, APIRouter
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 import httpx
 import secrets
@@ -9,13 +10,57 @@ import logging
 
 import models, schemas
 from config import settings
-from security import generate_secure_token, create_access_token, create_refresh_token
+from security import generate_secure_token, create_access_token, create_refresh_token, hash_token
 from database import get_db
-from models import User, OAuthState, OAuthAccount, AuditLog
+from models import User, OAuthState, OAuthAccount, AuditLog, OAuthAuthCode
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# The OAuth callback used to read ``FRONTEND_URL``. The Settings
+# field is ``frontend_url``; the capitalised name raises AttributeError, which
+# meant every error path below crashed while reporting the original error.
+FRONTEND_URL = settings.frontend_url
+
+# A redirect code is a credential. It is short-lived and single-use.
+AUTH_CODE_TTL_SECONDS = 120
+
+
+def _frontend_redirect(**params: Any) -> RedirectResponse:
+    """Redirect back to the SPA carrying only non-secret parameters."""
+    from urllib.parse import urlencode
+
+    clean = {k: v for k, v in params.items() if v is not None}
+    return RedirectResponse(url=f"{FRONTEND_URL}?{urlencode(clean)}")
+
+
+def issue_auth_code(
+    db: Session,
+    user_id: str,
+    session_id: Optional[str] = None,
+    redirect_to: Optional[str] = None,
+) -> str:
+    """Mint a single-use code the SPA exchanges for tokens over POST.
+
+    Returning the raw access and refresh tokens in a redirect URL puts them
+    into browser history, the Referer header, proxy logs and provider logs.
+    The URL therefore carries only this code, which is useless after one use
+    or after two minutes.
+    """
+    code = secrets.token_urlsafe(32)
+    db.add(
+        models.OAuthAuthCode(
+            code_hash=hash_token(code),
+            user_id=user_id,
+            session_id=session_id,
+            redirect_to=redirect_to,
+            expires_at=datetime.now(timezone.utc)
+            + timedelta(seconds=AUTH_CODE_TTL_SECONDS),
+        )
+    )
+    db.commit()
+    return code
 
 class OAuthProvider:
     """Base OAuth provider class"""
@@ -252,7 +297,7 @@ class OAuthService:
 
         if not oauth_state:
             logger.warning(f"Invalid or expired state received for provider: {provider_name}, state: {state}")
-            return RedirectResponse(url=f"{settings.FRONTEND_URL}?error=Invalid or expired state")
+            return RedirectResponse(url=f"{FRONTEND_URL}?error=Invalid or expired state")
 
         # Mark state as used
         oauth_state.used_at = datetime.now(timezone.utc)
@@ -265,27 +310,27 @@ class OAuthService:
             token_data = await provider.exchange_code(code, state)
         except HTTPException as e:
             logger.error(f"Error during token exchange for {provider_name}: {e.detail}")
-            return RedirectResponse(url=f"{settings.FRONTEND_URL}?error={e.detail}")
+            return RedirectResponse(url=f"{FRONTEND_URL}?error={e.detail}")
         except Exception as e:
             logger.error(f"Unexpected error during token exchange for {provider_name}: {e}")
-            return RedirectResponse(url=f"{settings.FRONTEND_URL}?error=An unexpected error occurred during authentication.")
+            return RedirectResponse(url=f"{FRONTEND_URL}?error=An unexpected error occurred during authentication.")
 
 
         access_token = token_data.get("access_token")
 
         if not access_token:
             logger.error(f"Access token not found in response from {provider_name}: {token_data}")
-            return RedirectResponse(url=f"{settings.FRONTEND_URL}?error=Failed to retrieve access token.")
+            return RedirectResponse(url=f"{FRONTEND_URL}?error=Failed to retrieve access token.")
 
         # Get user info
         try:
             user_info = await provider.get_user_info(access_token)
         except HTTPException as e:
             logger.error(f"Error retrieving user info from {provider_name}: {e.detail}")
-            return RedirectResponse(url=f"{settings.FRONTEND_URL}?error={e.detail}")
+            return RedirectResponse(url=f"{FRONTEND_URL}?error={e.detail}")
         except Exception as e:
             logger.error(f"Unexpected error retrieving user info from {provider_name}: {e}")
-            return RedirectResponse(url=f"{settings.FRONTEND_URL}?error=An unexpected error occurred while fetching user information.")
+            return RedirectResponse(url=f"{FRONTEND_URL}?error=An unexpected error occurred while fetching user information.")
 
 
         # Find or create user
@@ -295,13 +340,20 @@ class OAuthService:
 
         db.commit() # Commit user creation/update
 
-        # Create JWT tokens
-        jwt_access_token = create_access_token(data={"sub": str(user.id)})
-        jwt_refresh_token = create_refresh_token(data={"sub": str(user.id)})
+        # Create a real session so the refresh token is stored, revocable and
+        # replay-detectable, then hand the browser a one-time code.
+        from service import SessionService
 
-        # Redirect to frontend with tokens
-        redirect_url = f"{getattr(settings, 'frontend_url', 'http://localhost:3000')}?access_token={jwt_access_token}&refresh_token={jwt_refresh_token}"
-        return RedirectResponse(url=redirect_url)
+        session_record = SessionService.create_session(
+            db, user, user_agent=self._user_agent
+        )
+        SessionService.issue_tokens(db, user, session_record)
+        db.commit()
+
+        code = issue_auth_code(db, str(user.id), session_record.id)
+
+        # The URL carries a single-use code, never a credential.
+        return _frontend_redirect(code=code)
 
     async def _find_or_create_oauth_user(
         self,
@@ -321,6 +373,8 @@ class OAuthService:
                 status_code=400,
                 detail="Email not provided by OAuth provider"
             )
+
+        new_user_created = False
 
         # Check for existing OAuth connection
         oauth_account = db.query(models.OAuthAccount).filter(
@@ -349,6 +403,7 @@ class OAuthService:
             logger.info(f"Linking OAuth account to existing user ID: {user.id} via email: {email}")
         else:
             # Create new user
+            new_user_created = True
             display_name = user_info.get("name") or user_info.get("login") or email.split("@")[0]
             user = models.User(
                 display_name=display_name,
@@ -385,17 +440,19 @@ class OAuthService:
         db.add(oauth_account)
 
         # Create audit log
-        audit_log = models.AuditLog(
+        from service import AuditService
+
+        AuditService.record(
+            db,
+            event="oauth.account_linked",
             user_id=user.id,
-            event="oauth.account_linked", # or "oauth.login_success" if user existed
-            payload_json={
+            payload={
                 "provider": provider_name,
                 "provider_user_id": provider_user_id,
                 "email": email,
-                "new_user_created": email_obj.user_id == user.id and not oauth_account.user_id == user.id # A bit complex, better to have a flag
-            }
+                "new_user_created": bool(new_user_created),
+            },
         )
-        db.add(audit_log)
         logger.info(f"Created OAuth account link for user ID: {user.id}, provider: {provider_name}, provider user ID: {provider_user_id}")
 
         return user
@@ -437,17 +494,78 @@ async def oauth_callback(
     """Handle OAuth callback and create/login user"""
     if error:
         logger.error(f"OAuth callback error for {provider}: {error}")
-        return RedirectResponse(url=f"{settings.FRONTEND_URL}?error={error}")
+        return RedirectResponse(url=f"{FRONTEND_URL}?error={error}")
 
     if not code or not state:
         logger.error(f"Missing code or state in OAuth callback for {provider}")
-        return RedirectResponse(url=f"{settings.FRONTEND_URL}?error=Authentication parameters missing")
+        return RedirectResponse(url=f"{FRONTEND_URL}?error=Authentication parameters missing")
 
     try:
         return await oauth_service.handle_oauth_callback(provider, code, state, db)
     except HTTPException as e:
         logger.error(f"HTTP Exception during OAuth callback for {provider}: {e.detail}")
-        return RedirectResponse(url=f"{settings.FRONTEND_URL}?error={e.detail}")
+        return RedirectResponse(url=f"{FRONTEND_URL}?error={e.detail}")
     except Exception as e:
         logger.exception(f"Unexpected error during OAuth callback for {provider}") # Log the full traceback
-        return RedirectResponse(url=f"{settings.FRONTEND_URL}?error=An unexpected error occurred during authentication.")
+        return RedirectResponse(url=f"{FRONTEND_URL}?error=An unexpected error occurred during authentication.")
+
+
+class CodeExchangeRequest(BaseModel):
+    code: str = Field(..., min_length=10, max_length=256)
+
+
+@router.post("/auth/oauth/exchange")
+async def exchange_oauth_code(
+    payload: CodeExchangeRequest,
+    db: Session = Depends(get_db),
+):
+    """Trade a one-time redirect code for the tokens it stands for.
+
+    Single-use and short-lived: the row is burned on the first successful
+    exchange, so a code captured from history or a log cannot be replayed.
+    """
+    from service import SessionService
+
+    record = (
+        db.query(models.OAuthAuthCode)
+        .filter(models.OAuthAuthCode.code_hash == hash_token(payload.code))
+        .one_or_none()
+    )
+
+    now = datetime.now(timezone.utc)
+
+    def _invalid() -> HTTPException:
+        # One message for every failure mode, so the endpoint does not
+        # disclose whether a code ever existed.
+        return HTTPException(status_code=401, detail="Invalid or expired code")
+
+    if record is None or record.used_at is not None:
+        raise _invalid()
+
+    expires_at = record.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= now:
+        raise _invalid()
+
+    user = db.query(models.User).filter(models.User.id == record.user_id).one_or_none()
+    if user is None or user.status != "active":
+        # Suspended or deleted accounts must not complete a sign-in that
+        # started while they were still active.
+        raise _invalid()
+
+    # Burn the code before handing out anything, so a concurrent replay of
+    # the same code cannot race two token pairs into existence.
+    record.used_at = now
+    db.commit()
+
+    session_record = SessionService.create_session(db, user)
+    pair = SessionService.issue_tokens(db, user, session_record)
+    db.commit()
+
+    return {
+        "access_token": pair.access_token,
+        "refresh_token": pair.refresh_token,
+        "token_type": "bearer",
+        "expires_in": settings.access_token_expire_minutes * 60,
+    }
