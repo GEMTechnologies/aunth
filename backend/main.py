@@ -10,12 +10,14 @@ import uuid
 
 from database import engine, Base, create_tables, DatabaseManager
 from router import router
-from oauth import oauth_router
+from oauth import router as oauth_router
 from config import settings
 
 # Configure logging
+# The previous expression was getattr(settings.log_level.upper()), which calls
+# a two-argument builtin with one argument and raises TypeError at import.
 logging.basicConfig(
-    level=getattr(settings.log_level.upper()),
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format=settings.log_format
 )
 logger = logging.getLogger(__name__)
@@ -66,9 +68,12 @@ if settings.app_env == "production":
     )
 
 # CORS middleware
+# A wildcard origin combined with allow_credentials is rejected by browsers and
+# would defeat cookie authentication if it ever took effect. Development is
+# pinned to the configured local origins instead of "*".
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_origins if settings.app_env != "development" else ["*"],
+    allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],

@@ -1,8 +1,13 @@
-from sqlalchemy import create_engine, event, Engine
-from sqlalchemy.orm import sessionmaker, DeclarativeBase
+from sqlalchemy import create_engine, event, text, Engine
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from config import settings
-import sqlite3
+
+# The declarative base must be the ONE defined in models.py. This module used to
+# declare its own Base, which created a second metadata registry: models stayed
+# invisible to this registry, so create_tables() silently created nothing and
+# drop_tables() silently dropped nothing.
+from models import Base
 
 # SQLite WAL mode optimization
 @event.listens_for(Engine, "connect")
@@ -35,9 +40,6 @@ if settings.database_url.startswith("sqlite"):
 engine = create_engine(settings.database_url, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-class Base(DeclarativeBase):
-    pass
-
 def get_db():
     """Database dependency for FastAPI"""
     db = SessionLocal()
@@ -46,13 +48,29 @@ def get_db():
     finally:
         db.close()
 
+
 def create_tables():
-    """Create all database tables"""
+    """Create all database tables.
+
+    This is a development convenience only. Production schema changes go
+    through Alembic migrations (see alembic/versions/).
+    """
     Base.metadata.create_all(bind=engine)
 
-def drop_tables():
-    """Drop all database tables (use with caution)"""
+
+def drop_tables(confirm: bool = False):
+    """Drop all database tables.
+
+    Destructive and irreversible. Requires ``confirm=True`` so that an
+    accidental call cannot destroy tenant data.
+    """
+    if not confirm:
+        raise RuntimeError(
+            "drop_tables() destroys all data. Call drop_tables(confirm=True) "
+            "only against a disposable database."
+        )
     Base.metadata.drop_all(bind=engine)
+
 
 class DatabaseManager:
     """Database management utilities"""
@@ -63,14 +81,29 @@ class DatabaseManager:
 
     @staticmethod
     def execute_sql(sql: str, params: dict = None):
+        """Execute a literal SQL statement.
+
+        ``sql`` must be a complete statement and ``params`` uses bound
+        parameters. The previous implementation passed a bare string to
+        ``Connection.execute``, which SQLAlchemy 2.0 rejects with
+        ArgumentError ("Textual SQL expression should be explicitly declared
+        as text(...)").
+        """
         with engine.connect() as conn:
-            return conn.execute(sql, params or {})
+            return conn.execute(text(sql), params or {})
 
     @staticmethod
     def health_check() -> bool:
+        """Return True when the database answers.
+
+        The previous implementation executed the bare string ``"SELECT 1"``,
+        which raised ArgumentError on every call. The exception was swallowed
+        and False returned, so main.py treated a healthy database as down and
+        refused to start.
+        """
         try:
             with engine.connect() as conn:
-                conn.execute("SELECT 1")
+                conn.execute(text("SELECT 1"))
             return True
         except Exception:
             return False
