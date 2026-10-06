@@ -45,8 +45,18 @@ def upgrade() -> None:
     op.create_index(op.f('ix_emails_email'), 'emails', ['email'], unique=True)
     op.create_index(op.f('ix_emails_user_id'), 'emails', ['user_id'], unique=False)
 
-    # Add foreign key to users.primary_email_id
-    op.create_foreign_key(None, 'users', 'emails', ['primary_email_id'], ['id'])
+    # Add foreign key to users.primary_email_id.
+    # The constraint needs an explicit name: op.create_foreign_key(None, ...)
+    # makes PostgreSQL fail with "constraint name cannot be null".
+    # Wrapped in batch_alter_table because SQLite cannot ALTER a constraint on
+    # an existing table and raises NotImplementedError without it.
+    with op.batch_alter_table('users') as batch_op:
+        batch_op.create_foreign_key(
+            'fk_users_primary_email_id',
+            'emails',
+            ['primary_email_id'],
+            ['id'],
+        )
 
     # Create password_credentials table
     op.create_table('password_credentials',

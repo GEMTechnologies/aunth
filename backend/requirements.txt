@@ -1,25 +1,34 @@
+# Runtime dependencies for granada-auth.
+#
+# One entry per package. This file previously listed 7 packages twice with
+# conflicting pins (alembic 1.13.1 vs 1.12.1, pydantic-settings 2.1.0 vs
+# 2.0.3), which made an install non-deterministic. The versions below are the
+# ones the test suite currently runs green against.
 
+# --- Web framework ---
 fastapi==0.104.1
-uvicorn==0.24.0
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# --- Data layer ---
 sqlalchemy==2.0.23
 alembic==1.13.1
 psycopg2-binary==2.9.9
 redis==5.0.1
-passlib[argon2]==1.7.4
-python-jose[cryptography]==3.3.0
-python-multipart==0.0.6
+
+# --- Validation and settings ---
 pydantic==2.5.1
 pydantic-settings==2.1.0
 email-validator==2.1.0
+
+# --- Security ---
+passlib[argon2]==1.7.4
+python-jose[cryptography]==3.3.0
+
+# --- Templating and utilities ---
 jinja2==3.1.2
 python-dateutil==2.8.2
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-sqlalchemy==2.0.23
-alembic==1.12.1
-python-jose[cryptography]==3.3.0
-passlib[argon2]==1.7.4
-python-multipart==0.0.6
-httpx==0.25.2
-pydantic-settings==2.0.3
 python-dotenv==1.0.0
+
+# --- Outbound HTTP (OAuth provider calls) ---
+httpx==0.25.2
