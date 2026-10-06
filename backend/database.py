@@ -1,3 +1,7 @@
+"""Database engine and session plumbing."""
+
+import sqlite3
+
 from sqlalchemy import create_engine, event, text, Engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -9,17 +13,36 @@ from config import settings
 # drop_tables() silently dropped nothing.
 from models import Base
 
+
 # SQLite WAL mode optimization
 @event.listens_for(Engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
-    if 'sqlite' in settings.database_url:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.execute("PRAGMA temp_store=memory")
-        cursor.execute("PRAGMA mmap_size=268435456")  # 256MB
-        cursor.close()
+    """Apply SQLite pragmas to SQLite connections and to nothing else.
+
+    This listener is attached to the ``Engine`` class, so it fires for *every*
+    engine in the process, including engines this module never created.
+
+    It used to be gated on ``settings.database_url``, which is the wrong
+    question: that setting describes the application engine, not the connection
+    being opened. Any PostgreSQL engine built while settings happened to point
+    at SQLite - exactly what the test suite does, and what a multi-database
+    deployment does - received ``PRAGMA foreign_keys=ON`` and PostgreSQL
+    rejected it with a syntax error.
+
+    Testing the connection itself is both simpler and correct: a psycopg2
+    connection is simply not a ``sqlite3.Connection``, so non-SQLite drivers
+    are skipped no matter what the settings say.
+    """
+    if not isinstance(dbapi_connection, sqlite3.Connection):
+        return
+
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA temp_store=memory")
+    cursor.execute("PRAGMA mmap_size=268435456")  # 256MB
+    cursor.close()
 
 # Engine configuration
 engine_kwargs = {
