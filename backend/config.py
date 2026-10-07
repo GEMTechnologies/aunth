@@ -49,6 +49,17 @@ class Settings(BaseSettings):
         env_file=".env",
         case_sensitive=False,
         extra="ignore",
+        # Pydantic reserves the ``model_`` prefix because a field named
+        # ``model_dump`` or ``model_validate`` would shadow its own API. The
+        # model-gateway settings below genuinely need that prefix - "model
+        # provider" and "model classification model" are the domain's words -
+        # and none of them collides with a real ``BaseModel`` attribute.
+        #
+        # Rather than rely on "none of them collides today", that invariant is
+        # asserted in tests/test_model_gateway.py::test_no_setting_shadows_a_pydantic_attribute.
+        # A future `model_validate` setting would be caught there instead of
+        # silently breaking serialisation.
+        protected_namespaces=("settings_",),
     )
 
     # -- Application ------------------------------------------------------
@@ -165,6 +176,27 @@ class Settings(BaseSettings):
     max_upload_size: int = 10 * 1024 * 1024
     allowed_avatar_extensions: List[str] = [".jpg", ".jpeg", ".png", ".gif"]
 
+    # -- Model gateway ----------------------------------------------------
+    # Provider-neutral by construction: ``model_provider`` selects an adapter,
+    # and nothing above the gateway knows which vendor is behind it. Small
+    # models are used for classification and strong ones for synthesis, because
+    # paying synthesis prices to decide whether an email is an acknowledgement
+    # is the most common way an agent platform becomes uneconomic.
+    model_provider: str = "null"
+    model_classification_model: str = ""
+    model_synthesis_model: str = ""
+    model_api_key: str = ""
+    model_base_url: str = ""
+    model_timeout_seconds: int = 60
+    # Per-call cost ceiling in micro-dollars (1e-6 USD). Integer, not float:
+    # money in binary floating point accumulates error, and a budget guard that
+    # drifts is worse than none. Default 5_000_000 = $5.00.
+    model_max_cost_micros_per_call: int = 5_000_000
+    # Hard ceiling for one organisation in a rolling 24h window.
+    model_max_cost_micros_per_day: int = 50_000_000
+    # Prompts and responses are digested, not stored, unless this is on.
+    model_store_prompts: bool = False
+
     # -- Validators -------------------------------------------------------
     @field_validator("log_level")
     @classmethod
@@ -182,6 +214,22 @@ class Settings(BaseSettings):
                 f"log_level must be one of {sorted(allowed)}, got {value!r}"
             )
         return level
+
+    @field_validator("model_provider")
+    @classmethod
+    def _known_model_provider(cls, value: str) -> str:
+        """Reject an unknown provider at startup rather than at first call.
+
+        A typo here would otherwise surface as a failed agent run at 3am
+        rather than as a service that refuses to boot.
+        """
+        provider = (value or "null").strip().lower()
+        allowed = {"null", "scripted", "openai_compatible", "anthropic"}
+        if provider not in allowed:
+            raise ValueError(
+                f"model_provider must be one of {sorted(allowed)}, got {value!r}"
+            )
+        return provider
 
     @model_validator(mode="after")
     def _reject_insecure_secrets_outside_dev(self) -> "Settings":

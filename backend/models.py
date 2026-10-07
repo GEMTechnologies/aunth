@@ -474,11 +474,81 @@ class InboxEvent(Base):
     note: Mapped[Optional[str]] = mapped_column(Text)
 
 
+class ModelInvocation(Base):
+    """One call to a language model, recorded whether it succeeded or not.
+
+    Three obligations meet here.
+
+    **Cost control.** A platform that can spend money autonomously without
+    recording what it spent cannot be trusted with autonomy. Cost is stored in
+    integer micro-dollars because money in binary floating point accumulates
+    error, and a budget guard that drifts is worse than no guard.
+
+    **Why did it decide that?** The brief requires every automated decision to
+    have an evidence view. That view needs the provider, model and version, the
+    prompt version, and the outcome - so those are recorded as first-class
+    columns rather than buried in a JSON blob.
+
+    **Data minimisation.** The prompt and response are stored as SHA-256
+    digests, not text. The audit question is "was this the same input, and what
+    did it produce", which a digest answers; keeping donor and beneficiary text
+    in an ops table answers a question nobody should be asking.
+    ``settings.model_store_prompts`` can override that for debugging, and doing
+    so is a deliberate decision with a privacy cost.
+
+    ``org_id`` is nullable because system-level work (classifying an
+    un-attributed inbound webhook) legitimately has no tenant yet.
+    """
+
+    __tablename__ = "model_invocations"
+
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    INVALID_OUTPUT = "INVALID_OUTPUT"
+    BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
+
+    CLASSIFICATION = "CLASSIFICATION"
+    SYNTHESIS = "SYNTHESIS"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[Optional[str]] = mapped_column(ForeignKey("organisations.id"), index=True)
+    job_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    # What was asked of whom.
+    provider: Mapped[str] = mapped_column(String(50), index=True)
+    model: Mapped[str] = mapped_column(String(120), index=True)
+    model_version: Mapped[Optional[str]] = mapped_column(String(120))
+    tier: Mapped[str] = mapped_column(String(20), index=True)
+    prompt_version: Mapped[str] = mapped_column(String(50))
+    prompt_digest: Mapped[str] = mapped_column(String(64))
+    response_digest: Mapped[Optional[str]] = mapped_column(String(64))
+    # Only populated when settings.model_store_prompts is on.
+    prompt_text: Mapped[Optional[str]] = mapped_column(Text)
+    response_text: Mapped[Optional[str]] = mapped_column(Text)
+
+    # What it cost, and how long it took.
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_micros: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+    status: Mapped[str] = mapped_column(String(20), default=SUCCEEDED, index=True)
+    error_category: Mapped[Optional[str]] = mapped_column(String(40))
+    error_detail: Mapped[Optional[str]] = mapped_column(Text)
+
+    trace_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)
 Index("ix_jobs_dispatch", Job.state, Job.available_at)
 Index("ix_jobs_lease", Job.lease_expires_at)
 Index("ix_outbox_unpublished", OutboxEvent.published_at, OutboxEvent.created_at)
+Index("ix_model_invocations_org_created", ModelInvocation.org_id, ModelInvocation.created_at)
+Index("ix_model_invocations_model_status", ModelInvocation.model, ModelInvocation.status)
 Index("ix_refresh_tokens_expires", RefreshToken.expires_at)
 Index("ix_audit_logs_user_event", AuditLog.user_id, AuditLog.event)
 Index("ix_oauth_accounts_user", OAuthAccount.user_id)

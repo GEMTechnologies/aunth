@@ -722,3 +722,111 @@ def test_module_requires_postgresql():
         "RLS tests must run against PostgreSQL; SQLite cannot prove anything "
         "about row-level security."
     )
+
+
+def test_runtime_role_cannot_delete_the_ledger_or_the_evidence(pg_engine):
+    """Least privilege on the tables that record what the platform did.
+
+    Migrations 004 and 005 grant only SELECT/INSERT/UPDATE on ``jobs``,
+    ``job_attempts`` and ``model_invocations``: the application records its
+    work, it does not erase it. Purging a ledger is an administrative act and
+    belongs to the owner role.
+
+    **This test builds its own schema on purpose.** ``pg_engine`` grants
+    ``ALL ON ALL TABLES`` to the runtime role, and that is correct for what it
+    is for: it makes a forbidden DELETE fail because of *row-level security*
+    rather than because of a missing privilege, which is the property those 24
+    tests are asserting. Privileges are therefore not observable there, and
+    asserting them against that fixture would have measured the fixture rather
+    than the migrations.
+
+    Here the only table privileges are the ones the migrations themselves
+    confer, which is the production posture. The schema USAGE grant is not a
+    concession - without it the role cannot reach any object at all, and
+    migrations deliberately do not hand out schema-level rights.
+
+    ``has_table_privilege`` is used rather than
+    ``information_schema.role_table_grants`` because the view is not
+    authoritative: it has attributed privileges to ``granada_app`` that a live
+    connection was refused. TRUNCATE is included because it bypasses row-level
+    security entirely.
+    """
+    command, Config = _real_alembic()
+    role = _runtime_role_name()
+    schema = f"priv_test_{uuid.uuid4().hex[:10]}"
+
+    admin = create_engine(PG_URL, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as conn:
+            conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+    finally:
+        admin.dispose()
+
+    scoped = f"{PG_URL}?options=-csearch_path%3D{schema}"
+    previous = os.environ.get("DATABASE_URL")
+    previous_admin = os.environ.get("GRANADA_ADMIN_DATABASE_URL")
+    os.environ["DATABASE_URL"] = scoped
+    os.environ["GRANADA_ADMIN_DATABASE_URL"] = scoped
+    try:
+        cfg = Config(str(BACKEND / "alembic.ini"))
+        cfg.set_main_option("script_location", str(BACKEND / "alembic"))
+        command.upgrade(cfg, "head")
+
+        grant = create_engine(scoped, isolation_level="AUTOCOMMIT")
+        try:
+            with grant.connect() as conn:
+                # USAGE only. No table privileges: those must come from the
+                # migrations' own _grant_runtime().
+                conn.execute(text(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role}"'))
+        finally:
+            grant.dispose()
+
+        engine = create_engine(scoped)
+        try:
+            with engine.connect() as conn:
+                for name, allowed in (
+                    ("jobs", ("SELECT", "INSERT", "UPDATE")),
+                    ("job_attempts", ("SELECT", "INSERT", "UPDATE")),
+                    ("model_invocations", ("SELECT", "INSERT", "UPDATE")),
+                ):
+                    for privilege in allowed:
+                        assert conn.execute(
+                            text("SELECT has_table_privilege(:r, :t, :p)"),
+                            {"r": role, "t": f'"{schema}".{name}', "p": privilege},
+                        ).scalar(), (
+                            f"{role} is missing {privilege} on {name}; migration "
+                            "_grant_runtime() did not reach the scratch schema"
+                        )
+
+                    for privilege in ("DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"):
+                        assert not conn.execute(
+                            text("SELECT has_table_privilege(:r, :t, :p)"),
+                            {"r": role, "t": f'"{schema}".{name}', "p": privilege},
+                        ).scalar(), (
+                            f"{role} holds {privilege} on {name}; the runtime must "
+                            "not be able to erase or bypass the record of its own work"
+                        )
+
+                # The posture that motivated the whole privilege split.
+                assert not conn.execute(
+                    text("SELECT has_table_privilege(:r, :t, 'SELECT')"),
+                    {"r": role, "t": f'"{schema}".alembic_version'},
+                ).scalar(), f"{role} can read alembic_version"
+        finally:
+            engine.dispose()
+    finally:
+        if previous is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = previous
+        if previous_admin is None:
+            os.environ.pop("GRANADA_ADMIN_DATABASE_URL", None)
+        else:
+            os.environ["GRANADA_ADMIN_DATABASE_URL"] = previous_admin
+
+        cleanup = create_engine(PG_URL, isolation_level="AUTOCOMMIT")
+        try:
+            with cleanup.connect() as conn:
+                conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        finally:
+            cleanup.dispose()
