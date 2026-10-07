@@ -398,6 +398,31 @@ class ApplicationWorkspace:
     # ------------------------------------------------------------------
     # Readiness
     # ------------------------------------------------------------------
+    def _held_documents(self, canonical_type: str) -> list[models.Document]:
+        """Current documents whose type means the same thing as ``canonical_type``.
+
+        Matched in Python rather than in SQL because the synonym list lives in the
+        registry, and duplicating it as an ``IN`` clause is how the two drift apart again.
+        The row count here is small - an organisation holds tens of documents, not
+        millions - so the readability is worth more than the query.
+        """
+        from agent import document_types
+
+        rows = self.db.execute(
+            select(models.Document).where(
+                models.Document.org_id == self.org_id,
+                models.Document.is_current.is_(True),
+            )
+        ).scalars().all()
+        return [row for row in rows if document_types.is_same_type(row.doc_type, canonical_type)]
+
+    def _usable_document(self, vault: Any, canonical_type: str) -> bool:
+        """Whether an APPROVED, unexpired document of this type is held."""
+        for document in self._held_documents(canonical_type):
+            if vault.usable(doc_type=document.doc_type):
+                return True
+        return False
+
     def readiness(self, application: models.Application) -> ReadinessReport:
         """The deterministic checks that gate ``READY_TO_SUBMIT``.
 
@@ -434,30 +459,40 @@ class ApplicationWorkspace:
         text = " ".join(
             filter(None, [opportunity.eligibility_criteria, opportunity.application_process])
         ).casefold()
-        for doc_type, needles in (
-            ("registration_certificate", ("registration certificate", "certificate of registration")),
-            ("audited_accounts", ("audited accounts", "audited financial")),
-            ("tax_clearance", ("tax clearance", "tax compliance")),
-            ("bank_details", ("bank details", "bank account")),
-        ):
-            if not any(needle in text for needle in needles):
+        # The requirements come from ONE registry, and matching accepts the synonyms an
+        # organisation would actually have used.
+        #
+        # The previous version hard-coded `doc_type == "audited_accounts"` here while every
+        # helper in the codebase created `audited_financial_statements`. Nothing produced the
+        # type the gate asked for, so any listing mentioning audited accounts was
+        # permanently unsubmittable - and no test reached the branch, because every test
+        # opportunity's eligibility text omitted those phrases. `agent.document_types` is
+        # the single list, and this is the only place requirements are read.
+        from agent import document_types
+
+        for doc_type in document_types.required_types_for(text):
+            usable = self._usable_document(vault, doc_type)
+            if usable:
                 continue
-            usable = vault.usable(doc_type=doc_type)
-            if not usable:
-                held = self.db.execute(
-                    select(models.Document).where(
-                        models.Document.org_id == self.org_id,
-                        models.Document.doc_type == doc_type,
-                        models.Document.is_current.is_(True),
-                    )
-                ).scalars().all()
-                if held:
-                    blockers.append(
-                        f"the {doc_type.replace('_', ' ')} on file is not approved, "
-                        "or has expired"
-                    )
-                else:
-                    blockers.append(f"a {doc_type.replace('_', ' ')} is required but not held")
+            held = self._held_documents(doc_type)
+            if held:
+                blockers.append(
+                    f"the {doc_type.replace('_', ' ')} on file is not approved, "
+                    "or has expired"
+                )
+            else:
+                # The accepted names are listed, because "required but not held" for a
+                # document the organisation HAS under another name is the worst kind of
+                # blocker: it looks like missing evidence and is actually a vocabulary
+                # mismatch.
+                alternatives = ", ".join(
+                    name for name in document_types.DOCUMENT_TYPES.get(doc_type, ())
+                    if name != doc_type
+                ) or "no alternative names"
+                blockers.append(
+                    f"a {doc_type.replace('_', ' ')} is required but not held "
+                    f"(accepted names: {doc_type}, {alternatives})"
+                )
 
         # -- answers -----------------------------------------------------
         # Any answer the workspace has recorded as outstanding blocks readiness.

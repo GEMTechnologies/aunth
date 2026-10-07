@@ -527,7 +527,18 @@ class SubmissionService:
         commits the organisation's evidence: it names the exact documents and answers
         that are to be submitted in its name.
         """
-        package = self._package(package_id)
+        # A missing package returns a REFUSAL here, matching `execute`.
+        #
+        # The first version called `self._package(...)`, which raises — so the same
+        # not-found condition raised from `handoff` and returned a `NOT_FOUND` refusal from
+        # `execute`. Two paths answering one question differently is how a caller ends up
+        # handling only one of them, and the journey test hit it from a second organisation.
+        package = self._package(package_id, required=False)
+        if package is None:
+            return SubmissionRun(
+                package_id=package_id, refused=True, refusal_code="NOT_FOUND",
+                detail="no such submission package in this organisation",
+            )
 
         authorisation = self._authorisation_refusal(package)
         if authorisation is not None:

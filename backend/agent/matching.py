@@ -348,31 +348,36 @@ class EligibilityEngine:
             )
 
         vault = DocumentVault(self.db, self.memory.org_id)
-        wanted = [
-            doc_type
-            for doc_type, needles in (
-                ("registration_certificate", ("registration certificate", "certificate of registration", "certificate of incorporation")),
-                ("audited_accounts", ("audited accounts", "audited financial", "audit report")),
-                ("tax_clearance", ("tax clearance", "tax compliance", "tin certificate")),
-                ("bank_details", ("bank details", "bank account", "voided cheque")),
-            )
-            if any(needle in text for needle in needles)
-        ]
+        # ONE TABLE, from the registry. This method previously carried its own copy of the
+        # document types and phrases - a near-duplicate of the one in `workspace.py`, with
+        # slightly different needles. Two copies of one vocabulary is how they drift, and
+        # the drift is what made an organisation's own audited accounts invisible to both
+        # gates for as long as nobody opened a listing that asked for them.
+        from agent import document_types
+
+        wanted = document_types.required_types_for(text)
         if not wanted:
             return GateResult(
                 "required_documents_available", PASS, "no recognised document requirement"
             )
 
+        # Documents are matched through the registry, so an organisation that filed
+        # "Audited Financial Statements" satisfies a listing that asks for "audited
+        # accounts" - which is the same document under the product's other name.
+        held_by_type: dict[str, list[models.Document]] = {}
+        for document in self.db.execute(
+            select(models.Document).where(
+                models.Document.org_id == self.memory.org_id,
+                models.Document.is_current.is_(True),
+            )
+        ).scalars().all():
+            canonical = document_types.canonical(document.doc_type)
+            if canonical is not None:
+                held_by_type.setdefault(canonical, []).append(document)
+
         # A lapsed approved document is a definite failure.
         for doc_type in wanted:
-            held = self.db.execute(
-                select(models.Document).where(
-                    models.Document.org_id == self.memory.org_id,
-                    models.Document.doc_type == doc_type,
-                    models.Document.is_current.is_(True),
-                )
-            ).scalars().all()
-            for document in held:
+            for document in held_by_type.get(doc_type, []):
                 expiry = _aware(document.valid_until)
                 if expiry is not None and expiry <= now:
                     return GateResult(
@@ -381,7 +386,11 @@ class EligibilityEngine:
                         f"{expiry.date().isoformat()}",
                     )
 
-        usable = {d.doc_type for d in vault.usable(now=now)}
+        usable = {
+            canonical
+            for document in vault.usable(now=now)
+            if (canonical := document_types.canonical(document.doc_type)) is not None
+        }
         missing = [d for d in wanted if d not in usable]
         if missing:
             return GateResult(

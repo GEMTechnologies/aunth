@@ -345,6 +345,7 @@ class DeliveryService:
                 "grant_id": grant.id,
                 "application_id": grant.application_id,
                 "reference": grant.reference,
+                "title": grant.title,
                 "awarded_amount": str(awarded),
                 "currency": grant_currency,
                 "size_relative_to_request": size,
@@ -534,6 +535,7 @@ class DeliveryService:
             payload={
                 "grant_id": condition.grant_id,
                 "condition_id": condition.id,
+                "title": condition.title,
                 "evidence_ref": condition.evidence_ref,
             },
         )
@@ -649,7 +651,14 @@ class DeliveryService:
                         payload={
                             "grant_id": obligation.grant_id,
                             "obligation_id": obligation.id,
+                            # `title` is REQUIRED by the route and was missing, so the
+                            # notification read "Funder report overdue: (unknown)" - it told
+                            # a person something was overdue and not which thing.
+                            "title": obligation.title,
+                            "kind": obligation.kind,
+                            "period": obligation.period,
                             "due_on": due.isoformat(),
+                            "days_late": (moment - due).days,
                         },
                     )
                     moved["events"] += 1
@@ -662,6 +671,8 @@ class DeliveryService:
                         payload={
                             "grant_id": obligation.grant_id,
                             "obligation_id": obligation.id,
+                            "title": obligation.title,
+                            "kind": obligation.kind,
                             "due_on": due.isoformat(),
                             "days_remaining": (due - moment).days,
                         },
@@ -706,6 +717,7 @@ class DeliveryService:
             payload={
                 "grant_id": obligation.grant_id,
                 "obligation_id": obligation.id,
+                "title": obligation.title,
                 "reference": obligation.reference,
             },
         )
@@ -758,6 +770,7 @@ class DeliveryService:
             payload={
                 "grant_id": grant_id,
                 "disbursement_id": row.id,
+                "label": row.label or f"Tranche {row.tranche_number or '?'}",
                 "amount": str(row.amount),
                 "currency": row.currency,
                 "expected_on": row.expected_on.isoformat() if row.expected_on else None,
@@ -817,9 +830,11 @@ class DeliveryService:
             payload={
                 "grant_id": row.grant_id,
                 "disbursement_id": row.id,
+                "label": row.label or f"Tranche {row.tranche_number or '?'}",
                 "amount_received": str(received),
                 "currency": row.currency,
                 "reference": row.reference,
+                "variance_note": row.variance_note,
             },
         )
         self._record_activity(
