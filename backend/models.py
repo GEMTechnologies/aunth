@@ -2796,6 +2796,158 @@ class Disbursement(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
     )
 
+
+class NotificationPreference(Base):
+    """What one person wants to be told, and where.
+
+    Per (organisation, user, category) rather than per user, because the same person may
+    want funder deadlines at one organisation and not another - and a preference that
+    silently applies across tenants is a preference nobody set.
+
+    **Defaults are deliberately permissive for the categories that cost money.** An
+    organisation that has configured nothing still gets told its report is overdue, because
+    the alternative is a default of silence and the failure mode of silence is a withheld
+    tranche that nobody hears about.
+    """
+
+    __tablename__ = "notification_preferences"
+
+    #: Where it goes. ``IN_APP`` first, because it is internal and needs no gate. An
+    #: external channel reuses the Phase 7b outbound mail path rather than inventing a
+    #: second egress - see the delivery service.
+    CHANNEL_IN_APP = "IN_APP"
+    CHANNEL_EMAIL = "EMAIL"
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "user_id", "category", "channel",
+                         name="uq_notification_preference"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+
+    category: Mapped[str] = mapped_column(String(40), index=True)
+    channel: Mapped[str] = mapped_column(String(20), default=CHANNEL_IN_APP, index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+    #: Minimum severity this channel carries. A person may want CRITICAL by email and only
+    #: WARNING in the app, and expressing that as two thresholds is clearer than four
+    #: booleans.
+    min_severity: Mapped[str] = mapped_column(String(20), default="INFO")
+
+    #: Do not disturb, as local hours. A funder deadline is not urgent at 03:00, and a
+    #: notification system that wakes somebody for a non-urgent item is one they turn off.
+    quiet_from_hour: Mapped[Optional[int]] = mapped_column(Integer)
+    quiet_to_hour: Mapped[Optional[int]] = mapped_column(Integer)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class Notification(Base):
+    """One thing a person should know about.
+
+    Mutable, because a notification has a lifecycle - it is raised, read, acted on or
+    dismissed - but **DELETE is revoked**: a notification that was raised is evidence that
+    the platform knew, and one its own subject can erase is not evidence.
+
+    ``dedupe_key`` is the most important column here. A relay that scans every thirty
+    seconds would otherwise raise 2,880 notifications a day for one overdue report, and the
+    channel gets muted - which is precisely how a real problem goes unnoticed.
+    """
+
+    __tablename__ = "notifications"
+
+    SEVERITY_CRITICAL = "CRITICAL"   # money or an application at risk, right now
+    SEVERITY_WARNING = "WARNING"     # something needs attention
+    SEVERITY_INFO = "INFO"           # worth knowing
+
+    STATUS_UNREAD = "UNREAD"
+    STATUS_READ = "READ"
+    STATUS_ACTIONED = "ACTIONED"
+    STATUS_DISMISSED = "DISMISSED"
+
+    OPEN_STATUSES = frozenset({STATUS_UNREAD, STATUS_READ})
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "user_id", "dedupe_key",
+                         name="uq_notification_dedupe"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    user_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    category: Mapped[str] = mapped_column(String(40), index=True)
+    severity: Mapped[str] = mapped_column(String(20), default=SEVERITY_INFO, index=True)
+    status: Mapped[str] = mapped_column(String(20), default=STATUS_UNREAD, index=True)
+
+    title: Mapped[str] = mapped_column(String(500))
+    body: Mapped[Optional[str]] = mapped_column(Text)
+    #: True when a person must do something. The difference between "your report is
+    #: overdue" and "we filed your application", and the thing a UI filters on.
+    action_required: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    action_url: Mapped[Optional[str]] = mapped_column(String(1000))
+
+    #: Identity for suppression. Built from the SUBJECT and the CONDITION, not from the
+    #: event id - otherwise every scan raises a new notification.
+    dedupe_key: Mapped[str] = mapped_column(String(255), index=True)
+    #: Which event raised it, for the audit trail.
+    source_event_type: Mapped[Optional[str]] = mapped_column(String(80), index=True)
+    source_event_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    #: Structured context, so a client can render it without parsing the body.
+    context: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    read_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    #: When it was last raised again while still open. A reminder is not a new
+    #: notification, and the count is what tells a person it is not going away.
+    repeat_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_raised_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class NotificationDelivery(Base):
+    """One attempt to put a notification somewhere. **Append-only.**
+
+    The same discipline as ``mail_send_attempts`` and ``submission_receipts``: a delivery
+    record is evidence, and one its own subject can rewrite is not evidence. Without it,
+    "the platform knew and told somebody" is an assertion rather than a fact.
+    """
+
+    __tablename__ = "notification_deliveries"
+
+    RESULT_DELIVERED = "DELIVERED"
+    RESULT_SUPPRESSED = "SUPPRESSED"
+    RESULT_FAILED = "FAILED"
+    RESULT_DEFERRED = "DEFERRED"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    notification_id: Mapped[str] = mapped_column(
+        ForeignKey("notifications.id"), index=True
+    )
+    user_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    channel: Mapped[str] = mapped_column(String(20), index=True)
+    result: Mapped[str] = mapped_column(String(20), index=True)
+    #: Why it was suppressed or deferred, when it was.
+    reason: Mapped[Optional[str]] = mapped_column(String(255))
+    provider_reference: Mapped[Optional[str]] = mapped_column(String(255))
+    error_code: Mapped[Optional[str]] = mapped_column(String(60))
+
+    attempted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)
 Index("ix_jobs_dispatch", Job.state, Job.available_at)

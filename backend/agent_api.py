@@ -438,6 +438,112 @@ def compliance(
     return {"organisation_id": org_id, **summary}
 
 
+
+# ===========================================================================
+# NOTIFICATIONS — what a person should know
+# ===========================================================================
+class NotificationSummary(BaseModel):
+    id: str
+    category: str
+    severity: str
+    status: str
+    title: str
+    body: Optional[str] = None
+    action_required: bool = False
+    action_url: Optional[str] = None
+    repeat_count: int = 0
+    created_at: Optional[str] = None
+    last_raised_at: Optional[str] = None
+    source_event_type: Optional[str] = None
+
+
+class NotificationMarkRequest(BaseModel):
+    status: str = Field(..., description="READ, ACTIONED or DISMISSED")
+
+
+def _notification_service(db: Session, org_id: str, user_id: str):
+    """The service for one person's inbox.
+
+    Channels are seeded with the in-app channel only. An external channel is refused by the
+    service, so a notification read over HTTP can never cause something to leave the
+    platform - reading an inbox must not have side effects.
+    """
+    from agent.notifications.providers.fake import InAppChannel
+    from agent.notifications.service import NotificationService
+
+    return NotificationService(
+        db, org_id=org_id, channels=[InAppChannel()], default_recipients=[user_id]
+    )
+
+
+@router.get("/notifications", summary="Your notifications, most urgent first")
+def list_notifications(
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+    user: Any = Depends(get_current_user),
+    unread_only: bool = True,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Ordered by severity before recency.
+
+    A critical notification raised yesterday matters more than an informational one raised a
+    minute ago, and a chronological inbox buries it under the noise that arrived since.
+    """
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    service = _notification_service(db, org_id, str(user.id))
+    rows = service.inbox(
+        user_id=str(user.id), unread_only=unread_only, limit=max(1, min(limit, 200))
+    )
+    return {
+        "organisation_id": org_id,
+        "count": len(rows),
+        "summary": service.summary(user_id=str(user.id)),
+        "notifications": [
+            NotificationSummary(
+                id=n.id, category=n.category, severity=n.severity, status=n.status,
+                title=n.title, body=n.body, action_required=n.action_required,
+                action_url=n.action_url, repeat_count=n.repeat_count or 0,
+                created_at=_iso(n.created_at), last_raised_at=_iso(n.last_raised_at),
+                source_event_type=n.source_event_type,
+            ).model_dump()
+            for n in rows
+        ],
+    }
+
+
+@router.post("/notifications/{notification_id}", summary="Read, action or dismiss")
+def mark_notification(
+    notification_id: str,
+    request: NotificationMarkRequest,
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+    user: Any = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Mark a notification.
+
+    There is no DELETE. A notification that was raised is evidence the platform knew, and
+    one its own subject can erase is not evidence - dismissing is the way to clear it.
+    """
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    service = _notification_service(db, org_id, str(user.id))
+    try:
+        notification = service.mark(
+            notification_id=notification_id, user_id=str(user.id), status=request.status
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    db.commit()
+    return {
+        "id": notification.id,
+        "status": notification.status,
+        "read_at": _iso(notification.read_at),
+    }
+
+
 @router.get("/health", summary="Fleet, relay and autonomy health")
 def agent_health(
     tenant: TenantContext = Depends(get_tenant_context),

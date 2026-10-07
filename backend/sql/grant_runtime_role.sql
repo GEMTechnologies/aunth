@@ -120,7 +120,11 @@ BEGIN
         -- posture afterwards showed `submission_packages` had gone from D=false to D=true -
         -- the broad grant at line 37 standing unrevoked. That is the ninth time this trap
         -- has fired, and the first time it was caught by a check rather than by a report.
-        'submission_packages'
+        'submission_packages',
+        -- Phase 10 notification evidence. DELETE is revoked on all three; UPDATE only on
+        -- the delivery records, because a notification's OWN status must advance from
+        -- UNREAD to READ to ACTIONED while its delivery evidence must not change at all.
+        'notification_deliveries', 'notifications', 'notification_preferences'
     ]
     LOOP
         IF EXISTS (
@@ -139,7 +143,12 @@ BEGIN
             IF evidence_table IN (
                 'application_transitions', 'agent_activity', 'donor_research',
                 'mail_send_attempts', 'mail_approvals',
-                'submission_attempts', 'submission_receipts'
+                'submission_attempts', 'submission_receipts',
+                -- A delivery record is evidence that somebody WAS told. It may not be
+                -- rewritten. `notifications` is deliberately absent from THIS list,
+                -- because its own status must advance - the same distinction as
+                -- `submission_packages` and `mail_send_intents`.
+                'notification_deliveries'
             ) THEN
                 EXECUTE format('REVOKE UPDATE ON TABLE %I FROM granada_app', evidence_table);
             END IF;
@@ -198,9 +207,13 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 --          has_table_privilege('granada_app', 'submission_attempts', 'UPDATE'),
 --          has_table_privilege('granada_app', 'submission_receipts', 'UPDATE'),
 --          has_table_privilege('granada_app', 'submission_packages', 'UPDATE'),
---          has_table_privilege('granada_app', 'submission_packages', 'DELETE');
+--          has_table_privilege('granada_app', 'submission_packages', 'DELETE'),
+--          has_table_privilege('granada_app', 'notification_deliveries', 'UPDATE'),
+--          has_table_privilege('granada_app', 'notifications', 'UPDATE'),
+--          has_table_privilege('granada_app', 'notifications', 'DELETE');
 --
--- Expected: f, f, f, f, f, t, f  - UPDATE on a package is TRUE because its status must
--- advance, and DELETE on it is FALSE because its existence is the record. A blanket
--- `f, f, f, f, f, f, f` would mean UPDATE had been over-revoked and no application could
--- ever leave DRAFT; an all-`t` tail would mean the broad grant at line 37 was standing.
+-- Expected: f, f, f, f, f, t, f, f, t, f
+--   UPDATE on a package and on a notification are TRUE, because their statuses must
+--   advance. DELETE on everything protected is FALSE, because existence is the record.
+--   A blanket run of `f` would mean UPDATE had been over-revoked and nothing could ever
+--   leave DRAFT or UNREAD; an all-`t` tail would mean the broad grant at line 37 stood.

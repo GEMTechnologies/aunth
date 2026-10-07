@@ -55,6 +55,12 @@ class OutboxRelay:
         self.batch_size = batch_size
         self.max_attempts = max_attempts
 
+        #: How many events became notifications, and how many failed to. Reported by the
+        #: daemon's log line, because a notifier that has silently stopped working looks
+        #: exactly like a system with nothing to report.
+        self.notified = 0
+        self.notify_failures = 0
+
     def pending(self) -> list[models.OutboxEvent]:
         """Unpublished rows, oldest first.
 
@@ -117,6 +123,42 @@ class OutboxRelay:
             event.attempts += 1
             event.last_error = None
             published += 1
+
+            # Route it to the people who should know. This is the step that was missing:
+            # `report.overdue` reached Redis and stopped there, so the alert with the
+            # clearest financial consequence was published perfectly and read by nobody.
+            #
+            # A routing failure must not fail the publish above, for the same reason a
+            # publish failure must not kill the sweep: the event HAS reached the stream,
+            # and converting a delivered event into a retried one would duplicate it. It is
+            # counted and logged instead.
+            try:
+                from agent.notifications.integration import deliver_event
+
+                                # `self.db`, not `self.session`. The wrong attribute compiles cleanly
+                # and fails at the first routed event - the same class of defect as the
+                # undefined `_agent_for` helper in the delivery routes.
+                outcome = deliver_event(self.db, event=event)
+                if outcome:
+                    self.notified += 1
+                    logger.info(
+                        "outbox.relay.notified",
+                        extra={
+                            "event_id": event.id,
+                            "event_type": event.event_type,
+                            "recipients": len(outcome.get("recipients") or []),
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001 - never break the sweep
+                self.notify_failures += 1
+                logger.warning(
+                    "outbox.relay.notify_failed",
+                    extra={
+                        "event_id": event.id,
+                        "event_type": event.event_type,
+                        "error": f"{type(exc).__name__}: {exc}"[:300],
+                    },
+                )
 
         if published:
             self.db.commit()

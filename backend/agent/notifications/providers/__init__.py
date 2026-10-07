@@ -1,0 +1,1 @@
+"""Notification channels. In-app by default; external ones must use the gated mail path."""

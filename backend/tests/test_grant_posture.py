@@ -49,6 +49,9 @@ FULLY_APPEND_ONLY: frozenset[str] = frozenset({
     "mail_send_attempts",
     "submission_attempts",
     "submission_receipts",
+    # Phase 10. A delivery record is evidence that somebody WAS told. Without it, "the
+    # platform knew and told somebody" is an assertion rather than a fact.
+    "notification_deliveries",
 })
 
 #: `DELETE` no, `UPDATE` yes. The row's LIFECYCLE advances - a job goes QUEUED to RUNNING, a
@@ -66,6 +69,10 @@ DELETE_REVOKED_UPDATE_ALLOWED: frozenset[str] = frozenset({
     "model_invocations",
     "org_facts",
     "submission_packages",
+    # A notification's own status must advance UNREAD -> READ -> ACTIONED, and a
+    # preference must be editable. Neither may be erased.
+    "notifications",
+    "notification_preferences",
 })
 
 #: Protected by a DIFFERENT mechanism, and deliberately not in the list above.
