@@ -804,71 +804,26 @@ def remove_member(
         raise HTTPException(status_code=500, detail="Failed to remove member")
 
 # OAuth/Social Login endpoints
-@router.get("/auth/oauth/{provider}/authorize", tags=["OAuth"])
-async def oauth_authorize(
-    provider: str,
-    db: Session = Depends(get_db)
-):
-    """Initiate OAuth flow with provider"""
-    try:
-        result = await oauth_service.initiate_oauth_flow(provider, db)
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"OAuth authorize error: {str(e)}")
-        raise HTTPException(status_code=500, detail="OAuth initiation failed")
-
-@router.get("/auth/oauth/{provider}/callback", tags=["OAuth"])
-async def oauth_callback(
-    provider: str,
-    code: str,
-    state: str,
-    request: Request,
-    db: Session = Depends(get_db)
-):
-    """Handle OAuth callback from provider"""
-    try:
-        user = await oauth_service.handle_oauth_callback(provider, code, state, db)
-
-        # Create session and tokens
-        session = SessionService.create_session(
-            db,
-            user,
-            ip_address=get_client_ip(request),
-            user_agent=get_user_agent(request)
-        )
-
-        tokens = SessionService.issue_tokens(db, user, session)
-
-        return schemas.TokenResponse(
-            access_token=tokens.access_token,
-            refresh_token=tokens.refresh_token,
-            token_type=tokens.token_type,
-            expires_in=tokens.expires_in,
-            user=schemas.UserResponse(
-                id=user.id,
-                display_name=user.display_name,
-                avatar_url=user.avatar_url,
-                locale=user.locale,
-                created_at=user.created_at,
-                status=user.status,
-                primary_email=schemas.EmailResponse(
-                    id=user.primary_email.id,
-                    email=user.primary_email.email,
-                    is_verified=user.primary_email.is_verified,
-                    is_primary=user.primary_email.is_primary,
-                    created_at=user.primary_email.created_at
-                ) if user.primary_email else None
-            )
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"OAuth callback error: {str(e)}")
-        raise HTTPException(status_code=500, detail="OAuth callback failed")
-
+#
+# These two routes used to live here as well, calling a bare ``oauth_service``
+# name that does not exist in this module's namespace - so the handler raised
+# NameError and the broad ``except Exception`` turned it into a 500.
+#
+# Wiring the name up would have been the wrong repair. ``main.py`` mounts *both*
+# ``router`` and ``oauth.router`` under /api/v1, so /auth/oauth/{provider}/
+# {authorize,callback} were each registered twice, and because ``router`` is
+# included first its copies won the match. The copies here were not equivalent:
+#
+#   * This module's callback returned a ``schemas.TokenResponse`` - access token
+#     and refresh token in a JSON body, from a GET, on a URL the browser visited
+#     by redirect. That puts credentials in the URL bar, in browser history, and
+#     in any proxy log that records the query string, which is precisely what the
+#     one-time-code design exists to prevent.
+#   * ``oauth.handle_oauth_callback`` issues a single-use code and redirects with
+#     ``?code=`` only; ``POST /auth/oauth/exchange`` trades that code for the
+#     tokens, burning it on first use. Covered by ``tests/test_oauth_token_leak.py``.
+#
+# So the duplicates are removed rather than repaired. oauth.py owns this flow.
 @router.post("/auth/oauth/{provider}/unlink", tags=["OAuth"])
 def unlink_oauth_account(
     provider: str,
@@ -927,14 +882,17 @@ def change_password(
 ):
     """Change user password"""
     try:
-        # Verify old password
-        if not current_user.password_credential or not verify_password(
+        # Verify old password. These are ``security`` module functions, not
+        # bare names: this module imports the module, never the two functions,
+        # so the bare spelling raised NameError and the broad handler below
+        # reported it as a 500 "Failed to change password".
+        if not current_user.password_credential or not security.verify_password(
             payload.old_password, current_user.password_credential.password_hash
         ):
             raise HTTPException(status_code=400, detail="Current password is incorrect")
         
         # Update password
-        current_user.password_credential.password_hash = hash_password(payload.new_password)
+        current_user.password_credential.password_hash = security.hash_password(payload.new_password)
         current_user.password_credential.updated_at = datetime.now(timezone.utc)
         
         # Create audit log
@@ -1048,27 +1006,21 @@ def health_check(db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Service unhealthy")
 
 # Legacy compatibility endpoints
-@router.post("/auth/register", response_model=schemas.UserRead, tags=["Authentication", "Legacy"])
-def register_legacy(payload: schemas.UserCreate, db: Session = Depends(get_db)):
-    """Legacy registration endpoint for backward compatibility"""
-    user = AuthService.register_user(db, payload)
-    return schemas.UserRead(
-        id=user.id,
-        email=user.primary_email.email if user.primary_email else "",
-        full_name=user.display_name,
-        is_verified=user.primary_email.is_verified if user.primary_email else False
-    )
-
-@router.get("/users/me", response_model=schemas.UserRead, tags=["Users", "Legacy"])
-def get_me_legacy(current: models.User = Depends(get_current_user)):
-    """Legacy user profile endpoint"""
-    return schemas.UserRead(
-        id=current.id,
-        email=current.primary_email.email if current.primary_email else "",
-        full_name=current.display_name,
-        is_verified=current.primary_email.is_verified if current.primary_email else False
-    )
-
+#
+# This section used to also carry `register_legacy` (POST /auth/register) and
+# `get_me_legacy` (GET /users/me). Both were unreachable: Starlette matches the
+# first registered route, and the modern handlers for both paths are declared
+# earlier in this same file. So they shadowed nothing and served nothing.
+#
+# They were not harmless leftovers. Each returned `schemas.UserRead` while the
+# handler actually serving that path returns `UserResponse` - so PATCH
+# /users/me and GET /users/me would have disagreed about the shape of the same
+# resource had the order ever changed. The frontend calls GET /users/me
+# (SecurityPage.tsx) expecting the modern shape.
+#
+# `tests/test_router_integrity.py::test_no_path_is_registered_twice` now fails if
+# a duplicate registration reappears, which is what allowed this to go unnoticed.
+# `create_org_legacy` below does not collide with anything and stays.
 @router.post("/orgs", response_model=schemas.OrgRead, tags=["Organizations", "Legacy"])
 def create_org_legacy(
     payload: schemas.OrgCreate,
