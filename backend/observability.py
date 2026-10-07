@@ -315,6 +315,10 @@ def register_secrets_from_settings(settings: Any) -> int:
         "github_client_secret",
         "facebook_client_secret",
         "saml_sp_private_key",
+        # The TypeSafe/Jev key. Listed here so it is registered from the settings
+        # object rather than left to each call site to remember, and so it cannot
+        # reach a log line even if a provider exception quotes it.
+        "typesafe_api_key",
     ):
         candidates.append(getattr(settings, field, None))
 

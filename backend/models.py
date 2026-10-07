@@ -887,6 +887,145 @@ class IngestionJob(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# Matching (Phase 5)
+# ---------------------------------------------------------------------------
+class OpportunityMatch(Base):
+    """The result of qualifying and ranking one opportunity for one organisation.
+
+    This is tenant-owned, unlike the catalogue it points at. ``org_id`` is
+    FORCE-protected: who is pursuing which funding is among the most
+    commercially sensitive things in the product.
+
+    **Reasons are stored, not just a score.** The brief is explicit that the
+    system must store *why*, and a bare percentage cannot answer the two
+    questions that matter: "why was this rejected" (must name the gate) and "why
+    is this ranked first" (must name the evidence). ``failed_gates`` and
+    ``reasons`` are therefore first-class JSON columns.
+
+    ``REJECTED_BY_RULE`` rows are **kept**, not discarded. An organisation that
+    cannot see what it was ruled out of, and on what basis, cannot correct its own
+    profile - and a rule that never shows its work is a rule nobody trusts.
+    """
+
+    __tablename__ = "opportunity_matches"
+
+    MATCHED = "MATCHED"                    # passed every hard gate
+    REJECTED_BY_RULE = "REJECTED_BY_RULE"  # failed at least one hard gate
+    NEEDS_DATA = "NEEDS_DATA"              # a gate could not be evaluated
+    SUPERSEDED = "SUPERSEDED"              # recomputed since
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "opportunity_id", name="uq_match_org_opportunity"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    opportunity_id: Mapped[str] = mapped_column(ForeignKey("opportunities.id"), index=True)
+
+    state: Mapped[str] = mapped_column(String(20), index=True)
+    hard_gate_passed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+
+    #: Plain JSON *lists* of gate names, because the eligibility rules are
+    #: deterministic and must be re-derivable without parsing prose.
+    failed_gates: Mapped[Optional[dict]] = mapped_column(JSON)
+    unknown_gates: Mapped[Optional[dict]] = mapped_column(JSON)
+    #: The full evidence trail: every gate, its outcome, and why.
+    reasons: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    #: Only ever set for a match that PASSED the hard gates. ``None`` for a
+    #: rejected opportunity, because a semantic score for something ineligible is
+    #: precisely the number that must not exist.
+    semantic_score: Mapped[Optional[float]] = mapped_column(Float, index=True)
+    final_score: Mapped[Optional[float]] = mapped_column(Float, index=True)
+    rank: Mapped[Optional[int]] = mapped_column(Integer)
+
+    scorer: Mapped[Optional[str]] = mapped_column(String(120))
+    prompt_version: Mapped[Optional[str]] = mapped_column(String(50))
+    contract_version: Mapped[str] = mapped_column(String(20), default="v1")
+
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# Decision gateway (Phase 5b)
+# ---------------------------------------------------------------------------
+class DecisionRecord(Base):
+    """Every decision Granada made, why, and whether it was allowed to matter.
+
+    The brief requires that a decision influencing an external action is
+    auditable, with a named entry rather than the sentence "AI decided yes". This
+    table is that entry: the question set version, the answers, the confidence
+    that was (or was not) reported, the policy verdict, and the correlation id
+    tying it to the workflow and the log lines.
+
+    Two columns carry the design's weight:
+
+    ``state_hash``
+        A fingerprint of the state the decision was made on. It is what makes a
+        cache key correct and what makes a stored decision *invalidatable*: when
+        the organisation profile or the opportunity changes, the fingerprint
+        changes, and the old decision stops being reusable. Without it a cached
+        verdict would outlive the facts it was based on.
+
+    ``shadow`` / ``shadow_of``
+        A shadow decision is recorded with ``shadow=True`` and a pointer to the
+        decision that actually acted. This is what lets the platform answer "how
+        often would Jev have agreed with our rules" from real data, without any
+        possibility of the shadow answer having influenced anything - a claim
+        that is enforced in code, because the shadow result is never returned as
+        the acting one.
+
+    ``state_snapshot`` is nullable and off by default. References and a hash are
+    enough for audit, and storing the state would put donor and beneficiary
+    content into an operations table.
+    """
+
+    __tablename__ = "decision_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    #: Kept as a plain column name matching the brief's vocabulary. Tenant
+    #: scoping uses ``organisation_id``, which is what RLS filters on.
+    tenant_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    organisation_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("organisations.id"), index=True
+    )
+
+    decision_type: Mapped[str] = mapped_column(String(80), index=True)
+    subject_type: Mapped[Optional[str]] = mapped_column(String(20), index=True)
+    subject_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    workflow_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    provider: Mapped[str] = mapped_column(String(50), index=True)
+    model: Mapped[Optional[str]] = mapped_column(String(120))
+    question_schema_version: Mapped[str] = mapped_column(String(20), default="v1", index=True)
+    state_hash: Mapped[str] = mapped_column(String(64), index=True)
+    state_snapshot: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    answers: Mapped[Optional[dict]] = mapped_column(JSON)
+    confidences: Mapped[Optional[dict]] = mapped_column(JSON)
+    #: The lowest reported confidence, or None. Nullable because a provider that
+    #: reports none must not be recorded as if it were confident.
+    confidence: Mapped[Optional[float]] = mapped_column(Float, index=True)
+    probabilities: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    policy_outcome: Mapped[Optional[bool]] = mapped_column(Boolean, index=True)
+    policy_detail: Mapped[Optional[dict]] = mapped_column(JSON)
+    fallback_used: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+    shadow: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    shadow_of: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+
+
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)
 Index("ix_jobs_dispatch", Job.state, Job.available_at)
@@ -908,6 +1047,10 @@ Index("ix_opportunities_active_sector_deadline", Opportunity.is_active, Opportun
 Index("ix_opportunities_source_scraped", Opportunity.source_name, Opportunity.scraped_at)
 Index("ix_opportunity_changes_material", OpportunityChange.material, OpportunityChange.detected_at)
 Index("ix_opportunity_payloads_url_received", OpportunityPayload.source_url, OpportunityPayload.received_at)
+Index("ix_matches_org_state_score", OpportunityMatch.org_id, OpportunityMatch.state, OpportunityMatch.final_score)
+Index("ix_matches_org_rank", OpportunityMatch.org_id, OpportunityMatch.rank)
+Index("ix_decisions_org_type_created", DecisionRecord.organisation_id, DecisionRecord.decision_type, DecisionRecord.created_at)
+Index("ix_decisions_cache_lookup", DecisionRecord.organisation_id, DecisionRecord.decision_type, DecisionRecord.state_hash, DecisionRecord.provider)
 Index("ix_refresh_tokens_expires", RefreshToken.expires_at)
 Index("ix_audit_logs_user_event", AuditLog.user_id, AuditLog.event)
 Index("ix_oauth_accounts_user", OAuthAccount.user_id)

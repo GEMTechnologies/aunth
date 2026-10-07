@@ -197,6 +197,33 @@ class Settings(BaseSettings):
     # Prompts and responses are digested, not stored, unless this is on.
     model_store_prompts: bool = False
 
+    # -- Decision gateway -------------------------------------------------
+    # Provider-neutral bounded decisions. The default configuration needs no
+    # API key and no network, because the brief requires that the application
+    # boots and runs with JEV_ENABLED=false.
+    decision_gateway_enabled: bool = True
+    decision_provider: str = "rules"
+    jev_enabled: bool = False
+    # SHADOW is the only stage that cannot influence an action, and the brief is
+    # explicit that it comes first: record what Jev would have decided, compare
+    # it with Granada's own answer, and enable authority only on measured
+    # reliability rather than on a vendor benchmark.
+    decision_rollout_stage: str = "SHADOW"
+    decision_autonomy: str = "MONITOR_ONLY"
+    decision_cache_ttl_seconds: int = 3600
+    decision_timeout_seconds: int = 20
+    # Off by default. A decision fingerprint plus references is enough to audit
+    # with, and the state may contain donor and beneficiary content.
+    decision_store_state: bool = False
+
+    # -- TypeSafe / Jev ---------------------------------------------------
+    # The key is read here and nowhere else, and is registered as a secret with
+    # the logging layer so it cannot reach a log line. Only backend decision
+    # workers may use it: never a frontend bundle, never a database column.
+    typesafe_api_key: str = ""
+    typesafe_base_url: str = ""
+    typesafe_default_model: str = "jev-latest"
+
     # -- Validators -------------------------------------------------------
     @field_validator("log_level")
     @classmethod
@@ -230,6 +257,65 @@ class Settings(BaseSettings):
                 f"model_provider must be one of {sorted(allowed)}, got {value!r}"
             )
         return provider
+
+    @field_validator("decision_provider")
+    @classmethod
+    def _known_decision_provider(cls, value: str) -> str:
+        """Reject an unknown provider at startup rather than at first decision.
+
+        A typo here would otherwise surface as every decision falling through to
+        nothing at 3am.
+        """
+        provider = (value or "rules").strip().lower()
+        allowed = {"rules", "jev", "llm", "hybrid"}
+        if provider not in allowed:
+            raise ValueError(
+                f"decision_provider must be one of {sorted(allowed)}, got {value!r}"
+            )
+        return provider
+
+    @field_validator("decision_rollout_stage")
+    @classmethod
+    def _known_rollout_stage(cls, value: str) -> str:
+        """A typo must not silently become the most permissive stage."""
+        stage = (value or "SHADOW").strip().upper()
+        allowed = {"SHADOW", "ADVISORY", "INTERNAL_AUTOMATION", "LOW_RISK_EXTERNAL_AUTOMATION"}
+        if stage not in allowed:
+            raise ValueError(
+                f"decision_rollout_stage must be one of {sorted(allowed)}, got {value!r}"
+            )
+        return stage
+
+    @field_validator("decision_autonomy")
+    @classmethod
+    def _known_autonomy(cls, value: str) -> str:
+        autonomy = (value or "MONITOR_ONLY").strip().upper()
+        allowed = {"MONITOR_ONLY", "DRAFT_ONLY", "AUTO_ROUTINE", "AUTOPILOT_WITH_GATES"}
+        if autonomy not in allowed:
+            raise ValueError(
+                f"decision_autonomy must be one of {sorted(allowed)}, got {value!r}"
+            )
+        return autonomy
+
+    @model_validator(mode="after")
+    def _warn_when_jev_is_enabled_without_a_key(self) -> "Settings":
+        """Warn, and deliberately do not raise.
+
+        The application must boot with no TypeSafe key - the brief requires it,
+        and the rules provider answers every decision type Granada initially
+        needs. A missing key is a degraded configuration, not a broken one, and
+        turning it into a startup failure would make an optional vendor into a
+        hard dependency.
+        """
+        if self.jev_enabled and not self.typesafe_api_key:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "JEV_ENABLED is true but TYPESAFE_API_KEY is empty; the Jev "
+                "provider will be skipped and the decision chain will fall back. "
+                "Granada continues to operate."
+            )
+        return self
 
     @model_validator(mode="after")
     def _reject_insecure_secrets_outside_dev(self) -> "Settings":

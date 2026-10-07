@@ -65,7 +65,8 @@ DECLARE
     evidence_table text;
 BEGIN
     FOREACH evidence_table IN ARRAY ARRAY[
-        'jobs', 'job_attempts', 'model_invocations', 'org_facts', 'documents'
+        'jobs', 'job_attempts', 'model_invocations', 'org_facts', 'documents',
+        'decision_records'
     ]
     LOOP
         IF EXISTS (
