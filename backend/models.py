@@ -1,4 +1,4 @@
-from sqlalchemy import String, DateTime, Boolean, Text, ForeignKey, Integer, JSON, Index, UniqueConstraint
+from sqlalchemy import String, DateTime, Boolean, Text, ForeignKey, Integer, JSON, Index, UniqueConstraint, Float
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from datetime import datetime, timezone
 import uuid
@@ -542,6 +542,156 @@ class ModelInvocation(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# Organisation intelligence (Phase 3)
+# ---------------------------------------------------------------------------
+class OrgFact(Base):
+    """One version of one fact about an organisation.
+
+    This table is the Digital Twin. Its single most important property is that
+    **every fact carries how it came to be known**, because the security gate
+    forbids one specific failure: an AI-inferred value silently becoming a fact
+    in a submitted application.
+
+    How that is prevented structurally rather than by convention:
+
+    * ``state`` is one of a closed set, and ``AI_INFERRED`` is in it explicitly
+      rather than being represented by a missing value. A fact whose provenance
+      is unknown cannot be stored here at all.
+    * A version is never overwritten. Rows are appended and superseded, so the
+      history of what the platform believed - and on what basis - survives.
+    * ``source`` is required. There is no code path that writes a fact without
+      saying where it came from, so "nobody knows where this number came from"
+      is not representable.
+
+    ``version`` with ``is_current`` rather than deleting: an application that
+    was submitted against version 3 must still be explainable after version 4
+    arrives, which is the whole point of a "Why?" evidence view.
+
+    ``valid_until`` exists because organisation facts genuinely expire - a
+    certificate of registration, a tax exemption, an audit. An expired fact that
+    still reads as current is how stale information reaches a funder.
+    """
+
+    __tablename__ = "org_facts"
+
+    # Closed set. Anything not here cannot be stored, which is what makes
+    # "provenance is known" a property of the schema rather than a hope.
+    VERIFIED = "VERIFIED"            # a human with authority confirmed it
+    USER_PROVIDED = "USER_PROVIDED"  # the organisation told us
+    IMPORTED = "IMPORTED"            # a trusted external source
+    AI_INFERRED = "AI_INFERRED"      # a model guessed it - NEVER submission-safe
+    EXPIRED = "EXPIRED"              # was true, is no longer trusted
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "key", "version", name="uq_org_facts_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    key: Mapped[str] = mapped_column(String(120), index=True)  # e.g. "registration_number"
+    value: Mapped[Optional[dict]] = mapped_column(JSON)
+    value_type: Mapped[str] = mapped_column(String(20), default="text")
+
+    state: Mapped[str] = mapped_column(String(20), index=True)
+    # Only meaningful for AI_INFERRED, and deliberately nullable elsewhere: a
+    # confidence attached to a human-verified fact would be meaningless.
+    confidence: Mapped[Optional[float]] = mapped_column(Float)
+
+    # Provenance. Required, never null - see the class docstring.
+    source: Mapped[str] = mapped_column(String(255))
+    source_ref: Mapped[Optional[str]] = mapped_column(String(255))
+    evidence_document_id: Mapped[Optional[str]] = mapped_column(String(36))
+
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    is_current: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    supersedes_id: Mapped[Optional[str]] = mapped_column(String(36))
+
+    valid_from: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    valid_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    verified_by: Mapped[Optional[str]] = mapped_column(String(36))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class Document(Base):
+    """One version of one file in the document vault.
+
+    The vault exists because submissions need documents that are current,
+    approved, and provably the file that was sent. Four properties carry that:
+
+    ``checksum_sha256``
+        Proves the bytes. A submission receipt that names a document id is only
+        meaningful if the document cannot change underneath it.
+
+    ``valid_until``
+        Certificates, tax clearances and audits expire. A vault that cannot
+        express expiry cannot tell you an application is about to be submitted
+        with a lapsed certificate.
+
+    ``approval_status``
+        A document is not usable merely because it was uploaded. Uploading is
+        not approving, and the gap between those two is where wrong documents
+        get attached to real applications.
+
+    ``scope``
+        Organisation-wide, project-specific or grant-specific. Attaching a
+        project's audit to a different project's application is a real error and
+        the schema should make it expressible rather than inferable.
+
+    Versioning matches ``OrgFact``: versions are appended, and ``is_current``
+    identifies the live one, so an already-submitted application still resolves
+    the exact file it used.
+    """
+
+    __tablename__ = "documents"
+
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+
+    SCOPE_ORGANISATION = "ORGANISATION"
+    SCOPE_PROJECT = "PROJECT"
+    SCOPE_GRANT = "GRANT"
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "storage_key", "version", name="uq_documents_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+
+    title: Mapped[str] = mapped_column(String(255))
+    doc_type: Mapped[str] = mapped_column(String(80), index=True)
+    scope: Mapped[str] = mapped_column(String(20), default=SCOPE_ORGANISATION, index=True)
+    scope_ref: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    storage_key: Mapped[str] = mapped_column(String(500))
+    checksum_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    mime_type: Mapped[str] = mapped_column(String(120))
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    is_current: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    supersedes_id: Mapped[Optional[str]] = mapped_column(String(36))
+
+    valid_from: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    valid_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+
+    approval_status: Mapped[str] = mapped_column(String(20), default=PENDING, index=True)
+    approved_by: Mapped[Optional[str]] = mapped_column(String(36))
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    uploaded_by: Mapped[Optional[str]] = mapped_column(String(36))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)
 Index("ix_jobs_dispatch", Job.state, Job.available_at)
@@ -549,6 +699,11 @@ Index("ix_jobs_lease", Job.lease_expires_at)
 Index("ix_outbox_unpublished", OutboxEvent.published_at, OutboxEvent.created_at)
 Index("ix_model_invocations_org_created", ModelInvocation.org_id, ModelInvocation.created_at)
 Index("ix_model_invocations_model_status", ModelInvocation.model, ModelInvocation.status)
+# The Digital Twin is read by "give me the current facts for this org", and by
+# "which facts are about to expire" - both of which are index-shaped.
+Index("ix_org_facts_current", OrgFact.org_id, OrgFact.is_current, OrgFact.key)
+Index("ix_documents_current", Document.org_id, Document.is_current, Document.doc_type)
+Index("ix_documents_expiry", Document.org_id, Document.valid_until)
 Index("ix_refresh_tokens_expires", RefreshToken.expires_at)
 Index("ix_audit_logs_user_event", AuditLog.user_id, AuditLog.event)
 Index("ix_oauth_accounts_user", OAuthAccount.user_id)

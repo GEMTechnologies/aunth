@@ -788,6 +788,13 @@ def test_runtime_role_cannot_delete_the_ledger_or_the_evidence(pg_engine):
                     ("jobs", ("SELECT", "INSERT", "UPDATE")),
                     ("job_attempts", ("SELECT", "INSERT", "UPDATE")),
                     ("model_invocations", ("SELECT", "INSERT", "UPDATE")),
+                    # The Digital Twin and the vault. Their history IS the
+                    # product: superseding a fact is an UPDATE, and that only
+                    # works if the old row survives. A runtime role able to
+                    # DELETE could erase the version an application was
+                    # submitted against - exactly what the "Why?" view needs.
+                    ("org_facts", ("SELECT", "INSERT", "UPDATE")),
+                    ("documents", ("SELECT", "INSERT", "UPDATE")),
                 ):
                     for privilege in allowed:
                         assert conn.execute(

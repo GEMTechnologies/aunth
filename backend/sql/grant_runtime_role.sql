@@ -42,22 +42,31 @@ GRANT SELECT, INSERT, UPDATE, DELETE
 -- ---------------------------------------------------------------------------
 REVOKE ALL ON TABLE alembic_version FROM granada_app;
 
--- Ledger and evidence tables: the runtime records, it does not erase.
+-- Ledger, evidence and identity tables: the runtime records, it does not erase.
 --
--- This block exists because a GRANT is ADDITIVE. Migrations 004 and 005 grant
--- only SELECT/INSERT/UPDATE on `jobs`, `job_attempts` and `model_invocations`,
--- expressing the intent that the application may never delete the record of
--- work it is accountable for. The blanket grant above hands over DELETE
--- regardless, and granting DELETE after granting INSERT does not take it back -
--- so without these REVOKEs that intent was documented but not in force.
+-- This block exists because a GRANT is ADDITIVE. Migrations 004, 005 and 006
+-- grant only SELECT/INSERT/UPDATE on these tables, expressing the intent that
+-- the application may never delete the record of work it is accountable for, nor
+-- the organisation's own facts and legal documents. The blanket grant above
+-- hands over DELETE regardless, and granting DELETE after granting INSERT does
+-- not take it back - so without these REVOKEs that intent was documented but not
+-- in force.
+--
+-- `org_facts` and `documents` are on the list for a further reason: their
+-- history IS the product. Superseding a fact is an UPDATE (`is_current` goes
+-- false), and that only works if the old row survives. A runtime role able to
+-- DELETE would let an agent erase the version an application was submitted
+-- against, which is precisely what the "Why?" evidence view depends on.
 --
 -- Wrapped in a DO block so the file stays idempotent and runnable against a
--- database that has not yet applied 004 or 005.
+-- database that has not yet applied every migration.
 DO $$
 DECLARE
     evidence_table text;
 BEGIN
-    FOREACH evidence_table IN ARRAY ARRAY['jobs', 'job_attempts', 'model_invocations']
+    FOREACH evidence_table IN ARRAY ARRAY[
+        'jobs', 'job_attempts', 'model_invocations', 'org_facts', 'documents'
+    ]
     LOOP
         IF EXISTS (
             SELECT 1 FROM information_schema.tables
