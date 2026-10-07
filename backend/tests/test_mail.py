@@ -40,8 +40,12 @@ from agent.mail.providers.fake import FakeMailProvider  # noqa: E402
 from agent.mail.security import for_model, screen, split_sender  # noqa: E402
 from agent.mail.service import GranadaMail  # noqa: E402
 from agent.mail.vocabulary import (  # noqa: E402
+    CAPABILITIES_REQUIRING_APPROVAL,
     PHASE_7A_ALLOWED,
     PHASE_7A_FORBIDDEN,
+    PHASE_7B_ALLOWED,
+    PHASE_7B_FORBIDDEN,
+    ApprovalRequired,
     Capability,
     CorrelationState,
     DocumentRequestType,
@@ -178,28 +182,61 @@ def _document_request_text():
 # 1. THE CAPABILITY CEILING
 # ---------------------------------------------------------------------------
 def test_every_forbidden_capability_is_refused():
-    """The Phase 7a ceiling, asserted one capability at a time.
+    """The CURRENT (Phase 7b) ceiling, asserted one capability at a time.
 
     Enumerated rather than spot-checked, because a ceiling with an untested gap is
     a ceiling with a hole.
+
+    Updated for Phase 7b. The capability that moved is
+    `MAIL_SEND_HUMAN_APPROVED`, which is now available **only** with
+    ``human_approved=True`` - so a bare call is still refused, with
+    `ApprovalRequired` rather than `ExternalActionDisabled`. Asserting the specific
+    exception rather than "some exception" is deliberate: conflating "you need an
+    approval" with "you may not do this" would hide a change that allowed sending.
     """
-    for capability in sorted(PHASE_7A_FORBIDDEN, key=lambda c: c.value):
+    for capability in sorted(PHASE_7B_FORBIDDEN, key=lambda c: c.value):
         with pytest.raises(ExternalActionDisabled):
-            assert_capability(capability)
+            assert_capability(capability, human_approved=True)
+
+    # And the approval-gated capability refuses WITHOUT the flag.
+    with pytest.raises(ApprovalRequired):
+        assert_capability(Capability.MAIL_SEND_HUMAN_APPROVED)
+
+    # Autonomous sending stays refused even WITH the flag. This is the line Phase 7b
+    # must not cross.
+    for capability in (
+        Capability.MAIL_SEND, Capability.MAIL_SEND_AUTONOMOUS,
+        Capability.MAIL_AUTO_REPLY, Capability.MAIL_AUTO_FORWARD,
+        Capability.MAIL_AUTONOMOUS_FOLLOWUP,
+    ):
+        with pytest.raises(ExternalActionDisabled):
+            assert_capability(capability, human_approved=True)
 
 
 def test_every_allowed_capability_is_permitted():
-    for capability in sorted(PHASE_7A_ALLOWED, key=lambda c: c.value):
-        assert_capability(capability)
+    for capability in sorted(PHASE_7B_ALLOWED, key=lambda c: c.value):
+        # `human_approved=True` where the capability requires it; the ceiling itself
+        # decides which, so this loop does not need to know.
+        if capability in CAPABILITIES_REQUIRING_APPROVAL:
+            assert_capability(capability, human_approved=True)
+        else:
+            assert_capability(capability)
 
 
 def test_the_two_lists_do_not_overlap_and_cover_the_vocabulary():
-    assert not (PHASE_7A_ALLOWED & PHASE_7A_FORBIDDEN)
-    covered = PHASE_7A_ALLOWED | PHASE_7A_FORBIDDEN
+    assert not (PHASE_7B_ALLOWED & PHASE_7B_FORBIDDEN)
+    covered = PHASE_7B_ALLOWED | PHASE_7B_FORBIDDEN
     assert covered == set(Capability), (
         f"capabilities outside both lists: {set(Capability) - covered} - an "
         "unclassified capability is refused by default, which is right, but it "
         "should be a deliberate omission rather than an oversight"
+    )
+    # The Phase 7a lists remain intact so the earlier ceiling is still expressible.
+    assert not (PHASE_7A_ALLOWED & PHASE_7A_FORBIDDEN)
+    assert (PHASE_7A_ALLOWED | PHASE_7A_FORBIDDEN) == set(Capability)
+    assert PHASE_7A_ALLOWED < PHASE_7B_ALLOWED, (
+        "Phase 7b must be a strict widening of the inbound ceiling, not a "
+        "replacement that could have dropped something"
     )
 
 

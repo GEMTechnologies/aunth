@@ -1729,19 +1729,89 @@ class GranadaMail:
             models.MailProviderEvent.org_id == self.org_id,
             models.MailProviderEvent.status == models.MailProviderEvent.STATUS_FAILED,
         )
-        # Read from the column that would hold a send. Zero because nothing writes
-        # it in Phase 7a, not because it is hard-coded.
+        # ACCEPTED outbound messages, from the send intents. In Phase 7a this was
+        # read from `mail_drafts.sent_at`, which nothing could write - zero because
+        # the capability did not exist. It is now zero only when nothing has been
+        # accepted, which is a different and much more useful statement.
         sent = count(
-            models.MailDraft,
-            models.MailDraft.org_id == self.org_id,
-            models.MailDraft.sent_at.isnot(None),
+            models.MailSendIntent,
+            models.MailSendIntent.org_id == self.org_id,
+            models.MailSendIntent.sent_at.isnot(None),
         )
         accounts = count(
             models.MailAccount, models.MailAccount.org_id == self.org_id
         )
 
+        # -- outbound (Phase 7b) ------------------------------------------
+        from agent.mail.ceiling import HIGH_RISK_CLASSES
+
+        waiting_approval = count(
+            models.MailSendIntent,
+            models.MailSendIntent.org_id == self.org_id,
+            models.MailSendIntent.status == models.MailSendIntent.WAITING_FOR_APPROVAL,
+        )
+        approved = count(
+            models.MailSendIntent,
+            models.MailSendIntent.org_id == self.org_id,
+            models.MailSendIntent.status.in_(
+                [models.MailSendIntent.APPROVED, models.MailSendIntent.QUEUED]
+            ),
+        )
+        sending = count(
+            models.MailSendIntent,
+            models.MailSendIntent.org_id == self.org_id,
+            models.MailSendIntent.status == models.MailSendIntent.SENDING,
+        )
+        # `sent_today` counts provider ACCEPTANCE, which is all we know at this
+        # point. Deliberately not named "delivered": acceptance does not prove the
+        # recipient's mailbox received anything.
+        sent_today = count(
+            models.MailSendIntent,
+            models.MailSendIntent.org_id == self.org_id,
+            models.MailSendIntent.sent_at.isnot(None),
+            models.MailSendIntent.sent_at >= midnight,
+        )
+        unknown = count(
+            models.MailSendIntent,
+            models.MailSendIntent.org_id == self.org_id,
+            models.MailSendIntent.status == models.MailSendIntent.DELIVERY_UNKNOWN,
+        )
+        send_failures = count(
+            models.MailSendIntent,
+            models.MailSendIntent.org_id == self.org_id,
+            models.MailSendIntent.status.in_(
+                [models.MailSendIntent.FAILED_FINAL, models.MailSendIntent.TEMPORARY_FAILURE]
+            ),
+        )
+        reauth = count(
+            models.MailAccount,
+            models.MailAccount.org_id == self.org_id,
+            models.MailAccount.status == models.MailAccount.REAUTH_REQUIRED,
+        )
+        bounced = count(
+            models.MailSendIntent,
+            models.MailSendIntent.org_id == self.org_id,
+            models.MailSendIntent.delivery_state == "BOUNCED",
+        )
+        high_risk_blocked = count(
+            models.MailSendIntent,
+            models.MailSendIntent.org_id == self.org_id,
+            models.MailSendIntent.status == models.MailSendIntent.HIGH_RISK_BLOCKED,
+        )
+
         return {
             "mail_accounts": accounts,
+            # -- outbound ------------------------------------------------
+            "drafts_waiting_approval": waiting_approval,
+            "send_intents_approved": approved,
+            "mail_send_queue": approved,
+            "mail_sending": sending,
+            "emails_sent_today": sent_today,
+            "delivery_unknown": unknown,
+            "mail_send_failures": send_failures,
+            "mail_reauth_required": reauth,
+            "bounces": bounced,
+            "high_risk_blocked": high_risk_blocked,
             "emails_received_today": received,
             "emails_processed_today": processed,
             "emails_unlinked": unlinked,

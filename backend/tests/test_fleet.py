@@ -672,7 +672,8 @@ def test_the_implemented_specialists_are_exactly_the_phase_6c_and_7a_set(db):
 
     work_types = sorted(wt for spec in REGISTRY.values() for wt in spec.handlers)
     assert work_types == [
-        "donor_research", "mail_process", "opportunity_match", "opportunity_qualify",
+        "donor_research", "mail_process", "mail_reconcile", "mail_send", "mail_sync",
+        "opportunity_match", "opportunity_qualify",
     ]
 
     # THE CEILING, asserted where the roster is checked: `email_send` is a
@@ -683,8 +684,15 @@ def test_the_implemented_specialists_are_exactly_the_phase_6c_and_7a_set(db):
         "the roster should still SHOW the customer that outbound mail is planned"
     )
     assert "email_send" not in email.handlers, (
-        "Phase 7a must not be able to send: email_send must own no handler"
+        "autonomous sending must stay impossible: email_send must own no handler"
     )
+    # Phase 7b adds `mail_send`, and it is NOT a contradiction. That handler loads an
+    # intent a human already approved and revalidates it; an intent without a live
+    # matching approval is refused by the final authority check. The work type being
+    # dispatchable does not make autonomous sending reachable.
+    assert "mail_send" in email.handlers
+    assert "mail_reconcile" in email.handlers
+    assert "mail_sync" in email.handlers
 
 
 def test_a_specialist_refuses_work_it_does_not_do(db):

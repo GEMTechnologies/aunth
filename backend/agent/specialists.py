@@ -172,9 +172,23 @@ REGISTRY: dict[str, SpecialistSpec] = {
         # would refuse it even if it could.
         _spec(
             "EMAIL", "Email Agent",
-            {"mail_process": "_handle_mail_process"},
+            {
+                "mail_process": "_handle_mail_process",
+                "mail_reconcile": "_handle_mail_reconcile",
+                "mail_sync": "_handle_mail_sync",
+                # `mail_send` HAS a handler, and that is not a contradiction of the
+                # Phase 7b rule. The handler does not decide to send: it loads a
+                # send intent that a human already approved and revalidates it. An
+                # intent with no live matching approval is refused, so the work type
+                # being executable does not make autonomous sending possible.
+                "mail_send": "_handle_mail_send",
+            },
             Autonomy.MONITOR_ONLY,
-            registered_work_types=("mail_process", "email_send"),
+            registered_work_types=(
+                "mail_process", "mail_sync", "mail_reconcile", "mail_send",
+                # Still listed, still WITHOUT a handler, still undispatchable.
+                "email_send",
+            ),
         ),
         _spec("SUBMISSION", "Submission Agent", {}, Autonomy.AUTOPILOT_WITH_GATES,
               registered_work_types=("submission",)),

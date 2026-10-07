@@ -16,97 +16,30 @@ from __future__ import annotations
 from enum import Enum
 
 
-class Capability(str, Enum):
-    """What a Granada agent may do with mail.
-
-    Phase 7a enables the first seven. The last seven exist in the vocabulary
-    because the policy engine must be able to *name* what it refuses - a refusal
-    that cannot be expressed is a refusal that cannot be audited.
-    """
-
-    # -- allowed in Phase 7a ------------------------------------------------
-    MAIL_RECEIVE = "MAIL_RECEIVE"
-    MAIL_SYNC = "MAIL_SYNC"
-    MAIL_READ = "MAIL_READ"
-    MAIL_PARSE = "MAIL_PARSE"
-    MAIL_CLASSIFY = "MAIL_CLASSIFY"
-    MAIL_LINK = "MAIL_LINK"
-    MAIL_ANALYZE = "MAIL_ANALYZE"
-    MAIL_EXTRACT_TASKS = "MAIL_EXTRACT_TASKS"
-    MAIL_DRAFT = "MAIL_DRAFT"
-    MAIL_NOTIFY_INTERNAL = "MAIL_NOTIFY_INTERNAL"
-
-    # -- forbidden in Phase 7a ---------------------------------------------
-    MAIL_SEND = "MAIL_SEND"
-    MAIL_FORWARD_EXTERNAL = "MAIL_FORWARD_EXTERNAL"
-    MAIL_AUTO_REPLY_EXTERNAL = "MAIL_AUTO_REPLY_EXTERNAL"
-    CONTRACT_ACCEPT = "CONTRACT_ACCEPT"
-    AWARD_ACCEPT = "AWARD_ACCEPT"
-    BANK_DETAILS_SEND = "BANK_DETAILS_SEND"
-    FINANCIAL_COMMITMENT = "FINANCIAL_COMMITMENT"
-    LEGAL_DECLARATION = "LEGAL_DECLARATION"
-    SUBMISSION = "SUBMISSION"
-
-
-#: The brief's ceiling for Phase 7a, verbatim.
-PHASE_7A_ALLOWED: frozenset[Capability] = frozenset({
-    Capability.MAIL_RECEIVE,
-    Capability.MAIL_SYNC,
-    Capability.MAIL_READ,
-    Capability.MAIL_PARSE,
-    Capability.MAIL_CLASSIFY,
-    Capability.MAIL_LINK,
-    Capability.MAIL_ANALYZE,
-    Capability.MAIL_EXTRACT_TASKS,
-    Capability.MAIL_DRAFT,
-    Capability.MAIL_NOTIFY_INTERNAL,
-})
-
-PHASE_7A_FORBIDDEN: frozenset[Capability] = frozenset({
-    Capability.MAIL_SEND,
-    Capability.MAIL_FORWARD_EXTERNAL,
-    Capability.MAIL_AUTO_REPLY_EXTERNAL,
-    Capability.CONTRACT_ACCEPT,
-    Capability.AWARD_ACCEPT,
-    Capability.BANK_DETAILS_SEND,
-    Capability.FINANCIAL_COMMITMENT,
-    Capability.LEGAL_DECLARATION,
-    Capability.SUBMISSION,
-})
-
-
-class CapabilityRefused(PermissionError):
-    """A capability outside the Phase 7a ceiling was requested.
-
-    Deliberately a ``PermissionError``: this is an authority decision, not a bug,
-    and callers should be able to distinguish it from a provider failure.
-    """
-
-
-class ExternalActionDisabled(CapabilityRefused):
-    """An outbound action was attempted while the platform forbids outbound actions.
-
-    The brief asks for this by name rather than for a silent no-op, and the reason
-    is that the two fail differently. A no-op returns successfully, so a caller
-    believes the mail went out and the audit trail says it did. An exception stops
-    the caller, records the attempt, and cannot be mistaken for success.
-    """
-
-
-def assert_capability(capability: Capability) -> None:
-    """Refuse anything outside the Phase 7a ceiling.
-
-    **Deny by default.** The check is ``not in PHASE_7A_ALLOWED`` rather than ``in
-    PHASE_7A_FORBIDDEN``, so adding a new capability to the enum without adding it
-    to the allowed set leaves it *unavailable* rather than silently available.
-    """
-    if capability not in PHASE_7A_ALLOWED:
-        if capability in PHASE_7A_FORBIDDEN:
-            raise ExternalActionDisabled(
-                f"{capability.value} is outside the Phase 7a ceiling. Granada may "
-                "receive, understand, link and draft; it may not speak to a funder."
-            )
-        raise CapabilityRefused(f"{capability.value} is not enabled")
+# The capability ceiling, outbound risk classes and the approval requirement all
+# live in `ceiling`, re-exported here because this module is where the rest of the
+# mail subsystem already imports from.
+#
+# Defined in ONE place deliberately. Two capability enums would let the inbound
+# ceiling and the outbound ceiling drift, and the failure mode is precisely the one
+# the brief warns about: "the mailbox can be read" quietly becoming "the mailbox may
+# send" because a list was widened in one file and not the other.
+from agent.mail.ceiling import (  # noqa: E402
+    CAPABILITIES_REQUIRING_APPROVAL,
+    HIGH_RISK_CLASSES,
+    PHASE_7A_ALLOWED,
+    PHASE_7A_FORBIDDEN,
+    PHASE_7B_ALLOWED,
+    PHASE_7B_FORBIDDEN,
+    SENDABLE_RISK_CLASSES,
+    ApprovalRequired,
+    Capability,
+    CapabilityRefused,
+    ExternalActionDisabled,
+    OutboundRisk,
+    RiskRefused,
+    assert_capability,
+)
 
 
 class MailClassification(str, Enum):

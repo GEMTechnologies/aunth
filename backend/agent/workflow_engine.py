@@ -119,6 +119,13 @@ WORKFLOW_RESEARCH = "donor_research"
 #: `email_send` is registered on the roster and owns no handler, so it cannot be
 #: dispatched at all.
 WORKFLOW_MAIL = "mail_process"
+#: Phase 7b. `mail_send` executes an intent a HUMAN already approved; it does not
+#: decide to send. An intent without a live matching approval is refused by the
+#: final authority check, so the work type being dispatchable does not make
+#: autonomous sending possible.
+WORKFLOW_MAIL_SEND = "mail_send"
+WORKFLOW_MAIL_RECONCILE = "mail_reconcile"
+WORKFLOW_MAIL_SYNC = "mail_sync"
 
 #: Default per-agent cap in one sweep. Chosen so a single very large organisation
 #: cannot fill a batch, while a normal organisation is never truncated by it.
@@ -1242,6 +1249,231 @@ def _mail_transport(provider: str) -> Any:
     from agent.mail.gateway import get_transport
 
     return get_transport(provider)
+
+
+def _outbound_transport(provider: str) -> Any:
+    """Resolve an OUTBOUND transport. Separate registry from inbound, on purpose."""
+    from agent.mail.gateway import get_outbound_transport
+
+    return get_outbound_transport(provider)
+
+
+def _handle_mail_send(db: Session, context: dict[str, Any]) -> dict[str, Any]:
+    """Execute a human-approved send intent.
+
+    The handler's job is narrow: resolve the intent and provider, then hand both to
+    ``SendService``, which owns the final authority check. **Nothing here decides
+    whether to send.** No approval means no send, and that decision is made from
+    durable state inside the service rather than from anything this handler saw.
+    """
+    from agent.mail.send_service import SendService
+
+    workflow = context["workflow"]
+    agent = context["agent"]
+
+    payload = (workflow.context or {}).get("wake") or {}
+    intent_id = payload.get("send_intent_id") or workflow.subject_id
+    if not intent_id:
+        return {
+            "summary": "send workflow carried no intent",
+            "summary_key": "mail.send_invalid_job",
+            "next_state": models.AgentWorkflow.FAILED,
+            "meaningful": False,
+        }
+
+    intent = db.execute(
+        select(models.MailSendIntent).where(
+            models.MailSendIntent.id == intent_id,
+            models.MailSendIntent.org_id == agent.org_id,
+        )
+    ).scalars().first()
+    if intent is None:
+        return {
+            "summary": "the send intent no longer exists",
+            "summary_key": "mail.send_intent_missing",
+            "next_state": models.AgentWorkflow.CANCELLED,
+            "meaningful": False,
+        }
+
+    transport = _outbound_transport(intent.provider or payload.get("provider") or "")
+    if transport is None:
+        # No outbound provider configured is an operational state, not a failure.
+        # Parking keeps the approved intent intact and resumable.
+        return {
+            "summary": f"no outbound provider configured for {intent.provider!r}",
+            "summary_key": "mail.outbound_unavailable",
+            "next_state": models.AgentWorkflow.WAITING,
+            "waiting_on": f"outbound transport for {intent.provider} not configured",
+            "meaningful": False,
+        }
+
+    service = SendService(
+        db, org_id=agent.org_id, agent_id=agent.id, outbound=transport
+    )
+    result = service.execute_send(
+        intent_id=intent.id, worker_id=context["job"].lease_owner or "worker"
+    )
+
+    structured = result.as_dict()
+    if result.refused:
+        # A refusal is a deliberate outcome with a name, not an error. Park it so a
+        # person can act, and never retry it automatically: several refusal codes
+        # mean "a human must decide", and a loop would hammer them.
+        return {
+            "summary": f"send refused: {result.refusal_code}"[:200],
+            "summary_key": f"mail.send_refused.{result.refusal_code}".lower(),
+            "activity_type": "mail",
+            "structured_data": structured,
+            "next_state": models.AgentWorkflow.WAITING,
+            "waiting_on": (result.detail or result.refusal_code or "")[:255],
+            "meaningful": False,
+        }
+
+    if result.outcome == "DELIVERY_UNKNOWN":
+        # Reconcile work is created; a retry is forbidden until it reports back.
+        AgentWake.schedule(
+            db, agent=agent, workflow_type=WORKFLOW_MAIL_RECONCILE,
+            specialist_key="EMAIL", subject_type="SEND_INTENT", subject_id=intent.id,
+            payload_ref={"send_intent_id": intent.id, "provider": intent.provider},
+        )
+        return {
+            "summary": "the provider's response was lost; reconciling before any retry",
+            "summary_key": "mail.delivery_unknown",
+            "activity_type": "mail",
+            "structured_data": structured,
+            "next_state": models.AgentWorkflow.COMPLETED,
+        }
+
+    return {
+        "summary": (
+            f"sent an approved reply to {', '.join(intent.to_addresses or [])}"[:200]
+            if result.sent
+            else f"send did not complete: {result.failure}"[:200]
+        ),
+        "summary_key": "mail.sent" if result.sent else "mail.send_failed",
+        "activity_type": "mail",
+        "structured_data": structured,
+        "events": [{
+            "event_type": "mail.send_completed",
+            "stream": "granada:v1:mail:sent",
+            "payload": structured,
+        }],
+        "next_state": models.AgentWorkflow.COMPLETED,
+    }
+
+
+def _handle_mail_reconcile(db: Session, context: dict[str, Any]) -> dict[str, Any]:
+    """Establish what happened to an uncertain attempt, then stop.
+
+    Reconciliation never sends. Its whole purpose is to convert "we do not know"
+    into either "the provider has it" or "the provider provably does not", so that a
+    later decision to retry rests on evidence rather than on a guess.
+    """
+    from agent.mail.send_service import SendService
+
+    workflow = context["workflow"]
+    agent = context["agent"]
+    payload = (workflow.context or {}).get("wake") or {}
+    intent_id = payload.get("send_intent_id") or workflow.subject_id
+
+    intent = db.execute(
+        select(models.MailSendIntent).where(
+            models.MailSendIntent.id == intent_id,
+            models.MailSendIntent.org_id == agent.org_id,
+        )
+    ).scalars().first()
+    if intent is None:
+        return {
+            "summary": "the send intent no longer exists",
+            "summary_key": "mail.reconcile_missing",
+            "next_state": models.AgentWorkflow.CANCELLED,
+            "meaningful": False,
+        }
+
+    transport = _outbound_transport(intent.provider or "")
+    if transport is None:
+        return {
+            "summary": "no outbound provider available to reconcile against",
+            "summary_key": "mail.outbound_unavailable",
+            "next_state": models.AgentWorkflow.WAITING,
+            "waiting_on": "outbound transport not configured",
+            "meaningful": False,
+        }
+
+    service = SendService(db, org_id=agent.org_id, agent_id=agent.id, outbound=transport)
+    result = service.reconcile(intent_id=intent.id)
+
+    if result.refused and result.refusal_code == "STILL_UNKNOWN":
+        # Retry the reconciliation later rather than concluding anything. Concluding
+        # "not sent" from an absence of evidence is the mistake that duplicates mail.
+        return {
+            "summary": "reconciliation produced no decisive evidence; will look again",
+            "summary_key": "mail.reconcile_inconclusive",
+            "activity_type": "mail",
+            "structured_data": result.as_dict(),
+            "next_state": models.AgentWorkflow.WAITING,
+            "waiting_on": "provider evidence inconclusive",
+            "meaningful": False,
+        }
+
+    return {
+        "summary": f"reconciliation: {result.outcome or result.refusal_code}"[:200],
+        "summary_key": f"mail.reconciled.{(result.outcome or 'unknown').lower()}",
+        "activity_type": "mail",
+        "structured_data": result.as_dict(),
+        "next_state": models.AgentWorkflow.COMPLETED,
+    }
+
+
+def _handle_mail_sync(db: Session, context: dict[str, Any]) -> dict[str, Any]:
+    """Reconcile one mailbox: fetch anything a webhook never delivered.
+
+    Bounded by the provider adapter. The durable cursor lives on the account, so a
+    restart resumes rather than replaying the mailbox from the beginning.
+    """
+    from agent.mail.service import GranadaMail
+
+    workflow = context["workflow"]
+    agent = context["agent"]
+    payload = (workflow.context or {}).get("wake") or {}
+    account_id = payload.get("mail_account_id") or workflow.subject_id
+
+    account = db.execute(
+        select(models.MailAccount).where(
+            models.MailAccount.id == account_id,
+            models.MailAccount.org_id == agent.org_id,
+        )
+    ).scalars().first()
+    if account is None:
+        return {
+            "summary": "the mail account no longer exists",
+            "summary_key": "mail.sync_account_missing",
+            "next_state": models.AgentWorkflow.CANCELLED,
+            "meaningful": False,
+        }
+
+    transport = _mail_transport(account.provider)
+    if transport is None:
+        return {
+            "summary": f"no transport configured for {account.provider}",
+            "summary_key": "mail.transport_unavailable",
+            "next_state": models.AgentWorkflow.WAITING,
+            "waiting_on": f"mail transport for {account.provider} not configured",
+            "meaningful": False,
+        }
+
+    mail = GranadaMail(db, org_id=agent.org_id, agent_id=agent.id, transport=transport)
+    summary = mail.sync(account=account)
+
+    # Rescheduling is the scheduler's job, not the handler's: a handler that
+    # scheduled its own next run would be a per-mailbox timer by another name.
+    return {
+        "summary": f"reconciled {summary.get('messages_new', 0)} new message(s)"[:200],
+        "summary_key": "mail.synced",
+        "activity_type": "mail",
+        "structured_data": summary,
+        "next_state": models.AgentWorkflow.COMPLETED,
+    }
 
 
 def _settings() -> Any:

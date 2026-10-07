@@ -114,6 +114,60 @@ def registered_providers() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Outbound transport registry — a SEPARATE namespace
+# ---------------------------------------------------------------------------
+# Deliberately not the same dictionary as the inbound one. A provider that can
+# read a mailbox and a provider that can send from it are different capabilities,
+# and sharing a registry is how "this account is connected" quietly comes to mean
+# "this account can speak". An account may appear in one, both, or neither.
+_OUTBOUND: dict[str, Any] = {}
+
+
+def register_outbound_transport(provider: str, transport: Any) -> None:
+    """Make an outbound transport available for a provider name."""
+    if not provider:
+        raise ValueError("an outbound transport must be registered under a provider name")
+    _OUTBOUND[provider.upper()] = transport
+
+
+def unregister_outbound_transport(provider: str) -> None:
+    _OUTBOUND.pop(provider.upper(), None)
+
+
+def clear_outbound_transports() -> None:
+    """For test isolation. Also clears inbound, so no test can leak either."""
+    _OUTBOUND.clear()
+
+
+def get_outbound_transport(provider: str) -> Optional[Any]:
+    """The OUTBOUND transport for a provider, or ``None``.
+
+    ``None`` means "this mailbox cannot send", which the final authority check turns
+    into a refusal with a name rather than an AttributeError. That distinction
+    matters: one is a configuration state an operator fixes, the other looks like a
+    bug and invites a workaround.
+    """
+    if not provider:
+        return None
+    direct = _OUTBOUND.get(provider.upper())
+    if direct is not None:
+        return direct
+    try:
+        from config import settings
+
+        registry = getattr(settings, "outbound_mail_transports", None)
+        if isinstance(registry, dict):
+            return registry.get(provider) or registry.get(provider.upper())
+    except Exception:  # pragma: no cover
+        return None
+    return None
+
+
+def registered_outbound_providers() -> list[str]:
+    return sorted(_OUTBOUND)
+
+
+# ---------------------------------------------------------------------------
 # Wake-up
 # ---------------------------------------------------------------------------
 #: The subject type a mail workflow carries, so `due_workflows` can order and
@@ -298,3 +352,95 @@ class MailGateway:
         that a caller might mistake for a bug and work around.
         """
         refuse_send(reason="Granada Mail has no outbound capability in Phase 7a")
+
+# ---------------------------------------------------------------------------
+# Scheduled reconciliation: discovery only
+# ---------------------------------------------------------------------------
+SUBJECT_MAIL_ACCOUNT = "MAIL_ACCOUNT"
+
+
+def schedule_mail_sync(
+    db: Session, *, stale_seconds: int = 900, batch_size: int = 200
+) -> int:
+    """Find mailboxes due for reconciliation and create durable work for each.
+
+    **One shared scheduler, and it only discovers.** There is deliberately no timer
+    per mailbox, no process per mailbox and no scheduler per GranadaAgent: a timer
+    per mailbox is ten thousand timers, and a mail account is a row rather than a
+    service. This queries for stale accounts in one statement and enqueues a
+    ``mail_sync`` workflow for each; the shared fleet executes them.
+
+    The work is bounded by ``batch_size`` so a fleet with a hundred thousand
+    mailboxes cannot load them all into one transaction.
+
+    Returned count is how many workflows were newly created. A mailbox already
+    queued is not queued twice - the workflow uniqueness constraint on
+    ``(agent_id, workflow_type, subject_type, subject_id)`` decides that, not this
+    function, so two schedulers racing still produce one workflow.
+    """
+    from datetime import timedelta
+
+    from agent.workflow_engine import WORKFLOW_MAIL_SYNC
+
+    cutoff = _now() - timedelta(seconds=max(60, int(stale_seconds)))
+    candidates = db.execute(
+        select(models.MailAccount)
+        .where(
+            models.MailAccount.status == models.MailAccount.ACTIVE,
+            # A mailbox that has never synced is due immediately; one that synced
+            # recently is not. NULL is not "unknown", it is "never".
+            (models.MailAccount.last_sync_at.is_(None))
+            | (models.MailAccount.last_sync_at < cutoff),
+        )
+        .order_by(models.MailAccount.last_sync_at.asc().nullsfirst())
+        .limit(batch_size)
+    ).scalars().all()
+
+    queued = 0
+    for account in candidates:
+        # A mailbox with no provider transport has nothing to reconcile against.
+        # Parking it would accumulate dead work, so it is skipped rather than
+        # queued - and the account's sync_status is what an operator looks at.
+        if get_transport(account.provider) is None:
+            continue
+        try:
+            AgentWake.schedule(
+                db,
+                agent=_agent_row(db, account),
+                workflow_type=WORKFLOW_MAIL_SYNC,
+                specialist_key="EMAIL",
+                subject_type=SUBJECT_MAIL_ACCOUNT,
+                subject_id=account.id,
+                payload_ref={
+                    "provider": account.provider,
+                    "provider_account_id": account.provider_account_id,
+                    "mail_account_id": account.id,
+                },
+            )
+            queued += 1
+        except Exception as exc:  # noqa: BLE001
+            # One unreconcilable mailbox must not stop the sweep for every other
+            # organisation.
+            logger.warning(
+                "mail.sync_schedule_failed",
+                extra={"account_id": account.id, "error": str(exc)[:200]},
+            )
+            continue
+    db.flush()
+    return queued
+
+
+def _agent_row(db: Session, account: models.MailAccount) -> models.GranadaAgent:
+    """The agent that owns a mailbox, resolved from the row and never assumed."""
+    agent = db.execute(
+        select(models.GranadaAgent).where(
+            models.GranadaAgent.id == account.agent_id,
+            models.GranadaAgent.org_id == account.org_id,
+        )
+    ).scalars().first()
+    if agent is None:
+        raise ValueError(
+            f"mail account {account.id} names an agent that does not belong to its "
+            "organisation"
+        )
+    return agent

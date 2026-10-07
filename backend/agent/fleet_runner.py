@@ -55,6 +55,14 @@ logger = logging.getLogger(__name__)
 #: long enough that the query is not the busiest thing in the system.
 DEFAULT_INTERVAL_SECONDS = 15
 
+#: How often to look for mailboxes due reconciliation. Slower than the dispatch
+#: sweep on purpose: reconciliation is a fallback for webhooks that were lost, not
+#: the primary path, and polling mailboxes hard gets an organisation rate-limited.
+DEFAULT_MAIL_SYNC_INTERVAL_SECONDS = 300
+
+#: A mailbox is due for reconciliation when it has not synced within this window.
+DEFAULT_MAIL_SYNC_STALE_SECONDS = 900
+
 #: Cap on a single sleep, so a stop signal is honoured promptly even if the
 #: configured interval is long.
 MAX_SLEEP_SLICE_SECONDS = 1.0
@@ -76,6 +84,11 @@ class FleetHealth:
     started_at: Optional[datetime] = None
     stopping: bool = False
 
+    #: Mail reconciliation is part of fleet health. A scheduler that silently
+    #: stops discovering stale mailboxes is otherwise invisible.
+    mail_sync_sweeps: int = 0
+    mail_sync_queued: int = 0
+
     @property
     def healthy(self) -> bool:
         """A loop that has never completed a sweep is not healthy, however new."""
@@ -95,6 +108,8 @@ class FleetHealth:
             "last_sweep_at": self.last_sweep_at.isoformat() if self.last_sweep_at else None,
             "last_error": self.last_error,
             "started_at": self.started_at.isoformat() if self.started_at else None,
+            "mail_sync_sweeps": self.mail_sync_sweeps,
+            "mail_sync_queued": self.mail_sync_queued,
         }
 
 
@@ -115,6 +130,7 @@ class FleetRunner:
         batch_size: int = 200,
         per_agent_limit: int = 25,
         on_sweep: Optional[Callable[[DispatchResult], None]] = None,
+        mail_sync_interval_seconds: Optional[float] = None,
     ) -> None:
         self.session_factory = session_factory
         self.interval_seconds = max(1.0, float(interval_seconds))
@@ -123,6 +139,54 @@ class FleetRunner:
         self.on_sweep = on_sweep
         self.health = FleetHealth()
         self._stop = threading.Event()
+        #: Reconciliation runs on its own, slower clock inside the SAME process.
+        #: ONE shared scheduler discovers mailboxes that are due and creates durable
+        #: work for them; there is no timer per mailbox, no process per mailbox and
+        #: no scheduler per GranadaAgent.
+        self.mail_sync_interval_seconds = max(
+            5.0, float(mail_sync_interval_seconds or DEFAULT_MAIL_SYNC_INTERVAL_SECONDS)
+        )
+        self._last_mail_sync_at: Optional[datetime] = None
+        self.health.mail_sync_sweeps = 0
+        self.health.mail_sync_queued = 0
+
+    def sync_due_mail_accounts(self, *, stale_seconds: int = DEFAULT_MAIL_SYNC_STALE_SECONDS) -> int:
+        """Create ``mail_sync`` work for mailboxes that need reconciling.
+
+        **Discovery only.** This function queries which accounts are stale and
+        enqueues a workflow for each; it does not call a provider. The shared fleet
+        executes the work, so a slow provider cannot stall the scheduler and a
+        crashed worker does not lose the reconciliation.
+
+        Bounded by ``batch_size`` like every other sweep, so a fleet with a hundred
+        thousand mailboxes cannot load them all into one transaction.
+        """
+        db = self.session_factory()
+        try:
+            from agent.mail.gateway import schedule_mail_sync
+
+            queued = schedule_mail_sync(
+                db, stale_seconds=stale_seconds, batch_size=self.batch_size
+            )
+            db.commit()
+            self.health.mail_sync_sweeps += 1
+            self.health.mail_sync_queued += queued
+            self._last_mail_sync_at = datetime.now(timezone.utc)
+            return queued
+        except Exception as exc:
+            db.rollback()
+            self.health.errors += 1
+            self.health.last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("fleet.mail_sync_failed", extra={"error": self.health.last_error})
+            return 0
+        finally:
+            db.close()
+
+    def _mail_sync_due(self) -> bool:
+        if self._last_mail_sync_at is None:
+            return True
+        elapsed = (datetime.now(timezone.utc) - self._last_mail_sync_at).total_seconds()
+        return elapsed >= self.mail_sync_interval_seconds
 
     # ------------------------------------------------------------------
     def sweep_once(self) -> DispatchResult:
@@ -190,6 +254,8 @@ class FleetRunner:
                     self.sweep_once()
                 except Exception:
                     pass  # already counted and logged; the loop continues
+                if self._mail_sync_due():
+                    self.sync_due_mail_accounts()
                 if max_sweeps is not None and self.health.sweeps >= max_sweeps:
                     break
                 self._sleep_until_next_sweep()

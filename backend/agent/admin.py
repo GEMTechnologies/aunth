@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 
 import models
 from agent.granada_agent import AgentError, GranadaAgentService
+from agent.mail.approval import ApprovalService
 from agent.specialists import SpecialistError, resolve
 from agent.workflow_engine import FleetDispatcher
 from events.ledger import JobLedger
@@ -396,6 +397,183 @@ class AdminCommands:
         return CommandResult("resume-agent", True, "agent resumed",
                              {"agent_id": agent.id, "previous_status": previous})
 
+    def show_send_intent(self, intent_id: str) -> CommandResult:
+        """Everything about one outbound message, including its approvals."""
+        intent = self._send_intent(intent_id)
+        approvals = self.db.execute(
+            select(models.MailApproval).where(
+                models.MailApproval.send_intent_id == intent.id
+            ).order_by(models.MailApproval.approved_at.asc())
+        ).scalars().all()
+        attempts = self.db.execute(
+            select(models.MailSendAttempt).where(
+                models.MailSendAttempt.send_intent_id == intent.id
+            ).order_by(models.MailSendAttempt.attempt_number.asc())
+        ).scalars().all()
+
+        live = ApprovalService(self.db, org_id=self.org_id).active_approval(intent)
+        return CommandResult(
+            "show-send-intent", True, f"{intent.status} ({intent.risk_class})",
+            {"send_intent": {
+                "id": intent.id,
+                "status": intent.status,
+                "status_reason": intent.status_reason,
+                "risk_class": intent.risk_class,
+                "fingerprint": intent.message_fingerprint,
+                "from": intent.from_address,
+                "to": intent.to_addresses,
+                "subject": intent.subject,
+                "application_id": intent.application_id,
+                "thread_id": intent.thread_id,
+                "granada_message_ref": intent.granada_message_ref,
+                "provider_submission_id": intent.provider_submission_id,
+                "delivery_state": intent.delivery_state,
+                "attempt_count": intent.attempt_count,
+                "sent_at": intent.sent_at.isoformat() if intent.sent_at else None,
+                "approval_currently_authorises_this_message": live is not None,
+                "approvals": [
+                    {"decision": a.decision, "by": a.approved_by,
+                     "at": a.approved_at.isoformat() if a.approved_at else None,
+                     "fingerprint": a.fingerprint, "status": a.status,
+                     "matches_current": a.fingerprint == intent.message_fingerprint}
+                    for a in approvals
+                ],
+                "attempts": [
+                    {"number": a.attempt_number, "result": a.result,
+                     "error_code": a.error_code, "provider_submission_id": a.provider_submission_id,
+                     "reconciliation_state": a.reconciliation_state,
+                     "started_at": a.started_at.isoformat() if a.started_at else None}
+                    for a in attempts
+                ],
+            }},
+        )
+
+    def show_send_attempts(self, intent_id: str) -> CommandResult:
+        """The append-only attempt history: what Granada told each provider, and when."""
+        intent = self._send_intent(intent_id)
+        attempts = self.db.execute(
+            select(models.MailSendAttempt).where(
+                models.MailSendAttempt.send_intent_id == intent.id
+            ).order_by(models.MailSendAttempt.attempt_number.asc())
+        ).scalars().all()
+        return CommandResult(
+            "show-send-attempts", True, f"{len(attempts)} attempt(s)",
+            {"send_intent_id": intent.id, "attempts": [
+                {"number": a.attempt_number, "attempt_id": a.attempt_id,
+                 "provider": a.provider, "result": a.result,
+                 "error_code": a.error_code, "safe_error_summary": a.safe_error_summary,
+                 "provider_submission_id": a.provider_submission_id,
+                 "reconciliation_state": a.reconciliation_state,
+                 "started_at": a.started_at.isoformat() if a.started_at else None,
+                 "finished_at": a.finished_at.isoformat() if a.finished_at else None}
+                for a in attempts
+            ]},
+        )
+
+    def cancel_send(self, intent_id: str, reason: str = "") -> CommandResult:
+        """Stop an outbound message before it leaves.
+
+        Refuses once the message is SENDING, because a send in flight cannot be
+        called back and pretending otherwise would leave a cancelled-looking record
+        for a message that reaches a funder.
+        """
+        self._require_actor("cancel-send")
+        intent = self._send_intent(intent_id)
+        if intent.status in models.MailSendIntent.TERMINAL:
+            raise Refused(f"send intent {intent.id} is already {intent.status}")
+        if intent.status == models.MailSendIntent.SENDING:
+            raise Refused(
+                f"send intent {intent.id} is SENDING; a message already handed to the "
+                "provider cannot be recalled. Use reconcile-send once the outcome is known."
+            )
+
+        previous = intent.status
+        intent.status = models.MailSendIntent.CANCELLED
+        intent.status_reason = reason or "cancelled by an operator"
+        # Revoke any live approval too, so a later retry cannot pick it up.
+        for approval in self.db.execute(
+            select(models.MailApproval).where(
+                models.MailApproval.send_intent_id == intent.id,
+                models.MailApproval.status == models.MailApproval.STATUS_ACTIVE,
+            )
+        ).scalars():
+            approval.status = models.MailApproval.STATUS_REVOKED
+            approval.revoked_at = _now()
+            approval.revoked_by = self.actor_id
+        self.db.flush()
+        self._audit(action="cancel_send", subject=intent.id, detail=f"{previous} -> CANCELLED")
+        return CommandResult("cancel-send", True, f"cancelled from {previous}",
+                             {"send_intent_id": intent.id, "previous_status": previous})
+
+    def reconcile_send(self, intent_id: str) -> CommandResult:
+        """Ask the provider what happened to an uncertain attempt.
+
+        This is the **only** sanctioned way out of DELIVERY_UNKNOWN, and it never
+        sends. It establishes evidence; whether to retry is then a separate decision
+        made on that evidence.
+        """
+        self._require_actor("reconcile-send")
+        from agent.mail.send_service import SendService
+        from agent.mail.gateway import get_outbound_transport
+
+        intent = self._send_intent(intent_id)
+        transport = get_outbound_transport(intent.provider or "")
+        if transport is None:
+            raise Refused(
+                f"no outbound provider is configured for {intent.provider!r}; nothing to "
+                "reconcile against"
+            )
+        service = SendService(
+            self.db, org_id=self.org_id, agent_id=intent.agent_id, outbound=transport
+        )
+        result = service.reconcile(intent_id=intent.id)
+        self._audit(action="reconcile_send", subject=intent.id,
+                    detail=f"{result.outcome or result.refusal_code}")
+        return CommandResult(
+            "reconcile-send", not result.refused,
+            f"{result.outcome or result.refusal_code}",
+            result.as_dict(),
+        )
+
+    def retry_confirmed_not_sent(self, intent_id: str) -> CommandResult:
+        """Requeue a send that the provider **confirmed** it did not accept.
+
+        Refuses anything else. A `DELIVERY_UNKNOWN` intent must be reconciled first,
+        because retrying an unknown outcome can send the same message twice - which is
+        precisely the harm this whole phase is built to prevent.
+        """
+        self._require_actor("retry-confirmed-not-sent")
+        intent = self._send_intent(intent_id)
+
+        if intent.status == models.MailSendIntent.DELIVERY_UNKNOWN:
+            raise Refused(
+                "the outcome of the last attempt is UNKNOWN. Reconcile first: a retry "
+                "now may send this message to the funder twice."
+            )
+        if intent.status == models.MailSendIntent.SENT:
+            raise Refused("this message was already accepted by the provider")
+
+        attempt = self.db.execute(
+            select(models.MailSendAttempt).where(
+                models.MailSendAttempt.send_intent_id == intent.id
+            ).order_by(models.MailSendAttempt.attempt_number.desc())
+        ).scalars().first()
+        if attempt is None or attempt.result != models.MailSendAttempt.CONFIRMED_NOT_SENT:
+            raise Refused(
+                "no attempt has been confirmed as not-accepted for this intent; a retry "
+                "requires positive evidence that nothing was delivered"
+            )
+
+        previous = intent.status
+        intent.status = models.MailSendIntent.QUEUED
+        intent.retry_not_before = _now()
+        intent.status_reason = "requeued after a confirmed non-acceptance"
+        self.db.flush()
+        self._audit(action="retry_confirmed_not_sent", subject=intent.id,
+                    detail=f"{previous} -> QUEUED (attempt {attempt.attempt_number} confirmed not sent)")
+        return CommandResult("retry-confirmed-not-sent", True, "requeued",
+                             {"send_intent_id": intent.id, "previous_status": previous})
+
     def drain_fleet(self, *, rounds: int = 3) -> CommandResult:
         """Run bounded sweeps. Convenience for an operator after a fix."""
         self._require_actor("drain-fleet")
@@ -424,6 +602,17 @@ class AdminCommands:
             )
         return workflow
 
+    def _send_intent(self, intent_id: str) -> models.MailSendIntent:
+        intent = self.db.execute(
+            select(models.MailSendIntent).where(
+                models.MailSendIntent.id == intent_id,
+                models.MailSendIntent.org_id == self.org_id,
+            )
+        ).scalars().first()
+        if intent is None:
+            raise NotFound(f"no send intent {intent_id} in this organisation")
+        return intent
+
     def _job(self, job_id: str) -> models.Job:
         job = self.db.execute(
             select(models.Job).where(
@@ -442,6 +631,11 @@ COMMANDS = (
     "list-stuck-workflows", "show-workflow", "show-job", "show-agent",
     "retry-step", "requeue-job", "resume-workflow", "cancel-workflow",
     "pause-agent", "resume-agent", "drain-fleet",
+    # Phase 7b outbound recovery. Note what is absent: there is no `force-send` and
+    # no `send-without-approval`, because administrative recovery must never be a
+    # way around the approval the whole phase depends on.
+    "show-send-intent", "show-send-attempts", "cancel-send", "reconcile-send",
+    "retry-confirmed-not-sent",
 )
 
 
@@ -467,6 +661,11 @@ def run_command(
         "pause-agent": lambda: commands.pause_agent(reason=" ".join(rest)),
         "resume-agent": lambda: commands.resume_agent(),
         "drain-fleet": lambda: commands.drain_fleet(),
+        "show-send-intent": lambda: commands.show_send_intent(rest[0]),
+        "show-send-attempts": lambda: commands.show_send_attempts(rest[0]),
+        "cancel-send": lambda: commands.cancel_send(rest[0], reason=" ".join(rest[1:])),
+        "reconcile-send": lambda: commands.reconcile_send(rest[0]),
+        "retry-confirmed-not-sent": lambda: commands.retry_confirmed_not_sent(rest[0]),
     }
     handler = table.get(name)
     if handler is None:

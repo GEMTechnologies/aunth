@@ -1995,6 +1995,16 @@ class MailDraft(Base):
     application_version: Mapped[Optional[int]] = mapped_column(Integer)
     research_version: Mapped[Optional[int]] = mapped_column(Integer)
 
+    #: Human-edit provenance. A person editing a draft creates a NEW version rather
+    #: than overwriting the AI one, so the text Granada proposed and the text a
+    #: person approved are both recoverable after the fact. The first version of this
+    #: phase added these to the migration and not to the model, and the schema-drift
+    #: test caught it - which is precisely what it is for.
+    supersedes_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    edit_source: Mapped[Optional[str]] = mapped_column(String(20))
+    edited_by: Mapped[Optional[str]] = mapped_column(String(36))
+    edited_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
     )
@@ -2002,6 +2012,276 @@ class MailDraft(Base):
     approved_by: Mapped[Optional[str]] = mapped_column(String(36))
     sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
+
+
+class MailSendIntent(Base):
+    """The EXACT immutable message Granada proposes to send, and its approval.
+
+    Not "please send draft 12". A draft is mutable working material; a send intent
+    is a frozen artefact with a fingerprint, and the fingerprint is what a human
+    approves. That distinction is the whole safety property of Phase 7b: if an
+    approval bound a *draft id*, then editing the draft after approval would
+    silently change what gets sent, and the approving human would have authorised
+    words they never saw.
+
+    So every material field is copied here at creation, including a body snapshot
+    and an attachment manifest with checksums. Nothing reads through to the draft
+    at send time.
+
+    ``message_fingerprint`` is a SHA-256 over a canonical serialisation of exactly
+    those fields. A human approves ONE fingerprint. Change a recipient, a subject,
+    one byte of the body, an attachment's version, the sender identity, the thread
+    or the application, and the fingerprint changes and the old approval no longer
+    matches. **There is no approval inheritance.**
+
+    ``risk_class`` is computed here rather than at send time, so the class a human
+    saw is the class that was approved - and the high-risk classes are refused
+    before an approval can even be requested.
+    """
+
+    __tablename__ = "mail_send_intents"
+
+    WAITING_FOR_APPROVAL = "WAITING_FOR_APPROVAL"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    CHANGES_REQUESTED = "CHANGES_REQUESTED"
+    QUEUED = "QUEUED"
+    SENDING = "SENDING"
+    SENT = "SENT"
+    #: The provider may or may not have accepted. NEVER collapsed into FAILED,
+    #: because retrying an unknown outcome is how a donor receives one email twice.
+    DELIVERY_UNKNOWN = "DELIVERY_UNKNOWN"
+    TEMPORARY_FAILURE = "TEMPORARY_FAILURE"
+    RATE_LIMITED = "RATE_LIMITED"
+    REAUTH_REQUIRED = "REAUTH_REQUIRED"
+    SUPERSEDED = "SUPERSEDED"
+    CANCELLED = "CANCELLED"
+    FAILED_FINAL = "FAILED_FINAL"
+    HIGH_RISK_BLOCKED = "HIGH_RISK_BLOCKED"
+
+    #: No further provider call may ever be made from these.
+    TERMINAL = frozenset({SENT, REJECTED, SUPERSEDED, CANCELLED, FAILED_FINAL, HIGH_RISK_BLOCKED})
+    #: An approval is required and meaningful in these.
+    AWAITING_DECISION = frozenset({WAITING_FOR_APPROVAL, CHANGES_REQUESTED})
+    #: A send attempt may begin from these.
+    SENDABLE = frozenset({APPROVED, QUEUED, TEMPORARY_FAILURE})
+    #: Granada does not know whether the provider accepted. A retry is FORBIDDEN
+    #: until reconciliation produces positive evidence.
+    UNCERTAIN = frozenset({DELIVERY_UNKNOWN, SENDING})
+
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_send_intent_idempotency"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+
+    mail_account_id: Mapped[Optional[str]] = mapped_column(ForeignKey("mail_accounts.id"), index=True)
+    mail_identity_id: Mapped[Optional[str]] = mapped_column(ForeignKey("mail_identities.id"), index=True)
+    thread_id: Mapped[Optional[str]] = mapped_column(ForeignKey("mail_threads.id"), index=True)
+    application_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    reply_to_message_id: Mapped[Optional[str]] = mapped_column(ForeignKey("mail_messages.id"), index=True)
+
+    draft_id: Mapped[Optional[str]] = mapped_column(ForeignKey("mail_drafts.id"), index=True)
+    draft_version: Mapped[Optional[int]] = mapped_column(Integer)
+
+    #: The envelope, frozen. JSON rather than a child table because it is read and
+    #: hashed as a unit, never queried by element.
+    from_address: Mapped[Optional[str]] = mapped_column(String(320))
+    to_addresses: Mapped[Optional[dict]] = mapped_column(JSON)
+    cc_addresses: Mapped[Optional[dict]] = mapped_column(JSON)
+    bcc_addresses: Mapped[Optional[dict]] = mapped_column(JSON)
+    reply_to_address: Mapped[Optional[str]] = mapped_column(String(320))
+
+    subject: Mapped[Optional[str]] = mapped_column(String(1000))
+    body_snapshot: Mapped[Optional[str]] = mapped_column(Text)
+    #: [{document_id, version, storage_ref, filename, mime_type, checksum_sha256}]
+    attachment_manifest: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    #: SHA-256 over the canonical serialisation. THE approval is of this value.
+    message_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    #: The canonical string that was hashed. Stored so a mismatch is diagnosable
+    #: rather than merely detected.
+    fingerprint_input: Mapped[Optional[str]] = mapped_column(Text)
+
+    risk_class: Mapped[str] = mapped_column(String(40), index=True)
+    risk_detail: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    status: Mapped[str] = mapped_column(String(30), default=WAITING_FOR_APPROVAL, index=True)
+    status_reason: Mapped[Optional[str]] = mapped_column(Text)
+    approval_request_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    #: The authority the intent was created under. Compared at send time; a change
+    #: means revalidation, not a silent overwrite.
+    agent_version: Mapped[Optional[int]] = mapped_column(Integer)
+
+    provider: Mapped[Optional[str]] = mapped_column(String(40), index=True)
+    provider_submission_id: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    provider_message_id: Mapped[Optional[str]] = mapped_column(String(255))
+    internet_message_id: Mapped[Optional[str]] = mapped_column(String(500), index=True)
+    #: Granada's own outbound identity, generated before submission. Opaque and
+    #: non-enumerable, so correlation leaks neither a row count nor a sequence.
+    granada_message_ref: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+
+    #: One approved intent is one logical donor email. The unique constraint is the
+    #: guarantee; Redis locks are not.
+    idempotency_key: Mapped[str] = mapped_column(String(255))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    queued_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    send_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+
+    #: SENT is provider ACCEPTANCE. These are separate on purpose: acceptance does
+    #: not prove the recipient's mailbox received anything, and a panel that reports
+    #: "delivered" when all we know is "accepted" is lying to the customer.
+    delivery_state: Mapped[Optional[str]] = mapped_column(String(30), index=True)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    bounced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    bounce_detail: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    #: Set when a definite rate-limit or temporary failure states when to try again.
+    retry_not_before: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    failure_code: Mapped[Optional[str]] = mapped_column(String(60), index=True)
+    failure_summary: Mapped[Optional[str]] = mapped_column(Text)
+
+    #: Populated by reconciliation when it establishes what actually happened.
+    reconciled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    reconciliation_state: Mapped[Optional[str]] = mapped_column(String(40))
+
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+
+
+class MailApproval(Base):
+    """A human decision, bound to one fingerprint.
+
+    Records **which** fingerprint was approved rather than a boolean. A boolean
+    cannot answer "was the message this person saw the message we are about to
+    send", which is the only question that matters when an approved reply turns out
+    to have gone somewhere unintended.
+
+    Append-only: a revoked approval is marked revoked and a new decision is a new
+    row, so the history of who authorised what survives.
+    """
+
+    __tablename__ = "mail_approvals"
+
+    APPROVE = "APPROVE"
+    REJECT = "REJECT"
+    REQUEST_CHANGES = "REQUEST_CHANGES"
+
+    STATUS_ACTIVE = "ACTIVE"
+    STATUS_REVOKED = "REVOKED"
+
+    __table_args__ = (
+        UniqueConstraint("send_intent_id", "fingerprint", name="uq_approval_intent_fingerprint"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    send_intent_id: Mapped[str] = mapped_column(ForeignKey("mail_send_intents.id"), index=True)
+
+    decision: Mapped[str] = mapped_column(String(20), index=True)
+    #: The fingerprint this decision authorises.
+    fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    risk_class: Mapped[str] = mapped_column(String(40))
+    #: The CANONICAL input that was hashed, so a later mismatch can be diffed
+    #: rather than merely refused.
+    fingerprint_input: Mapped[Optional[str]] = mapped_column(Text)
+
+    approved_by: Mapped[str] = mapped_column(String(36), index=True)
+    approved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    #: The permission and membership context at the moment of approval. A permission
+    #: revoked afterwards does not retroactively invalidate the decision, but the
+    #: record has to show what it was.
+    permission_used: Mapped[Optional[str]] = mapped_column(String(80))
+    membership_id: Mapped[Optional[str]] = mapped_column(String(36))
+    approval_version: Mapped[int] = mapped_column(Integer, default=1)
+
+    status: Mapped[str] = mapped_column(String(20), default=STATUS_ACTIVE, index=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    revoked_by: Mapped[Optional[str]] = mapped_column(String(36))
+    note: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class MailSendAttempt(Base):
+    """One attempt to hand a message to a provider. **Append-only.**
+
+    Every attempt is recorded, including — especially — the ones whose outcome
+    Granada could not determine. An attempt row saying "we called the provider and
+    never learned what happened" is the only evidence reconciliation and an operator
+    have to work from.
+
+    UPDATE and DELETE are withheld from the runtime role, and the posture is
+    verified LIVE rather than inferred: the additive ``ALTER DEFAULT PRIVILEGES``
+    trap has silently re-granted UPDATE and DELETE on an append-only table five
+    times in this project.
+    """
+
+    __tablename__ = "mail_send_attempts"
+
+    #: The three fundamental outcomes. There is no fourth, and collapsing the third
+    #: into the second is how a donor receives the same email twice.
+    CONFIRMED_SENT = "CONFIRMED_SENT"
+    CONFIRMED_NOT_SENT = "CONFIRMED_NOT_SENT"
+    DELIVERY_UNKNOWN = "DELIVERY_UNKNOWN"
+
+    #: Reconciliation's answer, which is what turns an unknown into a definite.
+    RECON_UNKNOWN = "UNKNOWN"
+    RECON_ACCEPTED = "ACCEPTED"
+    RECON_NOT_ACCEPTED = "NOT_ACCEPTED"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    send_intent_id: Mapped[str] = mapped_column(ForeignKey("mail_send_intents.id"), index=True)
+
+    attempt_number: Mapped[int] = mapped_column(Integer)
+    #: Opaque per-attempt identifier, offered to the provider as an idempotency
+    #: token where the provider supports one, so a duplicate submission is
+    #: recognisable rather than merely hoped against.
+    attempt_id: Mapped[str] = mapped_column(String(64), index=True)
+
+    provider: Mapped[str] = mapped_column(String(40), index=True)
+    #: The exact fingerprint this attempt was made against. If an approval were
+    #: swapped between the attempt and its record, this is what shows it.
+    request_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
+    granada_message_ref: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer)
+
+    result: Mapped[str] = mapped_column(String(30), index=True)
+    error_code: Mapped[Optional[str]] = mapped_column(String(60), index=True)
+    #: Safe summary only. A raw provider error can echo the message body, and error
+    #: columns are read far more casually than message content.
+    safe_error_summary: Mapped[Optional[str]] = mapped_column(Text)
+
+    provider_submission_id: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    provider_message_id: Mapped[Optional[str]] = mapped_column(String(255))
+
+    reconciliation_state: Mapped[str] = mapped_column(
+        String(20), default=RECON_UNKNOWN, index=True
+    )
+    reconciled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    worker_id: Mapped[Optional[str]] = mapped_column(String(80))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
 
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)

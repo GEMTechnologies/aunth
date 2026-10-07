@@ -234,3 +234,192 @@ class Inbox:
         if status in (models.InboxEvent.PROCESSED, models.InboxEvent.IGNORED):
             event.processed_at = _now()
         self.db.flush()
+
+# ---------------------------------------------------------------------------
+# Runnable entry point (Phase 7b, task 0A)
+# ---------------------------------------------------------------------------
+# Until now the relay had NO main(). The systemd unit referenced
+# `python -m events.relay` and that command did not exist, which is a
+# particularly bad class of gap: the unit looked complete, the documentation said
+# the relay was deployable, and nothing would ever have published an event. It was
+# found by asking what the unit actually invokes.
+#
+# The same shape as FleetRunner on purpose: an interval, a session per sweep, a
+# sliced sleep so SIGTERM is honoured promptly, failure that is counted rather than
+# fatal, and a health snapshot. Two long-running processes that behave differently
+# under shutdown is a maintenance liability, not a design choice.
+class RelayHealth:
+    """What an operator or a probe needs to know about the relay."""
+
+    def __init__(self) -> None:
+        self.running = False
+        self.stopping = False
+        self.sweeps = 0
+        self.published = 0
+        self.errors = 0
+        self.consecutive_empty = 0
+        self.last_sweep_at: Optional[datetime] = None
+        self.last_error: Optional[str] = None
+        self.started_at: Optional[datetime] = None
+
+    @property
+    def healthy(self) -> bool:
+        return self.running and not self.stopping and self.sweeps > 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "running": self.running,
+            "stopping": self.stopping,
+            "healthy": self.healthy,
+            "sweeps": self.sweeps,
+            "published": self.published,
+            "errors": self.errors,
+            "consecutive_empty": self.consecutive_empty,
+            "last_sweep_at": self.last_sweep_at.isoformat() if self.last_sweep_at else None,
+            "last_error": self.last_error,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+        }
+
+
+#: How often to drain. Short enough that a dispatch becomes a wake-up promptly,
+#: long enough that the query is not the busiest thing in the system.
+DEFAULT_RELAY_INTERVAL_SECONDS = 5
+
+#: Cap on a single sleep slice, so a stop signal is honoured within a second even
+#: if the interval is configured long.
+MAX_SLEEP_SLICE_SECONDS = 1.0
+
+
+class OutboxRelayRunner:
+    """Drains the outbox on an interval, forever, until asked to stop."""
+
+    def __init__(
+        self,
+        session_factory: Any,
+        publisher: Optional[RedisEventPublisher] = None,
+        *,
+        interval_seconds: float = DEFAULT_RELAY_INTERVAL_SECONDS,
+        batch_size: int = 100,
+    ) -> None:
+        import threading
+
+        self.session_factory = session_factory
+        self.publisher = publisher or RedisEventPublisher()
+        self.interval_seconds = max(0.5, float(interval_seconds))
+        self.batch_size = batch_size
+        self.health = RelayHealth()
+        self._stop = threading.Event()
+
+    def sweep_once(self) -> int:
+        """One drain in its own session and transaction.
+
+        The session factory call is INSIDE the guard. It was outside in the fleet
+        runner, and the result was a dispatcher that looked healthy while having
+        silently done nothing all night; the same mistake here would leave the
+        outbox full and the health snapshot clean.
+        """
+        db = None
+        try:
+            db = self.session_factory()
+            relay = OutboxRelay(db, self.publisher, batch_size=self.batch_size)
+            published = relay.drain_once()   # commits the bookkeeping itself
+            self.health.sweeps += 1
+            self.health.published += published
+            self.health.consecutive_empty = 0 if published else self.health.consecutive_empty + 1
+            self.health.last_sweep_at = _now()
+            return published
+        except Exception as exc:
+            if db is not None:
+                try:
+                    db.rollback()
+                except Exception:  # pragma: no cover - connection already gone
+                    pass
+            self.health.errors += 1
+            self.health.last_error = f"{type(exc).__name__}: {exc}"
+            # An unreachable Redis must not kill the relay: the outbox is durable and
+            # the next sweep is the recovery path. Restarting the process instead
+            # would work too, but only because systemd would restart it - the loop
+            # continuing is the simpler guarantee.
+            logger.warning("outbox.relay.sweep_failed", extra={"error": self.health.last_error})
+            raise
+        finally:
+            if db is not None:
+                db.close()
+
+    def run_forever(self, *, max_sweeps: Optional[int] = None) -> RelayHealth:
+        self.health.running = True
+        self.health.started_at = _now()
+        self._stop.clear()
+        logger.info(
+            "outbox.relay.started",
+            extra={"interval_seconds": self.interval_seconds, "batch_size": self.batch_size},
+        )
+        try:
+            while not self._stop.is_set():
+                try:
+                    self.sweep_once()
+                except Exception:
+                    pass  # counted and logged; the loop continues
+                if max_sweeps is not None and self.health.sweeps >= max_sweeps:
+                    break
+                self._sleep()
+        finally:
+            self.health.running = False
+            logger.info("outbox.relay.stopped", extra=self.health.as_dict())
+        return self.health
+
+    def _sleep(self) -> None:
+        remaining = self.interval_seconds
+        while remaining > 0 and not self._stop.is_set():
+            slice_seconds = min(MAX_SLEEP_SLICE_SECONDS, remaining)
+            if self._stop.wait(slice_seconds):
+                return
+            remaining -= slice_seconds
+
+    def stop(self) -> None:
+        self.health.stopping = True
+        self._stop.set()
+
+    def request_stop(self, *_args: Any) -> None:
+        """Signal-handler shaped."""
+        self.stop()
+
+
+def install_signal_handlers(runner: OutboxRelayRunner) -> bool:
+    """Wire SIGTERM/SIGINT to a graceful stop. Returns whether it succeeded."""
+    import signal as _signal
+
+    installed = False
+    for name in ("SIGTERM", "SIGINT"):
+        number = getattr(_signal, name, None)
+        if number is None:
+            continue
+        try:
+            _signal.signal(number, runner.request_stop)
+            installed = True
+        except (ValueError, OSError):  # not the main thread
+            return installed
+    return installed
+
+
+def main() -> int:  # pragma: no cover - process entry point
+    """``python -m events.relay`` - the command the systemd unit invokes."""
+    from config import settings
+    from database import SessionLocal
+    from observability import configure_logging, register_secrets_from_settings
+
+    configure_logging(level=getattr(settings, "log_level", "INFO"), service="granada-outbox-relay")
+    register_secrets_from_settings(settings)
+
+    runner = OutboxRelayRunner(
+        SessionLocal,
+        interval_seconds=float(getattr(settings, "outbox_relay_interval_seconds", DEFAULT_RELAY_INTERVAL_SECONDS)),
+        batch_size=int(getattr(settings, "outbox_relay_batch_size", 100)),
+    )
+    install_signal_handlers(runner)
+    runner.run_forever()
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

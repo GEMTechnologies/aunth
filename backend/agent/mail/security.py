@@ -270,6 +270,15 @@ def _looks_like_lookalike(domain: Optional[str], known_domains: Iterable[str]) -
         # is one of the cheapest impersonations to construct.
         if domain.startswith(known.replace(".", "-")):
             return known
+        # The donor's brand as a HYPHENATED prefix: "unicef-portal.example" for
+        # "unicef.org". Deliberately narrow. A brand merely *embedded* in a different
+        # name is a different organisation - "unicefusa.org" is a real affiliate and
+        # blocking a reply to it would be wrong - whereas the brand followed by a
+        # hyphen and an unrelated word is the shape impersonation actually takes.
+        known_label = known.split(".")[0]
+        domain_label = domain.split(".")[0]
+        if len(known_label) >= 4 and domain_label.startswith(known_label + "-"):
+            return known
         if domain.endswith("." + known):
             return known
         # Homoglyph-ish substitution: same length, one character different, and
