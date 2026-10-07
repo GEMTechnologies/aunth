@@ -367,19 +367,27 @@ def test_a_reduced_authority_cancels_queued_work(db):
     version_at_creation = agent.version
 
     # A step needing more than MONITOR_ONLY, queued while authority was high.
+    #
+    # This used `email_send` on the EMAIL specialist. It no longer works as a
+    # vehicle, and the reason is worth recording: Phase 7a made the EMAIL
+    # specialist executable with `required_authority = MONITOR_ONLY`, because
+    # receiving, understanding, linking and DRAFTING are all safe at monitor level.
+    # The invariant under test is unchanged, so it is now carried by a specialist
+    # that genuinely requires more authority - drafting a proposal needs DRAFT_ONLY.
+    # The EMAIL ceiling is asserted separately, just below.
     workflow = service.schedule(
-        workflow_type="email_send",
+        workflow_type="proposal_draft",
         subject_type=models.AgentWorkflow.SUBJECT_OPPORTUNITY,
         subject_id=opportunity.id,
-        specialist_key="EMAIL",
+        specialist_key="PROPOSAL_WRITER",
         run_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
     db.commit()
 
     ledger = JobLedger(db)
     job, _ = ledger.enqueue(
-        org_id=org.id, job_type="email_send", payload={"workflow_id": workflow.id},
-        domain="jobs", action="email_send", idempotency_key="stale-authority-1",
+        org_id=org.id, job_type="proposal_draft", payload={"workflow_id": workflow.id},
+        domain="jobs", action="proposal_draft", idempotency_key="stale-authority-1",
     )
     job.agent_id = agent.id
     job.agent_version = version_at_creation
@@ -649,20 +657,34 @@ def test_registered_but_unimplemented_specialists_refuse(db):
         require_executable(key)
 
 
-def test_the_implemented_specialists_are_exactly_the_phase_6c_set(db):
-    """The brief says implement three work types, not ten specialists.
+def test_the_implemented_specialists_are_exactly_the_phase_6c_and_7a_set(db):
+    """The brief says implement work types, not all ten specialists.
 
-    The Matching Agent owns two of them - the deterministic gates and the bounded
-    decision - because the roster has ten specialists and an eleventh existing only
-    to hold one function would be roster noise the customer would have to read.
+    Phase 6c: the Matching Agent owns the deterministic gates AND the bounded
+    decision, because the roster has ten specialists and an eleventh existing only
+    to hold one function would be roster noise the customer has to read.
+    Phase 7a adds the Email Agent for `mail_process` - and **only** for that.
     """
-    assert EXECUTABLE == {"MATCHER", "DONOR_RESEARCHER"}
-    assert len(EXECUTABLE) == 2
-    # Three executable work types across those two specialists.
+    assert EXECUTABLE == {"MATCHER", "DONOR_RESEARCHER", "EMAIL"}
+    assert len(EXECUTABLE) == 3
+    # Four executable work types across those three specialists.
     from agent.specialists import REGISTRY
 
     work_types = sorted(wt for spec in REGISTRY.values() for wt in spec.handlers)
-    assert work_types == ["donor_research", "opportunity_match", "opportunity_qualify"]
+    assert work_types == [
+        "donor_research", "mail_process", "opportunity_match", "opportunity_qualify",
+    ]
+
+    # THE CEILING, asserted where the roster is checked: `email_send` is a
+    # registered work type with no handler, so no dispatcher can enqueue it and no
+    # worker can execute it. That is Phase 7a's whole point, expressed as data.
+    email = REGISTRY["EMAIL"]
+    assert "email_send" in email.allowed_work_types, (
+        "the roster should still SHOW the customer that outbound mail is planned"
+    )
+    assert "email_send" not in email.handlers, (
+        "Phase 7a must not be able to send: email_send must own no handler"
+    )
 
 
 def test_a_specialist_refuses_work_it_does_not_do(db):
@@ -675,8 +697,10 @@ def test_a_specialist_refuses_work_it_does_not_do(db):
 def test_the_inventory_reports_the_truth(db):
     data = inventory()
     assert data["total"] == 10, "the roster is the brief's ten, not eleven"
-    assert len(data["executable"]) == 2
-    assert len(data["registered_not_implemented"]) == 8
+    # Three executable after Phase 7a added the Email Agent's inbound capability.
+    assert len(data["executable"]) == 3
+    assert len(data["registered_not_implemented"]) == 7
+    assert "EMAIL" in data["executable"]
     for entry in data["specialists"]:
         assert entry["required_authority"] in Autonomy.ORDER
 

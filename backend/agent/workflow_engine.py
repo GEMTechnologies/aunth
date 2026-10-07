@@ -114,6 +114,11 @@ class AgentMismatch(FleetError):
 WORKFLOW_MATCH = "opportunity_match"
 WORKFLOW_QUALIFY = "opportunity_qualify"
 WORKFLOW_RESEARCH = "donor_research"
+#: Phase 7a. Email is one more wake condition for the same shared fleet — there is
+#: no per-mailbox worker and no mail daemon. Note the absence of a send work type:
+#: `email_send` is registered on the roster and owns no handler, so it cannot be
+#: dispatched at all.
+WORKFLOW_MAIL = "mail_process"
 
 #: Default per-agent cap in one sweep. Chosen so a single very large organisation
 #: cannot fill a batch, while a normal organisation is never truncated by it.
@@ -1093,6 +1098,150 @@ def _handle_donor_research(db: Session, context: dict[str, Any]) -> dict[str, An
         # submitted: Phase 6c proves autonomous INTERNAL work.
         "next_state": models.AgentWorkflow.COMPLETED,
     }
+
+
+def _handle_mail_process(db: Session, context: dict[str, Any]) -> dict[str, Any]:
+    """Run the mail pipeline for a queued delivery. EARS ONLY — it cannot send.
+
+    Email is one more wake condition for the **same shared fleet**, exactly like a
+    new opportunity. There is no per-mailbox worker and no mail daemon: a worker
+    picks up this job, loads the organisation's agent, and the database decides who
+    the work belongs to.
+
+    The handler is deliberately thin. All the reasoning lives in
+    ``agent.mail.service``, and the capability ceiling is asserted inside it, so
+    this cannot become a second, less careful path into the pipeline.
+
+    The payload carries identifiers, not content. A job in Redis must never hold a
+    mail body: the queue is the least protected and most replicated place in the
+    system, and the brief forbids putting bodies there.
+    """
+    from agent.mail.service import GranadaMail
+
+    workflow = context["workflow"]
+    agent = context["agent"]
+
+    # Read the wake payload from the WORKFLOW row, never from the job payload.
+    # The workflow is organisation-scoped and RLS-protected; the queue is neither,
+    # so identifiers taken from a message are read from the protected side. The job
+    # payload is a hint for locating work and is treated as untrusted.
+    payload = (workflow.context or {}).get("wake") or {}
+    if not payload:
+        # Fall back to the job payload only for a job enqueued by hand, which is an
+        # administrative path rather than the normal one.
+        payload = context["job"].payload or {}
+
+    provider = payload.get("provider")
+    provider_event_id = payload.get("provider_event_id")
+    if not provider or not provider_event_id:
+        return {
+            "summary": "mail job carried no provider event to process",
+            "summary_key": "mail.invalid_job",
+            "next_state": models.AgentWorkflow.FAILED,
+            "meaningful": False,
+        }
+
+    transport = _mail_transport(provider)
+    if transport is None:
+        # No credentials or no adapter: park rather than fail. The message is not
+        # lost - the provider event row survives and a later sweep retries - and
+        # marking it failed would hide a configuration gap as a processing error.
+        return {
+            "summary": f"no transport available for provider {provider}",
+            "summary_key": "mail.transport_unavailable",
+            "next_state": models.AgentWorkflow.WAITING,
+            "waiting_on": f"mail transport for {provider} not configured",
+            "meaningful": False,
+        }
+
+    from agent.mail.providers.base import ProviderEvent as MailProviderEventData
+
+    mail = GranadaMail(db, org_id=agent.org_id, agent_id=agent.id, transport=transport)
+    result = mail.ingest_webhook(
+        provider=provider,
+        event=MailProviderEventData(
+            provider_event_id=provider_event_id,
+            event_type=payload.get("event_type", "message.received"),
+            provider_account_id=payload.get("provider_account_id"),
+            provider_message_id=payload.get("provider_message_id"),
+            provider_thread_id=payload.get("provider_thread_id"),
+        ),
+    )
+
+    if result.error:
+        return {
+            "summary": f"mail processing failed: {result.error}"[:200],
+            "summary_key": "mail.processing_failed",
+            "activity_type": "mail",
+            "structured_data": {"error": result.error[:200]},
+            "next_state": models.AgentWorkflow.WAITING,
+            "waiting_on": result.error[:255],
+            "meaningful": False,
+        }
+
+    if result.duplicate_event or result.duplicate_message:
+        return {
+            "summary": "a duplicate delivery; no new work was created",
+            "summary_key": "mail.duplicate",
+            "activity_type": "mail",
+            "structured_data": {
+                "duplicate_event": result.duplicate_event,
+                "duplicate_message": result.duplicate_message,
+                "message_id": result.message_id,
+            },
+            "next_state": models.AgentWorkflow.COMPLETED,
+            "meaningful": False,
+        }
+
+    structured = {
+        "message_id": result.message_id,
+        "thread_id": result.thread_id,
+        "classification": result.classification,
+        "correlation_state": result.correlation_state,
+        "application_id": result.application_id,
+        "deadline_id": result.deadline_id,
+        "document_satisfied": result.document_satisfied,
+        "draft_id": result.draft_id,
+        "draft_status": result.draft_status,
+        "security_flags": result.security_flags,
+    }
+    summary = (
+        f"received a {result.classification or 'message'}"
+        + (f", linked to an application ({result.correlation_state})" if result.application_id else
+           f" ({result.correlation_state or 'unlinked'})")
+        + (f", draft {result.draft_status}" if result.draft_status else "")
+    )
+    return {
+        "summary": summary[:200],
+        "summary_key": f"mail.{(result.draft_status or result.classification or 'received').lower()}",
+        "activity_type": "mail",
+        "structured_data": structured,
+        "events": [{
+            "event_type": "mail.workflow_completed",
+            "stream": "granada:v1:mail:processed",
+            "payload": structured,
+        }],
+        # STOP HERE. A draft exists and nothing has been sent. Phase 7a ends at
+        # READY; outbound mail is a separate phase with its own ceiling.
+        "next_state": models.AgentWorkflow.COMPLETED,
+    }
+
+
+#: Provider name -> adapter. Populated by the deployment: a provider with no
+#: configured credentials is absent rather than broken, so the handler parks
+#: instead of failing.
+def _mail_transport(provider: str) -> Any:
+    """Resolve a mail transport for a provider name.
+
+    Delegates to the gateway's registry, which is the single place transports are
+    selected. Returns ``None`` when nothing is configured — deliberately not an
+    exception: an unconfigured provider is an operational state, not a processing
+    error, and conflating the two would make a configuration gap look like mail
+    corruption.
+    """
+    from agent.mail.gateway import get_transport
+
+    return get_transport(provider)
 
 
 def _settings() -> Any:

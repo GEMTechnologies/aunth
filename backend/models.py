@@ -1466,6 +1466,543 @@ class DonorResearch(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# Granada Mail (Phase 7a): receive -> understand -> link -> draft
+# ---------------------------------------------------------------------------
+class MailAccount(Base):
+    """A mailbox Granada reads on behalf of one organisation's agent.
+
+    Two kinds, and the distinction is a product requirement rather than an
+    implementation detail:
+
+    ``GRANADA_MANAGED``
+        An address Granada owns, e.g. ``warchild@granada.com``.
+    ``CONNECTED``
+        The organisation's own mailbox - Google Workspace, Microsoft 365 -
+        reached through **delegated OAuth**. Users must not have to abandon the
+        address their funders already write to.
+
+    **No provider password is ever stored.** There is no column for one, and
+    ``credentials_ref`` points at the secret store rather than holding a secret.
+    That is the security gate's rule and it is enforced by the schema's shape: a
+    password has nowhere to go.
+    """
+
+    __tablename__ = "mail_accounts"
+
+    PROVIDER_GRANADA_MANAGED = "GRANADA_MANAGED"
+    PROVIDER_GOOGLE = "GOOGLE"
+    PROVIDER_MICROSOFT = "MICROSOFT"
+
+    CONNECTION_GRANADA_MANAGED = "GRANADA_MANAGED"
+    CONNECTION_DELEGATED_OAUTH = "DELEGATED_OAUTH"
+
+    CONNECTING = "CONNECTING"
+    ACTIVE = "ACTIVE"
+    REAUTH_REQUIRED = "REAUTH_REQUIRED"
+    PAUSED = "PAUSED"
+    DISCONNECTED = "DISCONNECTED"
+    ERROR = "ERROR"
+
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_account_id", name="uq_mail_account_provider"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+
+    provider: Mapped[str] = mapped_column(String(40), index=True)
+    provider_account_id: Mapped[str] = mapped_column(String(255))
+    connection_type: Mapped[str] = mapped_column(String(30))
+    address: Mapped[str] = mapped_column(String(320), index=True)
+    display_name: Mapped[Optional[str]] = mapped_column(String(200))
+
+    status: Mapped[str] = mapped_column(String(20), default=CONNECTING, index=True)
+    #: Which scopes were granted. Recorded so a missing scope is diagnosable
+    #: rather than surfacing as a mysterious empty sync.
+    scopes: Mapped[Optional[dict]] = mapped_column(JSON)
+    #: A REFERENCE to the secret store, never a secret.
+    credentials_ref: Mapped[Optional[str]] = mapped_column(String(255))
+
+    #: Durable checkpoint. A restart resumes from here rather than from the
+    #: beginning of the mailbox or from a gap.
+    sync_cursor: Mapped[Optional[str]] = mapped_column(String(500))
+    last_sync_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    sync_status: Mapped[Optional[str]] = mapped_column(String(40))
+    last_error: Mapped[Optional[str]] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class MailIdentity(Base):
+    """An address Granada may eventually communicate *from*.
+
+    Separate from ``MailAccount`` because a mailbox can hold several sendable
+    addresses (aliases, shared addresses), and because an identity must exist for a
+    managed Granada address that has no external mailbox behind it.
+
+    ``token`` is the opaque, non-enumerable part of a managed reply address. The
+    brief is explicit that an address must not be ``application-123@granada.com``:
+    a predictable alias lets anyone enumerate tenants and applications, so the
+    token is random, stored hashed-indexed, and revocable.
+    """
+
+    __tablename__ = "mail_identities"
+
+    TYPE_MANAGED = "MANAGED"
+    TYPE_CONNECTED = "CONNECTED"
+    TYPE_REPLY_ALIAS = "REPLY_ALIAS"
+
+    ACTIVE = "ACTIVE"
+    REVOKED = "REVOKED"
+
+    __table_args__ = (
+        UniqueConstraint("address", name="uq_mail_identity_address"),
+        UniqueConstraint("token", name="uq_mail_identity_token"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    mail_account_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("mail_accounts.id"), index=True
+    )
+
+    address: Mapped[str] = mapped_column(String(320), index=True)
+    display_name: Mapped[Optional[str]] = mapped_column(String(200))
+    identity_type: Mapped[str] = mapped_column(String(20), index=True)
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), default=ACTIVE, index=True)
+
+    #: The opaque alias token. What a funder sees in the reply-to, and what
+    #: Granada resolves back to (org, agent, application). Never a bare UUID.
+    token: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    #: What the token resolves to. Kept as a reference rather than a copy so the
+    #: alias cannot disagree with the application it points at.
+    purpose_type: Mapped[Optional[str]] = mapped_column(String(20))
+    purpose_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class MailThread(Base):
+    """A correspondence thread, owned by one agent.
+
+    **A thread is never identified by its subject alone.** Subjects are reused,
+    forwarded, prefixed with ``Re:``, translated, and sometimes absent entirely;
+    treating one as an identity merges unrelated conversations. Identity comes from
+    the provider's thread id, the ``References``/``In-Reply-To`` chain, or an
+    opaque Granada alias - and ``subject`` is stored only for display and for
+    fuzzy matching when nothing better exists.
+    """
+
+    __tablename__ = "mail_threads"
+
+    STATUS_OPEN = "OPEN"
+    STATUS_WAITING = "WAITING"
+    STATUS_CLOSED = "CLOSED"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "mail_account_id", "provider_thread_id", name="uq_thread_account_provider"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    mail_account_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("mail_accounts.id"), index=True
+    )
+
+    provider_thread_id: Mapped[Optional[str]] = mapped_column(String(255))
+    #: Display and fuzzy matching only. Never an identity.
+    normalized_subject: Mapped[Optional[str]] = mapped_column(String(500), index=True)
+
+    application_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    opportunity_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    donor_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    status: Mapped[str] = mapped_column(String(20), default=STATUS_OPEN, index=True)
+    first_message_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_message_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class MailMessage(Base):
+    """One canonical inbound or outbound message.
+
+    Identity is the **provider's** message id, unique per account, so a redelivered
+    webhook cannot create a second copy. The Internet ``Message-ID`` is also kept
+    because it is what ``In-Reply-To`` and ``References`` in *other* messages point
+    at, which is what makes threading work.
+
+    ``authentication_results`` holds the provider's SPF/DKIM/DMARC verdicts. The
+    brief is explicit that PASS is not trustworthiness and FAIL is not fraud - they
+    are *signals* that feed the security classification, not a verdict.
+
+    ``body_ref`` points at object storage. Bodies are never put in Redis: mail is
+    among the largest and most sensitive things Granada holds, and a cache is not
+    a place for it.
+    """
+
+    __tablename__ = "mail_messages"
+
+    DIRECTION_INBOUND = "INBOUND"
+    DIRECTION_OUTBOUND = "OUTBOUND"
+
+    PROCESSING_RECEIVED = "RECEIVED"
+    PROCESSING_PERSISTED = "PERSISTED"
+    PROCESSING_CLASSIFIED = "CLASSIFIED"
+    PROCESSING_LINKED = "LINKED"
+    PROCESSING_DRAFTED = "DRAFTED"
+    PROCESSING_FAILED = "FAILED"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "mail_account_id", "provider_message_id", name="uq_message_account_provider"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    mail_account_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("mail_accounts.id"), index=True
+    )
+    thread_id: Mapped[Optional[str]] = mapped_column(ForeignKey("mail_threads.id"), index=True)
+
+    provider_message_id: Mapped[str] = mapped_column(String(255))
+    internet_message_id: Mapped[Optional[str]] = mapped_column(String(500), index=True)
+    in_reply_to: Mapped[Optional[str]] = mapped_column(String(500), index=True)
+    references: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    direction: Mapped[str] = mapped_column(String(10), default=DIRECTION_INBOUND, index=True)
+    sender: Mapped[Optional[str]] = mapped_column(String(320), index=True)
+    sender_name: Mapped[Optional[str]] = mapped_column(String(320))
+    recipients: Mapped[Optional[dict]] = mapped_column(JSON)
+    subject: Mapped[Optional[str]] = mapped_column(String(1000))
+
+    #: Object-storage reference. The original provider representation is retained
+    #: so an audit can reproduce what arrived.
+    body_ref: Mapped[Optional[str]] = mapped_column(String(500))
+    body_preview: Mapped[Optional[str]] = mapped_column(Text)
+    provider_payload_ref: Mapped[Optional[str]] = mapped_column(String(500))
+
+    received_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    authentication_results: Mapped[Optional[dict]] = mapped_column(JSON)
+    processing_status: Mapped[str] = mapped_column(
+        String(20), default=PROCESSING_RECEIVED, index=True
+    )
+    processing_error: Mapped[Optional[str]] = mapped_column(Text)
+
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class MailProviderEvent(Base):
+    """A provider webhook delivery, deduplicated on the provider's own event id.
+
+    Providers redeliver. Gmail retries a failed webhook for days. The unique
+    constraint on ``(provider, provider_event_id)`` turns that into a database
+    error rather than a duplicated business action - and it is the constraint, not
+    a SELECT, that guarantees it, because two concurrent deliveries would both pass
+    a SELECT.
+    """
+
+    __tablename__ = "mail_provider_events"
+
+    STATUS_RECEIVED = "RECEIVED"
+    STATUS_PROCESSED = "PROCESSED"
+    STATUS_FAILED = "FAILED"
+    STATUS_IGNORED = "IGNORED"
+
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_id", name="uq_mail_provider_event"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    provider: Mapped[str] = mapped_column(String(40), index=True)
+    provider_event_id: Mapped[str] = mapped_column(String(255))
+    mail_account_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("mail_accounts.id"), index=True
+    )
+    #: Nullable because the tenant is genuinely unknown until the mailbox is
+    #: resolved - the same pre-tenant residual as ``inbox_events``.
+    org_id: Mapped[Optional[str]] = mapped_column(ForeignKey("organisations.id"), index=True)
+
+    event_type: Mapped[Optional[str]] = mapped_column(String(80), index=True)
+    payload_ref: Mapped[Optional[str]] = mapped_column(String(500))
+
+    status: Mapped[str] = mapped_column(String(20), default=STATUS_RECEIVED, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_summary: Mapped[Optional[str]] = mapped_column(Text)
+
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class MailAttachment(Base):
+    """One inbound attachment. Untrusted until proven otherwise.
+
+    An inbound attachment must **never** become a verified organisation document
+    automatically: it arrives from outside, addressed to anyone, and a
+    document the organisation did not upload is not a document the organisation
+    stands behind. Importing it into the vault is a human decision, and
+    ``vault_document_id`` is set only after that.
+    """
+
+    __tablename__ = "mail_attachments"
+
+    SCAN_PENDING = "PENDING"
+    SCAN_CLEAN = "CLEAN"
+    SCAN_SUSPICIOUS = "SUSPICIOUS"
+    SCAN_FAILED = "FAILED"
+    SCAN_UNAVAILABLE = "UNAVAILABLE"
+
+    __table_args__ = (
+        UniqueConstraint("message_id", "checksum_sha256", "filename", name="uq_attachment_message"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    message_id: Mapped[str] = mapped_column(ForeignKey("mail_messages.id"), index=True)
+
+    filename: Mapped[Optional[str]] = mapped_column(String(500))
+    mime_type: Mapped[Optional[str]] = mapped_column(String(200))
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    checksum_sha256: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    storage_ref: Mapped[Optional[str]] = mapped_column(String(500))
+
+    scan_status: Mapped[str] = mapped_column(String(20), default=SCAN_PENDING, index=True)
+    scan_detail: Mapped[Optional[str]] = mapped_column(Text)
+    #: Set only after a human chose to import it. Never automatic.
+    vault_document_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class MailApplicationLink(Base):
+    """The persisted correlation between a message and an application.
+
+    Correlation is the most safety-critical part of mail handling, and the brief's
+    rule governs the design: **wrong linkage is worse than no linkage.** A message
+    linked to the wrong application would produce a draft about the wrong grant,
+    quoting the wrong deadline, to the wrong funder.
+
+    So the state is explicit - ``EXACT``, ``HIGH_CONFIDENCE``, ``AMBIGUOUS``,
+    ``UNLINKED`` - and only the first two may autonomously trigger an
+    application-specific workflow. An ambiguous message is parked for a human
+    rather than guessed at.
+
+    Corrections are **appended, never rewritten**: ``superseded_by`` preserves the
+    earlier association so the evidence of what Granada believed, and why, survives
+    a human override. Silently rewriting the link would destroy exactly the audit
+    trail the correction is meant to create.
+    """
+
+    __tablename__ = "mail_application_links"
+
+    EXACT = "EXACT"
+    HIGH_CONFIDENCE = "HIGH_CONFIDENCE"
+    AMBIGUOUS = "AMBIGUOUS"
+    UNLINKED = "UNLINKED"
+
+    STATUS_ACTIVE = "ACTIVE"
+    STATUS_CORRECTED = "STATUS_CORRECTED"
+    STATUS_REJECTED = "REJECTED"
+
+    #: Only these may trigger an application-specific workflow autonomously.
+    AUTONOMOUS_STATES = frozenset({EXACT, HIGH_CONFIDENCE})
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    message_id: Mapped[str] = mapped_column(ForeignKey("mail_messages.id"), index=True)
+    application_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    link_method: Mapped[str] = mapped_column(String(40), index=True)
+    confidence: Mapped[str] = mapped_column(String(20), index=True)
+    status: Mapped[str] = mapped_column(String(20), default=STATUS_ACTIVE, index=True)
+    #: Every signal that contributed, so the decision is explainable.
+    signals: Mapped[Optional[dict]] = mapped_column(JSON)
+    #: The candidates considered when the answer was AMBIGUOUS - which is the work
+    #: item a human needs.
+    candidates: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    linked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    corrected_by: Mapped[Optional[str]] = mapped_column(String(36))
+    corrected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    superseded_by: Mapped[Optional[str]] = mapped_column(String(36))
+
+
+class MailClassificationRecord(Base):
+    """Why a message was classified the way it was.
+
+    Named `...Record` rather than `MailClassification` to avoid colliding with the
+    `MailClassification` **enum** in ``agent.mail.vocabulary``. The collision was
+    not merely cosmetic: the static regression test that checks every
+    ``Model.ATTRIBUTE`` reference resolves against the real model reported 23 false
+    positives, because it could not tell the vocabulary from the table. A safety net
+    that reports 23 imaginary problems is a safety net people learn to ignore.
+
+    The brief forbids storing only a string on the message. A bare label cannot
+    answer "why did Granada think this was a document request", which is the
+    question that matters when it got it wrong - so the rule hits, the provider,
+    the confidence, the decision id, the shadow classification and the security
+    flags are all recorded.
+    """
+
+    __tablename__ = "mail_classifications"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    message_id: Mapped[str] = mapped_column(ForeignKey("mail_messages.id"), index=True)
+
+    classification: Mapped[str] = mapped_column(String(40), index=True)
+    #: Rules are deterministic and always run first; a judgmental classification
+    #: records the decision instead.
+    method: Mapped[str] = mapped_column(String(20), index=True)
+    confidence: Mapped[Optional[float]] = mapped_column(Float)
+    rule_hits: Mapped[Optional[dict]] = mapped_column(JSON)
+    decision_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    shadow_classification: Mapped[Optional[dict]] = mapped_column(JSON)
+    security_flags: Mapped[Optional[dict]] = mapped_column(JSON)
+    classified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class MailDeadline(Base):
+    """A deadline extracted from correspondence, stored as durable work.
+
+    The brief is explicit that a deadline must not live only inside draft text. A
+    date mentioned in an email is a commitment the organisation has made, and it
+    has to survive the draft being discarded.
+
+    ``raw_expression`` preserves what the message actually said, because
+    "within five days" and "by 16 October 2026" resolve differently and the
+    resolution is an interpretation that must be auditable.
+    """
+
+    __tablename__ = "mail_deadlines"
+
+    RESOLVED = "RESOLVED"
+    AMBIGUOUS = "AMBIGUOUS"
+    UNRESOLVED = "UNRESOLVED"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    message_id: Mapped[str] = mapped_column(ForeignKey("mail_messages.id"), index=True)
+    application_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    raw_expression: Mapped[str] = mapped_column(String(500))
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    timezone_assumption: Mapped[Optional[str]] = mapped_column(String(60))
+    confidence: Mapped[Optional[float]] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(20), default=RESOLVED, index=True)
+    #: What produced the resolution: a deterministic parse or a model reading.
+    resolved_by: Mapped[Optional[str]] = mapped_column(String(60))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class MailDraft(Base):
+    """A reply draft. **Phase 7a can produce one and can never send it.**
+
+    ``SENT`` exists in the status vocabulary because the column must describe the
+    future state honestly, but it is **structurally unreachable** in 7a: nothing in
+    the codebase writes it, and the provider interface refuses the send capability
+    with ``ExternalActionDisabled`` rather than silently doing nothing.
+
+    Versioned rather than overwritten. A draft records the exact inputs it was
+    built from - organisation profile version, application version, research
+    version, the facts and documents it used - so a proposal built on version 3
+    stays explainable after version 4 arrives. That is the same reasoning as
+    ``org_facts`` and ``donor_research``.
+    """
+
+    __tablename__ = "mail_drafts"
+
+    GENERATING = "GENERATING"
+    READY = "READY"
+    NEEDS_DATA = "NEEDS_DATA"
+    NEEDS_REVIEW = "NEEDS_REVIEW"
+    APPROVED = "APPROVED"
+    SUPERSEDED = "SUPERSEDED"
+    #: Unreachable in Phase 7a. See the class docstring.
+    SENT = "SENT"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "reply_to_message_id", "application_version", "research_version", "version",
+            name="uq_draft_message_revision",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    thread_id: Mapped[Optional[str]] = mapped_column(ForeignKey("mail_threads.id"), index=True)
+    application_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    reply_to_message_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("mail_messages.id"), index=True
+    )
+
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    subject: Mapped[Optional[str]] = mapped_column(String(1000))
+    body: Mapped[Optional[str]] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default=GENERATING, index=True)
+    status_reason: Mapped[Optional[str]] = mapped_column(Text)
+
+    model_invocation_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    prompt_version: Mapped[Optional[str]] = mapped_column(String(50))
+    #: What the draft asserts and where each assertion came from.
+    facts_used: Mapped[Optional[dict]] = mapped_column(JSON)
+    documents_used: Mapped[Optional[dict]] = mapped_column(JSON)
+    #: The revisions the draft was built against, so it can be explained later.
+    organisation_profile_version: Mapped[Optional[int]] = mapped_column(Integer)
+    application_version: Mapped[Optional[int]] = mapped_column(Integer)
+    research_version: Mapped[Optional[int]] = mapped_column(Integer)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    approved_by: Mapped[Optional[str]] = mapped_column(String(36))
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)
 Index("ix_jobs_dispatch", Job.state, Job.available_at)

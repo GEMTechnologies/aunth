@@ -162,8 +162,20 @@ REGISTRY: dict[str, SpecialistSpec] = {
               registered_work_types=("compliance_check",)),
         _spec("DOCUMENT", "Document Agent", {}, Autonomy.MONITOR_ONLY,
               registered_work_types=("document_request",)),
-        _spec("EMAIL", "Email Agent", {}, Autonomy.AUTO_ROUTINE,
-              registered_work_types=("email_triage", "email_send")),
+        # Implemented in Phase 7a — EARS ONLY.
+        #
+        # `mail_process` has a handler. `email_send` is listed as a REGISTERED work
+        # type and deliberately has none, so the roster shows the customer that the
+        # capability exists while the code makes it impossible to dispatch. That is
+        # the ceiling expressed in the registry rather than in a comment: a
+        # dispatcher cannot enqueue what no handler owns, and the capability assert
+        # would refuse it even if it could.
+        _spec(
+            "EMAIL", "Email Agent",
+            {"mail_process": "_handle_mail_process"},
+            Autonomy.MONITOR_ONLY,
+            registered_work_types=("mail_process", "email_send"),
+        ),
         _spec("SUBMISSION", "Submission Agent", {}, Autonomy.AUTOPILOT_WITH_GATES,
               registered_work_types=("submission",)),
         _spec("FOLLOW_UP", "Follow-up Agent", {}, Autonomy.AUTO_ROUTINE,

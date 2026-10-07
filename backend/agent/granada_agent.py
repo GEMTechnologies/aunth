@@ -611,6 +611,17 @@ class GranadaAgentService:
             models.DecisionRecord.shadow.is_(False),
             models.DecisionRecord.policy_outcome.is_(False),
         )
+        # Mail that Granada received and could NOT confidently attach to an
+        # application is an action item, and leaving it out of this figure was a
+        # real gap: the panel showed zero things needing attention while an
+        # unlinked funder email sat unread. "Wrong linkage is worse than no
+        # linkage" only holds if a person is actually told to make the link.
+        ambiguous_mail = count(
+            models.MailApplicationLink,
+            models.MailApplicationLink.org_id == self.org_id,
+            models.MailApplicationLink.confidence.in_(["AMBIGUOUS", "UNLINKED"]),
+            models.MailApplicationLink.status == models.MailApplicationLink.STATUS_ACTIVE,
+        )
 
         active_workflows = count(
             models.AgentWorkflow,
@@ -674,7 +685,9 @@ class GranadaAgentService:
             applications_in_progress=in_progress,
             emails_handled_today=emails,
             applications_submitted=submitted,
-            actions_requiring_you=int(pending_approval + waiting_data + escalated),
+            actions_requiring_you=int(
+                pending_approval + waiting_data + escalated + ambiguous_mail
+            ),
             opportunities_scanned_today=evaluated,
             next_wake_at=_aware(next_wake) if next_wake else None,
         )
