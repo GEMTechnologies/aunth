@@ -943,35 +943,62 @@ class GranadaMail:
             detail = None
             storage_ref = None
 
+            # Set to None here because the oversize path never downloads the content,
+            # so it has no checksum - and the row must say that rather than the code
+            # raising UnboundLocalError. Found by the oversize test after the scanner
+            # was wired in, because the digest used to be computed once outside the
+            # branch and now comes from the scan verdict inside it.
+            digest: Optional[str] = None
+
             if size > max_bytes:
-                # Never downloaded. The record says why.
+                # Never downloaded, so there is nothing to scan and nothing to hash.
+                # The record says why.
                 scan_status = models.MailAttachment.SCAN_SUSPICIOUS
                 detail = f"declared size {size} exceeds the {max_bytes} byte limit; not downloaded"
             else:
-                filename = (getattr(attachment, "filename", None) or "").lower()
-                suffix = filename[filename.rfind(".") :] if "." in filename else ""
-                from agent.mail.security import _DANGEROUS_EXTENSIONS, _MACRO_EXTENSIONS
+                # The content screen. A real scan, not an extension check, and its
+                # verdict decides whether the bytes are stored at all.
+                #
+                # The previous version marked any unrecognised type CLEAN with the
+                # detail "stored; no malware scanner configured". That was honest about
+                # the limitation, and it still meant an inbound file reached
+                # `scan_status = CLEAN` without anything having looked inside it -
+                # which is precisely the reading `CLEAN` must never invite.
+                from agent.mail.scanning import ScanVerdict, scan_attachment
 
-                if suffix in _DANGEROUS_EXTENSIONS:
+                verdict = scan_attachment(
+                    content=attachment.content,
+                    filename=getattr(attachment, "filename", None),
+                    declared_mime=getattr(attachment, "mime_type", None),
+                )
+                digest = verdict.checksum_sha256
+
+                if verdict.verdict == ScanVerdict.MALICIOUS:
                     scan_status = models.MailAttachment.SCAN_SUSPICIOUS
-                    detail = f"executable attachment type {suffix}; not downloaded"
-                elif suffix in _MACRO_EXTENSIONS:
+                    codes = ", ".join(f.code for f in verdict.findings)
+                    detail = f"quarantined without storing: {codes}"[:500]
+                elif verdict.verdict == ScanVerdict.SUSPICIOUS:
                     scan_status = models.MailAttachment.SCAN_SUSPICIOUS
-                    detail = f"macro-enabled attachment type {suffix}; quarantined"
-                elif attachment.content is not None:
-                    digest = hashlib.sha256(attachment.content).hexdigest()
+                    codes = ", ".join(f.code for f in verdict.findings)
+                    detail = f"quarantined: {codes}"[:500]
+                    # Stored anyway, so an operator can look at it. Quarantine means
+                    # "do not use", not "pretend it never arrived".
+                    if attachment.content is not None:
+                        storage_ref = f"mail/{self.org_id}/quarantine/{digest}"
+                elif verdict.verdict == ScanVerdict.CLEAN and attachment.content is not None:
                     storage_ref = f"mail/{self.org_id}/attachments/{digest}"
                     scan_status = models.MailAttachment.SCAN_CLEAN
-                    detail = "stored; no malware scanner configured in this environment"
+                    # The detail names the COVERAGE, never the word "safe". A reader
+                    # must not be able to conclude more was checked than was.
+                    detail = (
+                        "passed a structural and signature screen (type and magic bytes, "
+                        "executable and macro detection, archive inspection). NOT an "
+                        "anti-virus engine: a novel payload would not be detected."
+                    )[:1000]
                 else:
                     scan_status = models.MailAttachment.SCAN_UNAVAILABLE
-                    detail = "content not supplied by the provider in this delivery"
+                    detail = "no content was supplied by the provider in this delivery"
 
-            digest = (
-                hashlib.sha256(attachment.content).hexdigest()
-                if attachment.content is not None
-                else None
-            )
             self.db.add(
                 models.MailAttachment(
                     id=str(uuid.uuid4()),
