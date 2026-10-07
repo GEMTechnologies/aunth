@@ -6,9 +6,9 @@
 # ones the test suite currently runs green against.
 
 # --- Web framework ---
-fastapi==0.104.1
+fastapi==0.115.6
 uvicorn[standard]==0.24.0
-python-multipart==0.0.6
+python-multipart==0.0.32
 
 # --- Data layer ---
 sqlalchemy==2.0.23
@@ -23,12 +23,12 @@ email-validator==2.1.0
 
 # --- Security ---
 passlib[argon2]==1.7.4
-python-jose[cryptography]==3.3.0
+python-jose[cryptography]==3.5.0
 
 # --- Templating and utilities ---
-jinja2==3.1.2
+jinja2==3.1.6
 python-dateutil==2.8.2
-python-dotenv==1.0.0
+python-dotenv==1.2.2
 
 # --- Outbound HTTP (OAuth provider calls) ---
 httpx==0.25.2

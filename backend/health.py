@@ -537,6 +537,39 @@ def validate_configuration() -> list[ConfigProblem]:
         return [ConfigProblem("CONFIG_UNREADABLE", "refuse",
                               f"settings could not be loaded: {exc}")]
 
+    # 0. The JWT algorithm must be an HMAC algorithm.
+    #
+    # THE CVE THIS CLOSES: CVE-2026-85394 has NO FIX VERSION. python-jose through 3.5.0
+    # accepts DER-encoded public keys as HMAC secrets, so an attacker holding the
+    # service's public key can forge HS256 tokens - "when algorithms are not explicitly
+    # restricted".
+    #
+    # Granada meets neither condition: `decode_access_token` passes
+    # `algorithms=[settings.jwt_algorithm]`, and `jwt_secret` is a symmetric string with
+    # no public key anywhere in the codebase. But the mitigation is only a mitigation
+    # while the configuration stays symmetric, and `JWT_ALGORITHM=RS256` is a one-line
+    # change that would ask python-jose to verify an asymmetric token with an HMAC key -
+    # which is the exact shape the advisory makes exploitable.
+    #
+    # So the check is a refusal rather than a warning: there is no correct configuration
+    # in which this codebase verifies a JWT with an asymmetric algorithm and a symmetric
+    # secret, and a warning on a security-shaped misconfiguration is a warning that gets
+    # clicked past.
+    hmac_algorithms = {"HS256", "HS384", "HS512"}
+    if str(getattr(settings, "jwt_algorithm", "")).upper() not in hmac_algorithms:
+        problems.append(
+            ConfigProblem(
+                "JWT_ALGORITHM_NOT_HMAC",
+                "refuse",
+                f"jwt_algorithm is {settings.jwt_algorithm!r} but the verification key is "
+                "a symmetric secret. An asymmetric algorithm here asks python-jose to "
+                "verify an asymmetric token with an HMAC key, which is the shape "
+                "CVE-2026-85394 makes exploitable - and that advisory has no fix version. "
+                "Use HS256, or move to a public key with an actively maintained JWT "
+                "library before changing this.",
+            )
+        )
+
     # 1. Autonomous mail on, with no way to send.
     from agent.mail.autonomy import platform_autonomy_enabled
 

@@ -88,10 +88,39 @@ BEGIN
         -- This entry exists because leaving it out re-granted DELETE the moment the
         -- script was re-run. It was found by verifying the posture AFTER applying the
         -- script rather than trusting that migration 014's REVOKE still stood - which
-        -- is the only way this trap has ever been caught, and it has now caught seven
-        -- tables: jobs, model_invocations, decision_records, application_transitions,
-        -- agent_activity, donor_research and mail_send_intents.
-        'mail_send_intents'
+        -- is the only way this trap has ever been caught. It had caught seven tables
+        -- before Phase 8 (jobs, model_invocations, decision_records,
+        -- application_transitions, agent_activity, donor_research, mail_send_intents);
+        -- the submission entries below were added BEFORE the script was next run,
+        -- which is the first time this trap has been closed ahead of time rather than
+        -- after the fact.
+        'mail_send_intents',
+        -- Phase 8 submission history. Added here as well as in migration 016, for the
+        -- same reason as every entry above: THIS script is additive and is what gets
+        -- re-run, so leaving them out would hand back UPDATE and DELETE on the record of
+        -- which applications were filed and what the funder acknowledged.
+        --
+        -- Found by `tools/security_scan.py`, which checks structurally that every
+        -- append-only table appears in this file - because the way this trap has always
+        -- been caught before is by verifying the posture AFTER applying the script, and
+        -- that only catches it once it has already happened.
+        --
+        -- `submission_receipts` is the sharper of the two. A receipt is the EVIDENCE that
+        -- a funder received an application; one its own subject can rewrite is not
+        -- evidence, and `SUBMITTED` is only ever recorded against a receipt.
+        'submission_attempts', 'submission_receipts',
+        -- DELETE is revoked but UPDATE is NOT. A package's status must advance from DRAFT
+        -- to AWAITING_AUTHORISATION to AUTHORISED to SUBMITTING to SUBMITTED, so UPDATE
+        -- belongs to it. DELETING it does not: a package is the record of which documents
+        -- a person authorised and what was filed, and a record its own subject can erase
+        -- is not a record.
+        --
+        -- This entry was ADDED AFTER the script had already been re-run, because the first
+        -- version of this fix named the two history tables and stopped there. Verifying the
+        -- posture afterwards showed `submission_packages` had gone from D=false to D=true -
+        -- the broad grant at line 37 standing unrevoked. That is the ninth time this trap
+        -- has fired, and the first time it was caught by a check rather than by a report.
+        'submission_packages'
     ]
     LOOP
         IF EXISTS (
@@ -102,7 +131,16 @@ BEGIN
             -- Append-only tables must not be editable either. A history or an
             -- evidence record a caller can rewrite is worse than none, because it
             -- looks authoritative.
-            IF evidence_table IN ('application_transitions', 'agent_activity', 'donor_research', 'mail_send_attempts', 'mail_approvals') THEN
+            -- `submission_packages` is deliberately NOT in THIS list, while being IN the
+            -- DELETE list above. Its status must advance from DRAFT to
+            -- AWAITING_AUTHORISATION to AUTHORISED to SUBMITTING to SUBMITTED, so UPDATE
+            -- belongs to it. Its LIFECYCLE is mutable; its EXISTENCE is not. The same
+            -- distinction as `mail_send_intents`.
+            IF evidence_table IN (
+                'application_transitions', 'agent_activity', 'donor_research',
+                'mail_send_attempts', 'mail_approvals',
+                'submission_attempts', 'submission_receipts'
+            ) THEN
                 EXECUTE format('REVOKE UPDATE ON TABLE %I FROM granada_app', evidence_table);
             END IF;
         END IF;
@@ -156,6 +194,13 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 --
 --   SELECT has_table_privilege('granada_app', 'alembic_version', 'SELECT'),
 --          has_table_privilege('granada_app', 'jobs', 'DELETE'),
---          has_table_privilege('granada_app', 'model_invocations', 'DELETE');
+--          has_table_privilege('granada_app', 'model_invocations', 'DELETE'),
+--          has_table_privilege('granada_app', 'submission_attempts', 'UPDATE'),
+--          has_table_privilege('granada_app', 'submission_receipts', 'UPDATE'),
+--          has_table_privilege('granada_app', 'submission_packages', 'UPDATE'),
+--          has_table_privilege('granada_app', 'submission_packages', 'DELETE');
 --
--- Expected: f, f, f.
+-- Expected: f, f, f, f, f, t, f  - UPDATE on a package is TRUE because its status must
+-- advance, and DELETE on it is FALSE because its existence is the record. A blanket
+-- `f, f, f, f, f, f, f` would mean UPDATE had been over-revoked and no application could
+-- ever leave DRAFT; an all-`t` tail would mean the broad grant at line 37 was standing.
