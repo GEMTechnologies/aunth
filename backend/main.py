@@ -11,6 +11,7 @@ import uuid
 from database import engine, Base, create_tables, DatabaseManager
 from router import router
 from oauth import router as oauth_router
+from agent_api import router as agent_router
 from config import settings
 
 # Configure logging
@@ -137,6 +138,11 @@ async def general_exception_handler(request: Request, exc: Exception):
 # Include router
 app.include_router(router, prefix="/api/v1")
 app.include_router(oauth_router, prefix="/api/v1")
+# The agent and mail surface. Registered here beside the auth routers because it uses
+# the same authentication and tenant binding: the tenant comes from the validated
+# token, never from a path parameter, so editing a URL cannot reach another
+# organisation's correspondence.
+app.include_router(agent_router, prefix="/api/v1")
 
 # Root endpoints
 @app.get("/")
