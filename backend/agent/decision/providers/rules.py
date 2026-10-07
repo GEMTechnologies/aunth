@@ -101,6 +101,26 @@ def triage_rules() -> dict[str, Rule]:
     and a rule that pretended to judge fit would be a model with no model in it.
     """
 
+    def worth_researching(request: DecisionRequest) -> Any:
+        """A deterministic proxy for the judgment, and nothing more.
+
+        It answers only from facts Granada holds: if a hard gate failed, no; if
+        every gate passed and none is unknown, yes. Anything in between refuses, so
+        the answer is a function of the deterministic result rather than a guess -
+        the judgmental part ("is this a *good* fit") needs a provider that can
+        actually judge, and the chain moves on when this one will not answer.
+
+        This replaces the questions the qualify step asks being unanswerable by the
+        deterministic baseline, which parked every workflow on the first sweep and
+        meant the fleet never completed a pipeline.
+        """
+        eligibility = request.state.get("eligibility", {})
+        if eligibility.get("failed_gates"):
+            return False
+        if eligibility.get("unknown_gates"):
+            return None
+        return True
+
     def human_review_needed(request: DecisionRequest) -> Any:
         """Certain cases only.
 
@@ -132,7 +152,11 @@ def triage_rules() -> dict[str, Rule]:
             return "NORMAL"
         return "LOW"
 
-    return {"human_review_needed": human_review_needed, "priority": priority}
+    return {
+        "human_review_needed": human_review_needed,
+        "priority": priority,
+        "worth_researching": worth_researching,
+    }
 
 
 def email_rules() -> dict[str, Rule]:

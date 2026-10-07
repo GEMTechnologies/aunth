@@ -387,6 +387,17 @@ class Job(Base):
     #: agent, and inventing one would attribute work to a customer that did not
     #: ask for it.
     agent_id: Mapped[Optional[str]] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    #: The agent's version **at the moment this work was created**. Authority is
+    #: not static: an organisation can pause, or drop from AUTOPILOT_WITH_GATES to
+    #: MONITOR_ONLY, while a workflow is in flight. A worker compares this against
+    #: the live agent and re-evaluates rather than finishing under stale
+    #: permission. Nullable because pre-agent work has none.
+    agent_version: Mapped[Optional[int]] = mapped_column(Integer)
+    #: The workflow this job advances, so the worker can progress it canonically.
+    workflow_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    #: Set once the worker has taken the job for execution. Distinguishes "leased"
+    #: from "never started", which a lease alone cannot.
+    started_executing_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     trace_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -785,6 +796,10 @@ class Opportunity(Base):
     dedupe_fingerprint: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     source_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
     contract_version: Mapped[str] = mapped_column(String(20), default="v1", index=True)
+    #: Bumped when a tracked field changes. Research records which revision it
+    #: read, so a proposal built on version 3 stays explainable after version 4
+    #: arrives - the same reasoning as org_facts and documents.
+    version: Mapped[int] = mapped_column(Integer, default=1)
 
 
 class OpportunityPayload(Base):
@@ -1318,6 +1333,139 @@ class AgentWorkflow(Base):
     updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
 
+# ---------------------------------------------------------------------------
+# Fleet execution (Phase 6c)
+# ---------------------------------------------------------------------------
+class AgentActivity(Base):
+    """Structured, customer-facing record of what the agent did.
+
+    The dashboard says *"Your Granada Agent found 4 strong matches"* and
+    *"Granada needs your audited accounts."* Those statements are **rows here**,
+    not sentences parsed out of log files, because a customer-facing claim has to
+    be queryable, translatable and correct.
+
+    **Technical logs are kept separate.** Structured JSON logs go to stderr for
+    operators; this table is what the customer reads. Conflating them produces a
+    dashboard built on log-scraping, which breaks the moment someone rewords a
+    message.
+
+    ``summary_key`` is a stable identifier (``match.strong``,
+    ``document.missing``) with :attr:`structured_data` carrying the numbers, so
+    the UI owns the wording and the backend owns the facts. That is what makes the
+    panel translatable without a schema change.
+
+    Append-only by policy and by grant: an activity ledger that can be rewritten
+    is not a record of what happened.
+    """
+
+    __tablename__ = "agent_activity"
+
+    #: Who may see it. Technical detail stays out of the customer's view without
+    #: needing a second table.
+    VISIBILITY_CUSTOMER = "CUSTOMER"
+    VISIBILITY_INTERNAL = "INTERNAL"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+
+    specialist_key: Mapped[Optional[str]] = mapped_column(String(40), index=True)
+    workflow_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    job_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    #: Stable key, e.g. "match.strong", "research.completed", "approval.needed".
+    activity_type: Mapped[str] = mapped_column(String(60), index=True)
+    summary_key: Mapped[str] = mapped_column(String(80), index=True)
+
+    subject_type: Mapped[Optional[str]] = mapped_column(String(20), index=True)
+    subject_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    #: The numbers and names the UI needs to render the sentence.
+    structured_data: Mapped[Optional[dict]] = mapped_column(JSON)
+    visibility: Mapped[str] = mapped_column(String(20), default=VISIBILITY_CUSTOMER, index=True)
+
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class DonorResearch(Base):
+    """A versioned research result for one opportunity, with provenance.
+
+    The brief is explicit that research must not fabricate donor information, so
+    every field carries its **epistemic class**:
+
+    ``SOURCE_FACT``
+        Quoted from the opportunity record, which itself came from a scored
+        source. Traceable to ``source_references``.
+    ``DERIVED_OBSERVATION``
+        Computed from source facts - a deadline arithmetic, a range overlap.
+        True by construction, not by assertion about the world.
+    ``AI_INFERENCE``
+        A model's reading. **Never** treated as a donor fact, exactly as an
+        ``AI_INFERRED`` organisation fact is never submission-safe.
+    ``UNKNOWN``
+        Not established. Recorded as UNKNOWN rather than omitted, because a
+        missing field reads as "nothing to say" whereas UNKNOWN reads as
+        "somebody must find this out".
+
+    ``fact_classes`` maps each populated field to its class, so a consumer cannot
+    use an inference without having seen that it was one.
+
+    **Versioned, never overwritten.** If an opportunity changes materially, a new
+    version is created rather than mutating the result an existing application was
+    built against - the same reasoning as ``org_facts`` and ``documents``. An
+    application records which research version it used.
+    """
+
+    __tablename__ = "donor_research"
+
+    SOURCE_FACT = "SOURCE_FACT"
+    DERIVED_OBSERVATION = "DERIVED_OBSERVATION"
+    AI_INFERENCE = "AI_INFERENCE"
+    UNKNOWN = "UNKNOWN"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "opportunity_id", "agent_id", "version", name="uq_research_opportunity_version"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    opportunity_id: Mapped[str] = mapped_column(ForeignKey("opportunities.id"), index=True)
+    application_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    is_current: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+    donor_identity: Mapped[Optional[dict]] = mapped_column(JSON)
+    programme_priorities: Mapped[Optional[dict]] = mapped_column(JSON)
+    eligibility_observations: Mapped[Optional[dict]] = mapped_column(JSON)
+    application_instructions: Mapped[Optional[str]] = mapped_column(Text)
+    funding_range: Mapped[Optional[dict]] = mapped_column(JSON)
+    deadline: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    required_documents: Mapped[Optional[dict]] = mapped_column(JSON)
+    required_sections: Mapped[Optional[dict]] = mapped_column(JSON)
+    submission_mechanism: Mapped[Optional[str]] = mapped_column(String(120))
+    contacts: Mapped[Optional[dict]] = mapped_column(JSON)
+    risks: Mapped[Optional[dict]] = mapped_column(JSON)
+    unknowns: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    #: field name -> one of the four classes above.
+    fact_classes: Mapped[Optional[dict]] = mapped_column(JSON)
+    #: Which opportunity revision this was researched from, and from where.
+    source_references: Mapped[Optional[dict]] = mapped_column(JSON)
+    opportunity_version: Mapped[Optional[int]] = mapped_column(Integer)
+
+    research_version: Mapped[str] = mapped_column(String(20), default="v1")
+    researched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)
 Index("ix_jobs_dispatch", Job.state, Job.available_at)
@@ -1352,6 +1500,14 @@ Index("ix_jobs_agent_dispatch", Job.agent_id, Job.state, Job.available_at)
 Index("ix_workflows_due", AgentWorkflow.state, AgentWorkflow.next_run_at)
 Index("ix_workflows_agent_state", AgentWorkflow.agent_id, AgentWorkflow.state)
 Index("ix_specialists_agent_status", AgentSpecialist.agent_id, AgentSpecialist.status)
+Index("ix_activity_agent_time", AgentActivity.agent_id, AgentActivity.occurred_at)
+Index("ix_activity_customer", AgentActivity.org_id, AgentActivity.visibility, AgentActivity.occurred_at)
+Index("ix_research_current", DonorResearch.opportunity_id, DonorResearch.is_current)
+# The dispatcher's queue query: due, not finished, attributable to an agent.
+Index("ix_jobs_workflow", Job.workflow_id)
+# The composite FK's supporting unique key. Required by PostgreSQL before a
+# composite foreign key can reference (id, org_id) rather than just (id).
+Index("ix_agents_id_org", GranadaAgent.id, GranadaAgent.org_id, unique=True)
 Index("ix_refresh_tokens_expires", RefreshToken.expires_at)
 Index("ix_audit_logs_user_event", AuditLog.user_id, AuditLog.event)
 Index("ix_oauth_accounts_user", OAuthAccount.user_id)
