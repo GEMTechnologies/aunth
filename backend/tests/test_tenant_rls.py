@@ -819,6 +819,26 @@ def test_runtime_role_cannot_delete_the_ledger_or_the_evidence(pg_engine):
                     text("SELECT has_table_privilege(:r, :t, 'SELECT')"),
                     {"r": role, "t": f'"{schema}".alembic_version'},
                 ).scalar(), f"{role} can read alembic_version"
+
+                # -- the append-only audit trail --------------------------
+                # ``application_transitions`` is history. A trail its own subject
+                # can rewrite is worse than no trail, because it looks
+                # authoritative. UPDATE is refused here as well as DELETE, and
+                # that is asserted separately because it is the one table where
+                # the difference matters.
+                for privilege in ("UPDATE", "DELETE", "TRUNCATE"):
+                    assert not conn.execute(
+                        text("SELECT has_table_privilege(:r, :t, :p)"),
+                        {"r": role, "t": f'"{schema}".application_transitions', "p": privilege},
+                    ).scalar(), (
+                        f"{role} holds {privilege} on application_transitions; an "
+                        "append-only history must not be rewritable"
+                    )
+                for privilege in ("SELECT", "INSERT"):
+                    assert conn.execute(
+                        text("SELECT has_table_privilege(:r, :t, :p)"),
+                        {"r": role, "t": f'"{schema}".application_transitions', "p": privilege},
+                    ).scalar(), f"{role} cannot {privilege} the history it must write"
         finally:
             engine.dispose()
     finally:

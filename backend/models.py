@@ -1026,6 +1026,109 @@ class DecisionRecord(Base):
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
 
 
+# ---------------------------------------------------------------------------
+# Application workspace (Phase 6)
+# ---------------------------------------------------------------------------
+class Application(Base):
+    """One application workspace per organisation and opportunity.
+
+    The brief requires a single workspace carrying the whole lifecycle, and the
+    unique constraint on ``(org_id, opportunity_id)`` is what makes "one" true
+    rather than aspirational. Two workspaces for one opportunity would mean two
+    answers being written to the same funder, which is worse than either of them
+    alone.
+
+    ``state`` is a closed set and transitions are validated in code
+    (``agent/workspace.py``) rather than by a CHECK constraint, because the
+    *reason* a transition is refused has to be reportable and a constraint
+    violation is not. Every accepted transition writes an
+    ``ApplicationTransition`` row, so the history is append-only and an
+    application that reached ``SUBMITTED`` can be explained afterwards.
+
+    ``version`` increments on every accepted transition. The brief requires full
+    version history, and this is what a submission receipt can cite: the state of
+    the workspace at the moment it was sent, not the state now.
+    """
+
+    __tablename__ = "applications"
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "opportunity_id", name="uq_application_org_opportunity"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    opportunity_id: Mapped[str] = mapped_column(ForeignKey("opportunities.id"), index=True)
+
+    state: Mapped[str] = mapped_column(String(40), index=True)
+    #: Incremented on every accepted transition. Cited by a receipt.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+    created_by: Mapped[Optional[str]] = mapped_column(String(36))
+    assigned_to: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    #: Why the workspace is where it is. Not a log line - a queryable reason.
+    state_reason: Mapped[Optional[str]] = mapped_column(Text)
+    #: Set when a human approved the next step; cleared when it is consumed.
+    approved_by: Mapped[Optional[str]] = mapped_column(String(36))
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    #: The external reference the funder returned. A submission without one is
+    #: not a submission, and the state machine refuses to claim otherwise.
+    submission_receipt: Mapped[Optional[str]] = mapped_column(Text)
+    submission_adapter: Mapped[Optional[str]] = mapped_column(String(50))
+    deadline: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    outcome: Mapped[Optional[str]] = mapped_column(String(40), index=True)
+
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class ApplicationTransition(Base):
+    """The append-only history of a workspace.
+
+    Never updated, never deleted. This is what makes "full version history" real,
+    and it is the difference between knowing an application was submitted and
+    being able to say which version of it, by whom, and on what authority.
+
+    ``actor_type`` distinguishes a human from an agent from the system, because
+    "who did this" has a different answer and a different consequence for each.
+    """
+
+    __tablename__ = "application_transitions"
+
+    ACTOR_HUMAN = "HUMAN"
+    ACTOR_AGENT = "AGENT"
+    ACTOR_SYSTEM = "SYSTEM"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"), index=True)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+
+    from_state: Mapped[Optional[str]] = mapped_column(String(40))
+    to_state: Mapped[str] = mapped_column(String(40), index=True)
+    reason: Mapped[Optional[str]] = mapped_column(Text)
+
+    actor_type: Mapped[str] = mapped_column(String(20), default=ACTOR_SYSTEM, index=True)
+    actor_id: Mapped[Optional[str]] = mapped_column(String(36))
+    #: The decision that authorised this transition, when a decision did.
+    decision_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    #: The job that performed it, when an agent did.
+    job_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)
 Index("ix_jobs_dispatch", Job.state, Job.available_at)
@@ -1051,6 +1154,9 @@ Index("ix_matches_org_state_score", OpportunityMatch.org_id, OpportunityMatch.st
 Index("ix_matches_org_rank", OpportunityMatch.org_id, OpportunityMatch.rank)
 Index("ix_decisions_org_type_created", DecisionRecord.organisation_id, DecisionRecord.decision_type, DecisionRecord.created_at)
 Index("ix_decisions_cache_lookup", DecisionRecord.organisation_id, DecisionRecord.decision_type, DecisionRecord.state_hash, DecisionRecord.provider)
+Index("ix_applications_org_state", Application.org_id, Application.state, Application.deadline)
+Index("ix_applications_org_updated", Application.org_id, Application.updated_at)
+Index("ix_transitions_application_version", ApplicationTransition.application_id, ApplicationTransition.version)
 Index("ix_refresh_tokens_expires", RefreshToken.expires_at)
 Index("ix_audit_logs_user_event", AuditLog.user_id, AuditLog.event)
 Index("ix_oauth_accounts_user", OAuthAccount.user_id)

@@ -42,15 +42,21 @@ GRANT SELECT, INSERT, UPDATE, DELETE
 -- ---------------------------------------------------------------------------
 REVOKE ALL ON TABLE alembic_version FROM granada_app;
 
--- Ledger, evidence and identity tables: the runtime records, it does not erase.
+-- Ledger, evidence, identity and history tables: the runtime records, it does
+-- not erase.
 --
--- This block exists because a GRANT is ADDITIVE. Migrations 004, 005 and 006
--- grant only SELECT/INSERT/UPDATE on these tables, expressing the intent that
--- the application may never delete the record of work it is accountable for, nor
--- the organisation's own facts and legal documents. The blanket grant above
--- hands over DELETE regardless, and granting DELETE after granting INSERT does
--- not take it back - so without these REVOKEs that intent was documented but not
--- in force.
+-- This block exists because a GRANT is ADDITIVE. Migrations 004, 005, 006, 009
+-- and 010 grant only the privileges each table needs, expressing the intent that
+-- the application may never delete the record of what it did, nor the
+-- organisation's own facts, documents and application history. The blanket grant
+-- above hands over DELETE regardless, and granting DELETE after granting INSERT
+-- does not take it back - so without these REVOKEs that intent was documented but
+-- not in force.
+--
+-- `application_transitions` is the sharpest case: it is an append-only audit
+-- trail, and an audit trail that its own subject can rewrite or erase is not an
+-- audit trail. Migration 010 grants only SELECT and INSERT on it, and this
+-- REVOKE is what makes that true rather than aspirational.
 --
 -- `org_facts` and `documents` are on the list for a further reason: their
 -- history IS the product. Superseding a fact is an UPDATE (`is_current` goes
@@ -66,7 +72,7 @@ DECLARE
 BEGIN
     FOREACH evidence_table IN ARRAY ARRAY[
         'jobs', 'job_attempts', 'model_invocations', 'org_facts', 'documents',
-        'decision_records'
+        'decision_records', 'application_transitions'
     ]
     LOOP
         IF EXISTS (
@@ -74,6 +80,12 @@ BEGIN
              WHERE table_schema = 'public' AND table_name = evidence_table
         ) THEN
             EXECUTE format('REVOKE DELETE ON TABLE %I FROM granada_app', evidence_table);
+            -- The append-only trail must not be editable either. A history a
+            -- caller can rewrite is worse than no history, because it looks
+            -- authoritative.
+            IF evidence_table = 'application_transitions' THEN
+                EXECUTE format('REVOKE UPDATE ON TABLE %I FROM granada_app', evidence_table);
+            END IF;
         END IF;
     END LOOP;
 END $$;
