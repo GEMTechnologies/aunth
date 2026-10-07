@@ -13,6 +13,13 @@ from config import settings
 from context_service import ContextService
 from service import OrganizationService, AuthService, SessionService, PasswordResetService, AuditService
 from security import decode_access_token
+from tenant_context import (
+    TenantAccessDenied,
+    TenantContext,
+    clear_tenant,
+    for_each_tenant,
+    set_tenant,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +43,15 @@ def get_current_user(
     db: Session = Depends(get_db),
     token: str = Depends(oauth2_scheme)
 ) -> models.User:
-    """Get current authenticated user from JWT token"""
+    """Get current authenticated user from JWT token.
+
+    Also resolves the caller's tenant and publishes it on ``request.state`` so
+    that :func:`get_tenant_db` can bind it before any tenant-scoped query runs.
+    Resolution uses ``app.user_org_ids()`` - the SECURITY DEFINER bootstrap
+    helper from migration 003 - rather than reading ``org_members`` directly,
+    because ``org_members`` is protected by exactly the policy that needs the
+    tenant first. See ADR-0005.
+    """
     try:
         payload = decode_access_token(token)
         user_id = payload.get("sub")
@@ -44,12 +59,18 @@ def get_current_user(
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token payload")
 
+        # `users` and `sessions` carry no org_id and are therefore not tenant
+        # tables; reading them needs no tenant scope. This runs before the
+        # tenant is known, which is exactly why it is safe.
         user = db.query(models.User).filter(models.User.id == user_id).first()
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
 
         if user.status != "active":
             raise HTTPException(status_code=401, detail="User account is not active")
+
+        request.state.user_id = user.id
+        request.state.tenant_context = TenantContext.resolve(db, user.id)
 
         # Update last seen for session if session_id is in token
         session_id = payload.get("sid")
@@ -69,9 +90,90 @@ def get_current_user(
     except JWTError as e:
         logger.warning(f"JWT error: {str(e)}")
         raise HTTPException(status_code=401, detail="Invalid token")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Authentication error: {str(e)}")
         raise HTTPException(status_code=401, detail="Authentication failed")
+
+
+def get_tenant_context(request: Request) -> TenantContext:
+    """The resolved tenant for this request, or a deny-all context.
+
+    Depends on ``get_current_user`` having run, which it has: FastAPI solves a
+    dependency's sub-dependencies before its own body, and this is always
+    declared alongside ``get_current_active_user``.
+    """
+    tenant = getattr(request.state, "tenant_context", None)
+    if tenant is None:
+        return TenantContext(user_id=str(getattr(request.state, "user_id", "") or ""))
+    return tenant
+
+
+def get_tenant_db(
+    db: Session = Depends(get_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    """Yield a session with the caller's tenant bound to its connection.
+
+    This is the dependency every authenticated, tenant-scoped endpoint must
+    use instead of :func:`get_db`. It reuses ``get_db`` as a sub-dependency, so
+    FastAPI's per-request dependency cache guarantees exactly one session and
+    one connection per request.
+
+    The tenant comes from the validated token, never from a path parameter or a
+    query string, so editing a URL cannot reach another organisation's rows.
+    Endpoints that name an organisation additionally call
+    :func:`require_org_access`, and the row-level security policy still refuses
+    the rows even if both of those were removed.
+
+    A user who belongs to several organisations gets *no* tenant bound: the
+    policies then deny every tenant row rather than guessing. Such endpoints
+    must scope explicitly, using ``for_each_tenant`` or ``set_tenant`` after an
+    explicit membership check.
+
+    Unbinding in the ``finally`` is not optional. The settings are session-level
+    so they survive the ``db.commit()`` calls this codebase already performs,
+    which means a connection returned to the pool would otherwise carry the
+    previous tenant into the next request.
+    """
+    try:
+        set_tenant(db, tenant.primary_org_id, tenant.user_id)
+        yield db
+    finally:
+        try:
+            clear_tenant(db)
+        except Exception:
+            # The session may be closed or its transaction aborted. The pool's
+            # check-in listener clears the GUCs regardless; this is the primary
+            # mechanism, not the only one.
+            logger.warning("could not clear tenant context on request exit",
+                           exc_info=True)
+
+
+def require_org_access(tenant: TenantContext, db: Session, org_id: str) -> str:
+    """Authorise ``org_id`` for this caller and bind it as the current tenant.
+
+    Two independent checks, deliberately both present:
+
+    1. ``TenantContext.require_member`` compares the named organisation against
+       the membership ids the caller proved by authenticating. This is the
+       application-tier check, and it produces a clean 403 with a useful
+       message.
+    2. Binding the tenant is what makes row-level security enforce anything.
+       Without this call the policy denies every row, so a handler that forgot
+       it would fail closed rather than leak - the failure mode is an error,
+       not a disclosure.
+
+    A handler that skips step 1 still cannot read another tenant's rows; a
+    handler that skips step 2 reads nothing at all.
+    """
+    try:
+        org_id = tenant.require_member(org_id)
+    except TenantAccessDenied as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    set_tenant(db, org_id, tenant.user_id)
+    return org_id
 
 def get_current_active_user(current_user: models.User = Depends(get_current_user)) -> models.User:
     """Ensure current user is active"""
@@ -214,7 +316,7 @@ def logout(
 @router.post("/auth/logout-all", status_code=204, tags=["Authentication"])
 def logout_all_sessions(
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db)
 ):
     """Logout user from all sessions"""
     try:
@@ -263,7 +365,7 @@ def reset_password(
 
 # Context management endpoints
 @router.get("/me/contexts", response_model=schemas.UserContextsResponse, tags=["Contexts"])
-async def get_user_contexts(current_user: models.User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+async def get_user_contexts(current_user: models.User = Depends(get_current_active_user), db: Session = Depends(get_tenant_db)):
     """Get all available contexts for the current user"""
     return ContextService.get_user_contexts(db, current_user.id)
 
@@ -271,7 +373,7 @@ async def get_user_contexts(current_user: models.User = Depends(get_current_acti
 async def set_last_active_context(
     payload: schemas.SetContextRequest,
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db)
 ):
     """Set user's last active context"""
     ContextService.set_last_active_context(db, current_user.id, payload.context)
@@ -282,7 +384,7 @@ async def resolve_landing_context(
     request: Request,
     redirect_uri: Optional[str] = None,
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db)
 ):
     """Resolve where user should land based on context resolution algorithm"""
     host = request.headers.get("host")
@@ -292,7 +394,7 @@ async def resolve_landing_context(
 @router.get("/users/me", response_model=schemas.MeResponse, tags=["Users"])
 def get_current_user_profile(
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db)
 ):
     """Get current user profile with detailed information"""
 
@@ -334,7 +436,7 @@ def get_current_user_profile(
 def update_user_profile(
     payload: schemas.UpdateProfileRequest,
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db)
 ):
     """Update current user profile"""
     try:
@@ -388,6 +490,10 @@ def create_organization(
 ):
     """Create new organization"""
     try:
+        # This endpoint intentionally keeps get_db rather than get_tenant_db:
+        # there is no tenant to bind until the organisation exists. The service
+        # pre-allocates the id and binds it itself immediately before the INSERT,
+        # then leaves it cleared on exit.
         org = OrganizationService.create_organization(db, payload.name, current_user)
 
         return schemas.OrganisationResponse(
@@ -406,23 +512,27 @@ def create_organization(
 @router.get("/organizations", response_model=List[schemas.OrganisationResponse], tags=["Organizations"])
 def list_user_organizations(
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db),
+    tenant: TenantContext = Depends(get_tenant_context),
 ):
-    """List organizations where user is a member"""
-    try:
-        # Get user's organization memberships
-        memberships = db.query(models.OrgMember).options(
-            joinedload(models.OrgMember.organisation)
-        ).filter(models.OrgMember.user_id == current_user.id).all()
+    """List every organisation the caller belongs to.
 
-        return [
+    This endpoint genuinely spans tenants, so it cannot bind one. Binding the
+    first membership would make row-level security hide the other organisations
+    from their own member - the response would silently shrink rather than
+    fail. ``for_each_tenant`` rotates the tenant once per membership and clears
+    it afterwards, so each query is authorised by that tenant's own policy.
+    """
+    try:
+        return for_each_tenant(db, tenant, lambda: [
             schemas.OrganisationResponse(
-                id=membership.organisation.id,
-                name=membership.organisation.name,
-                slug=membership.organisation.slug,
-                created_at=membership.organisation.created_at
-            ) for membership in memberships
-        ]
+                id=membership.id,
+                name=membership.name,
+                slug=membership.slug,
+                created_at=membership.created_at
+            )
+            for membership in db.query(models.Organisation).all()
+        ])
 
     except Exception as e:
         logger.error(f"Organization listing error: {str(e)}")
@@ -432,19 +542,16 @@ def list_user_organizations(
 def list_organization_members(
     org_id: str,
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db),
+    tenant: TenantContext = Depends(get_tenant_context),
 ):
     """List members of an organization"""
     try:
-        # Check if user is member of organization
-        membership = db.query(models.OrgMember).filter(
-            models.OrgMember.org_id == org_id,
-            models.OrgMember.user_id == current_user.id
-        ).first()
-        
-        if not membership:
-            raise HTTPException(status_code=403, detail="Access denied to organization")
-        
+        # Membership check and tenant binding in one call: without the binding
+        # the RLS policy returns zero rows rather than an error, so a forgotten
+        # check would look like an empty organisation.
+        require_org_access(tenant, db, org_id)
+
         # Get all members
         members = db.query(models.OrgMember).options(
             joinedload(models.OrgMember.user).joinedload(models.User.primary_email),
@@ -478,17 +585,29 @@ def invite_member(
     org_id: str,
     payload: schemas.InviteMemberRequest,
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db),
+    tenant: TenantContext = Depends(get_tenant_context),
 ):
     """Invite new member to organization"""
     try:
-        # Check if user has admin role
-        membership = db.query(models.OrgMember).filter(
-            models.OrgMember.org_id == org_id,
-            models.OrgMember.user_id == current_user.id,
-            models.OrgMember.role.in_(["admin", "owner"])
-        ).first()
-        
+        require_org_access(tenant, db, org_id)
+
+        # Check if user has admin role.
+        # OrgMember stores role_id, not a free-text role: `OrgMember.role.in_([...])`
+        # referenced the relationship and raised AttributeError, which the
+        # generic handler below turned into a 500. Join the Role row instead,
+        # as the PATCH and DELETE handlers already do.
+        membership = (
+            db.query(models.OrgMember)
+            .join(models.Role, models.Role.id == models.OrgMember.role_id)
+            .filter(
+                models.OrgMember.org_id == org_id,
+                models.OrgMember.user_id == current_user.id,
+                models.Role.key.in_(["admin", "owner"]),
+            )
+            .first()
+        )
+
         if not membership:
             raise HTTPException(status_code=403, detail="Admin access required")
         
@@ -515,9 +634,12 @@ def invite_member(
             
             # Add as member
             # OrgMember stores a role_id foreign key; the old `role=` string
-            # column no longer exists, so resolve the key to a Role row.
+            # column no longer exists, so resolve the key to a Role row owned by
+            # this tenant.
             role_key = (payload.role or "member").lower()
-            role_row = OrganizationService._ensure_role(db, role_key, role_key)
+            role_row = OrganizationService._ensure_role(
+                db, role_key, role_key, org_id=org_id
+            )
             new_member = models.OrgMember(
                 org_id=org_id,
                 user_id=existing_user.id,
@@ -543,10 +665,13 @@ def update_member_role(
     user_id: str,
     payload: schemas.UpdateMemberRoleRequest,
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db),
+    tenant: TenantContext = Depends(get_tenant_context),
 ):
     """Update member role in organization"""
     try:
+        require_org_access(tenant, db, org_id)
+
         # Check if current user has admin role
         admin_membership = (
             db.query(models.OrgMember)
@@ -573,7 +698,9 @@ def update_member_role(
         
         # Update role
         new_role_key = (payload.role or "member").lower()
-        member.role_id = OrganizationService._ensure_role(db, new_role_key, new_role_key).id
+        member.role_id = OrganizationService._ensure_role(
+            db, new_role_key, new_role_key, org_id=org_id
+        ).id
         
         # Create audit log
         AuditService.record(
@@ -603,10 +730,13 @@ def remove_member(
     org_id: str,
     user_id: str,
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db),
+    tenant: TenantContext = Depends(get_tenant_context),
 ):
     """Remove member from organization"""
     try:
+        require_org_access(tenant, db, org_id)
+
         # Check if current user has admin role
         admin_membership = (
             db.query(models.OrgMember)
@@ -743,7 +873,7 @@ async def oauth_callback(
 def unlink_oauth_account(
     provider: str,
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db)
 ):
     """Unlink OAuth account from user"""
     try:
@@ -793,7 +923,7 @@ def unlink_oauth_account(
 def change_password(
     payload: schemas.ChangePasswordRequest,
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db)
 ):
     """Change user password"""
     try:
@@ -830,7 +960,7 @@ def change_password(
 def revoke_user_session(
     session_id: str,
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db)
 ):
     """Revoke a specific session"""
     try:
@@ -864,7 +994,7 @@ def revoke_user_session(
 def revoke_other_sessions(
     request: Request,
     current_user: models.User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_tenant_db)
 ):
     """Revoke all other sessions except current one"""
     try:

@@ -33,15 +33,32 @@ target_metadata = models.Base.metadata
 
 
 def get_url() -> str:
-    """Resolve the database URL.
+    """Resolve the migration (owner) database URL.
 
-    An explicit DATABASE_URL in the environment wins over application
-    settings, so tooling and tests can target a scratch database without
-    editing the committed configuration. Otherwise the service's own setting
-    is used, which keeps migrations pointed at the same database the service
-    talks to and keeps credentials out of this repository.
+    Three sources, most specific first:
+
+    1. ``GRANADA_ADMIN_DATABASE_URL`` - the schema owner's credentials.
+    2. ``DATABASE_URL`` - an explicit override, kept for tooling and tests that
+       target a scratch database without editing committed configuration.
+    3. ``config.settings.database_url`` - the service's own setting.
+
+    ``GRANADA_ADMIN_DATABASE_URL`` exists because ``DATABASE_URL`` now names the
+    *runtime* role (``granada_app``), which deliberately cannot create objects.
+    Migrations need the owner: they create tables, and several of them enable
+    row-level security, which the owner needs in order to seed reference data
+    before policies are switched on. Running Alembic against ``DATABASE_URL``
+    would now fail, and the previous fallback - silently using the runtime role -
+    was the kind of ambiguity that invites running a migration against the
+    wrong database.
+
+    Falls back to an empty string, which Alembic reports as a configuration
+    error, rather than guessing a database name.
     """
     import os
+
+    admin = os.environ.get("GRANADA_ADMIN_DATABASE_URL")
+    if admin:
+        return admin
 
     explicit = os.environ.get("DATABASE_URL")
     if explicit:

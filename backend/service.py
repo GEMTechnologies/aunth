@@ -7,6 +7,7 @@ from typing import Optional, List, Dict, Any
 import secrets
 import logging
 import re
+import uuid
 
 import models, schemas
 from security import (
@@ -15,6 +16,7 @@ from security import (
 )
 from config import settings
 from context_service import ContextService
+from tenant_context import clear_tenant, set_tenant
 
 logger = logging.getLogger(__name__)
 
@@ -341,60 +343,141 @@ class SessionService:
 
 class OrganizationService:
     @staticmethod
-    def _ensure_role(db: Session, key: str, name: str) -> models.Role:
+    def _ensure_role(db: Session, key: str, name: str, org_id: Optional[str] = None) -> models.Role:
         """Fetch or create a Role row.
 
         OrgMember references roles by ``role_id``; there is no free-text role
         column. The previous code passed ``role="admin"``, which is not a
         column, so membership creation raised TypeError.
+
+        ``org_id`` decides who owns the role. With no ``org_id`` this creates a
+        *shared system* role (``roles.org_id IS NULL``), which is only correct
+        for platform-wide roles seeded before migration 003. With an
+        ``org_id`` it creates a *tenant* role, which is what an organisation's
+        own admin/owner/member roles must be.
+
+        That distinction is a security property, not a cosmetic one. If every
+        tenant's "owner" pointed at one shared Role row, then renaming or
+        re-pointing a role in tenant A would change what "owner" means in tenant
+        B. Migration 003 enforces it at the database level: the ``roles`` INSERT
+        policy requires ``org_id = app.current_org()``, so a tenant cannot create
+        shared system roles at all, and a row with ``org_id IS NULL`` is only
+        reachable by the owner role used for seeding.
+
+        The lookup prefers a tenant role over a system role of the same key,
+        because the ``roles`` SELECT policy exposes ``org_id IS NULL OR org_id =
+        app.current_org()`` and a bare ``filter(key=...)`` could pick up either.
         """
-        role = db.query(models.Role).filter(models.Role.key == key).first()
-        if role:
-            return role
-        role = models.Role(key=key, name=name, is_system=True)
+        query = db.query(models.Role).filter(models.Role.key == key)
+        if org_id:
+            role = query.filter(models.Role.org_id == org_id).first()
+            if role:
+                return role
+            # Fall back to a shared system role before creating a duplicate.
+            system_role = query.filter(models.Role.org_id.is_(None)).first()
+            if system_role:
+                return system_role
+        else:
+            role = query.filter(models.Role.org_id.is_(None)).first()
+            if role:
+                return role
+
+        role = models.Role(key=key, name=name, is_system=True, org_id=org_id)
         db.add(role)
         db.flush()
         return role
 
     @staticmethod
     def create_organization(db: Session, name: str, owner: models.User) -> models.Organisation:
+        """Create a tenant and its first membership.
+
+        Tenant creation is the one operation that has to establish the tenant
+        rather than join one, so it pre-allocates the organisation id and binds
+        it *before* the INSERT. The ``organisations`` INSERT policy is
+        ``WITH CHECK (id = app.current_org())``: a row may only be created into
+        the tenant it claims to be, which is what stops a caller from creating
+        an organisation that belongs to somebody else.
+
+        The slug collision probe is deliberately *not* a SELECT. Under row-level
+        security an unprivileged connection cannot see other tenants' slugs, so
+        a probe would always report "available" and the real outcome would be a
+        raw IntegrityError from the unique index. Probing optimistically and
+        retrying on collision is both correct under RLS and correct without it.
+        """
         # Generate slug from name. The pattern collapses a whole run of
         # separators into one hyphen; mapping character-by-character turned
         # "Water & Sanitation NGO" into "water---sanitation-ngo".
         slug = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')[:80]
 
-        # Check if slug exists
-        existing = db.query(models.Organisation).filter(models.Organisation.slug == slug).first()
-        if existing:
-            slug = f"{slug}-{secrets.token_hex(4)}"
+        org = None
+        last_error: Optional[IntegrityError] = None
+        for attempt in range(5):
+            candidate = slug if attempt == 0 else f"{slug}-{secrets.token_hex(4)}"
+            org = models.Organisation(
+                id=str(uuid.uuid4()),
+                name=name,
+                slug=candidate,
+                owner_user_id=owner.id,
+                created_by=owner.id
+            )
+            # Bind the tenant being created *before* the INSERT. The
+            # organisations INSERT policy is `id = app.current_org()`, so a row
+            # can only be created inside the tenant it claims. Left unbound,
+            # org creation would fail with a row-level security violation; bound
+            # to anything else, the insert is simply refused.
+            set_tenant(db, org.id, owner.id)
+            db.add(org)
+            try:
+                db.flush()
+                break
+            except IntegrityError as exc:
+                db.rollback()
+                last_error = exc
+                org = None
+        if org is None:
+            # Five collisions on a 4-byte random suffix would mean the slug
+            # space is exhausted or something other than the unique index is
+            # failing. Surface the original error rather than a vague 500.
+            raise last_error
 
-        org = models.Organisation(
-            name=name,
-            slug=slug,
-            owner_user_id=owner.id,
-            created_by=owner.id
-        )
-        db.add(org)
-        db.flush()
+        try:
+            # Add owner as admin member.
+            # OrgMember keys are (org_id, user_id) and carries role_id, not a
+            # free-text role.
+            owner_role = OrganizationService._ensure_role(
+                db, "owner", "Owner", org_id=org.id
+            )
+            member = models.OrgMember(
+                org_id=org.id,
+                user_id=owner.id,
+                role_id=owner_role.id
+            )
+            db.add(member)
 
-        # Add owner as admin member.
-        # OrgMember keys are (org_id, user_id) and carries role_id, not a
-        # free-text role.
-        owner_role = OrganizationService._ensure_role(db, "owner", "Owner")
-        member = models.OrgMember(
-            org_id=org.id,
-            user_id=owner.id,
-            role_id=owner_role.id
-        )
-        db.add(member)
+            db.commit()
+            # Refresh *before* the tenant is cleared. This ordering is
+            # load-bearing, not incidental. Committing expires every attribute
+            # on the instance, so refresh() re-SELECTs the row - and the
+            # organisations SELECT policy admits only `id = app.current_org()`.
+            # Refreshing after clear_tenant() therefore matches no row and
+            # raises "Could not refresh instance". SQLite cannot catch this:
+            # there are no policies there, so the row is always visible.
+            db.refresh(org)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            # Leave no tenant bound on a connection that is about to go back to
+            # the pool. The pool listener is the backstop; this is explicit.
+            clear_tenant(db)
 
-        db.commit()
-        db.refresh(org)
         return org
 
     @staticmethod
     def add_member(db: Session, user_id: str, org_id: str, role: str = "member"):
-        role_row = OrganizationService._ensure_role(db, role, role.replace("_", " ").title())
+        role_row = OrganizationService._ensure_role(
+            db, role, role.replace("_", " ").title(), org_id=org_id
+        )
         member = models.OrgMember(
             org_id=org_id,
             user_id=user_id,

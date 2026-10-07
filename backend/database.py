@@ -1,11 +1,16 @@
 """Database engine and session plumbing."""
 
 import sqlite3
+import logging
 
 from sqlalchemy import create_engine, event, text, Engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from config import settings
+
+from tenant_context import apply_tenant_on_checkout
+
+logger = logging.getLogger(__name__)
 
 # The declarative base must be the ONE defined in models.py. This module used to
 # declare its own Base, which created a second metadata registry: models stayed
@@ -63,8 +68,49 @@ if settings.database_url.startswith("sqlite"):
 engine = create_engine(settings.database_url, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+
+@event.listens_for(Engine, "checkout")
+def blank_tenant_on_checkout(dbapi_connection, connection_record, connection_proxy):
+    """Refuse to hand out a pooled connection that still carries a tenant.
+
+    The tenant GUCs are session-level so they survive the ``Session.commit()``
+    calls the request path already performs. That is paid for with an
+    obligation: a connection must never reach the next unit of work still
+    impersonating the previous one.
+
+    This listener used to sit on ``reset`` - on check-*in* - which reads like a
+    stronger guarantee and is in fact weaker than useless. ``Session.commit()``
+    returns the connection to the pool, so that event fired in the middle of
+    every request that commits; the pool then rolled back, and because ``SET``
+    is transactional, the rollback undid the very blanking the listener had just
+    performed. Measured directly against PostgreSQL: with the listener on
+    ``reset`` a pooled connection still reported
+    ``app.current_org_id = 'TENANT-A'`` to the next session that borrowed it.
+
+    Clearing on ``checkout`` instead makes the invariant a single sentence: no
+    unit of work ever sees a tenant it did not itself establish. Anything that
+    legitimately needs a tenant calls ``set_tenant``, which re-establishes it on
+    whatever connection it is handed - including after a ``commit()`` releases
+    the previous one.
+
+    ``clear_tenant`` in the request dependency remains the primary mechanism;
+    this is the backstop for every path that misses it - an exception between
+    set and clear, a dependency that was never entered, a background task
+    holding a session.
+    """
+    apply_tenant_on_checkout(dbapi_connection)
+
+
 def get_db():
-    """Database dependency for FastAPI"""
+    """Database dependency for FastAPI.
+
+    Deliberately tenant-agnostic. This is the dependency for endpoints that run
+    *before* a tenant can exist or be known - registration, login, token
+    refresh, password reset - and for unauthenticated endpoints such as
+    ``/health``. Those requests operate with no tenant bound, so under
+    row-level security they see no tenant rows. That is the correct outcome: an
+    endpoint that needs tenant data must ask for ``router.get_tenant_db``.
+    """
     db = SessionLocal()
     try:
         yield db

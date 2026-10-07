@@ -35,29 +35,74 @@ BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from tenant_context import tenant_scope, unscoped  # noqa: E402
+from tenant_context import (  # noqa: E402
+    apply_tenant_on_checkout,
+    clear_tenant,
+    set_tenant,
+    tenant_scope,
+    unscoped,
+)
 
 
-def _postgres_url() -> str:
-    """Read the real database URL straight from ``.env``.
+def _postgres_url(*names: str) -> str:
+    """Read a PostgreSQL URL from the environment, then from ``.env``.
 
     ``config.settings`` cannot be used here: conftest sets ``DATABASE_URL`` to
     a SQLite scratch file before any test module imports ``config``, so the
     settings singleton would report the scratch database rather than the real
     one.
+
+    The two URLs are deliberately different roles:
+
+    ``GRANADA_ADMIN_DATABASE_URL``  the schema owner. Needs CREATE on the
+                                   database and will own every table it builds.
+    ``GRANADA_RUNTIME_DATABASE_URL`` the least-privilege role the application
+                                   actually connects as.
+
+    Falling back to ``.env`` keeps the module usable for a developer who has only
+    ever had one local role; anything that is not PostgreSQL yields ``""`` and
+    the module skips.
     """
     from dotenv import dotenv_values
 
     values = dotenv_values(BACKEND / ".env")
-    url = values.get("DATABASE_URL") or ""
-    return url if url.startswith("postgresql") else ""
+    for name in names:
+        for candidate in (os.environ.get(name), values.get(name)):
+            if candidate and candidate.startswith("postgresql"):
+                return candidate
+    return ""
 
 
-PG_URL = _postgres_url()
+# Owner / migrating role. Without it there is nowhere to put the scratch schema.
+ADMIN_URL = _postgres_url("GRANADA_ADMIN_DATABASE_URL", "DATABASE_URL")
+
+# The role the application connects as. Optional: without it the ``org_members``
+# tests, which can only be proven for a non-owner, skip loudly.
+RUNTIME_URL = _postgres_url("GRANADA_RUNTIME_DATABASE_URL", "DATABASE_URL")
+
+
+def _runtime_role_name() -> str:
+    """Extract the role name from the runtime URL.
+
+    Used so the GRANT statements name whatever role the developer configured
+    rather than assuming ``granada_app`` - a CI box may use a different name,
+    and a hardcoded GRANT that silently does nothing is worse than no grant.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(RUNTIME_URL)
+    return parsed.username or "granada_app"
+
+
+PG_URL = ADMIN_URL
+
 
 pytestmark = pytest.mark.skipif(
     not PG_URL,
-    reason="RLS enforcement requires a real PostgreSQL target; SQLite has no RLS",
+    reason=(
+        "RLS enforcement requires a real PostgreSQL target; SQLite has no RLS. "
+        "Set GRANADA_ADMIN_DATABASE_URL to the schema-owner credentials."
+    ),
 )
 
 
@@ -123,7 +168,12 @@ def pg_engine():
     scoped = f"{PG_URL}?options=-csearch_path%3D{schema}"
 
     previous = os.environ.get("DATABASE_URL")
+    previous_admin = os.environ.get("GRANADA_ADMIN_DATABASE_URL")
     os.environ["DATABASE_URL"] = scoped
+    # env.py now prefers GRANADA_ADMIN_DATABASE_URL, and it takes precedence in
+    # the process environment, so pinning only DATABASE_URL would let the run
+    # migrate the real public schema. Both are pinned, and both are restored.
+    os.environ["GRANADA_ADMIN_DATABASE_URL"] = scoped
     try:
         cfg = Config(str(BACKEND / "alembic.ini"))
         cfg.set_main_option("script_location", str(BACKEND / "alembic"))
@@ -157,20 +207,31 @@ def pg_engine():
             os.environ.pop("DATABASE_URL", None)
         else:
             os.environ["DATABASE_URL"] = previous
+        if previous_admin is None:
+            os.environ.pop("GRANADA_ADMIN_DATABASE_URL", None)
+        else:
+            os.environ["GRANADA_ADMIN_DATABASE_URL"] = previous_admin
 
-    runtime_url = os.environ.get("GRANADA_RUNTIME_DATABASE_URL", "").strip()
+    runtime_url = RUNTIME_URL
     runtime = None
-    if runtime_url.startswith("postgresql"):
+    if runtime_url:
+        role = _runtime_role_name()
         # The runtime role is not the owner, so GRANT - never FORCE - is what
         # lets it read and write here. Ownership stays with the migrating role,
         # which is the whole point of the split.
         grant = create_engine(scoped, isolation_level="AUTOCOMMIT")
         try:
             with grant.connect() as conn:
-                conn.execute(text(f'GRANT USAGE, CREATE ON SCHEMA "{schema}" TO granada_app'))
-                conn.execute(text(f'GRANT ALL ON ALL TABLES IN SCHEMA "{schema}" TO granada_app'))
-                conn.execute(text(f'GRANT ALL ON ALL SEQUENCES IN SCHEMA "{schema}" TO granada_app'))
-                conn.execute(text("GRANT EXECUTE ON FUNCTION app.user_org_ids(text) TO granada_app"))
+                conn.execute(text(f'GRANT USAGE, CREATE ON SCHEMA "{schema}" TO "{role}"'))
+                conn.execute(text(f'GRANT ALL ON ALL TABLES IN SCHEMA "{schema}" TO "{role}"'))
+                conn.execute(text(f'GRANT ALL ON ALL SEQUENCES IN SCHEMA "{schema}" TO "{role}"'))
+                # Deliberately unqualified: this engine's search_path is already
+                # the scratch schema (set through the connection options), and
+                # the function name contains a dot that PostgreSQL would parse
+                # as schema.app rather than schema."app".
+                conn.execute(
+                    text(f'GRANT EXECUTE ON FUNCTION app.user_org_ids(text) TO "{role}"')
+                )
         finally:
             grant.dispose()
         runtime = create_engine(f"{runtime_url}?options=-csearch_path%3D{schema}")
@@ -529,6 +590,89 @@ def test_tenant_does_not_leak_through_the_pool(pg_engine, tenants):
         assert conn.execute(
             text("SELECT count(*) FROM organisations")
         ).scalar() == 0, "tenant alpha leaked onto a later connection"
+
+
+# ----------------------------------------------------------------------
+# Session-scoped tenant binding, across commits and pool check-outs
+# ----------------------------------------------------------------------
+
+def _orm_session_factory(engine):
+    """A real ORM session factory with the production check-out backstop attached.
+
+    The production engine registers :func:`apply_tenant_on_checkout` on the
+    ``Engine`` class, so every engine in the process inherits it. Registering it
+    on this engine instance reproduces that faithfully without importing
+    ``database``, which would pull the application's configured engine and URL
+    into a module that is only about policies.
+    """
+    from sqlalchemy import event
+    from sqlalchemy.orm import sessionmaker
+
+    event.listen(engine, "checkout", apply_tenant_on_checkout)
+    return sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+
+def _org_count(session) -> int:
+    return session.execute(text("SELECT count(*) FROM organisations")).scalar()
+
+
+def test_session_tenant_survives_commit(pg_engine, tenants):
+    """``Session.commit()`` must not silently drop the tenant mid-request.
+
+    This is the most important behaviour in the module, and it was wrong before
+    anything tested it. ``Session.commit()`` ends the transaction *and* returns
+    the DBAPI connection to the pool. The next query in the same request
+    therefore borrows a connection that the check-out listener has just
+    blanked, so without ``_rebind_after_transaction`` the request runs with
+    "tenant unknown" - which the policies deny.
+
+    The failure mode is closed: it leaks nothing, it breaks legitimate traffic.
+    Organisation creation returned HTTP 500 against real PostgreSQL while all
+    119 SQLite tests stayed green, because SQLite has no policies to fail.
+    """
+    Session = _orm_session_factory(pg_engine.owner)
+    session = Session()
+    try:
+        set_tenant(session, tenants["alpha"]["org_id"], tenants["alpha"]["user_id"])
+        assert _org_count(session) == 1, "precondition: the tenant reads its own row"
+
+        session.commit()  # <- the connection goes back to the pool here
+
+        assert _org_count(session) == 1, (
+            "the tenant was dropped by Session.commit(); the request is now "
+            "running unscoped and reads nothing"
+        )
+    finally:
+        clear_tenant(session)
+        session.close()
+
+
+def test_a_session_that_established_no_tenant_reads_nothing(pg_engine):
+    """The complementary half: nothing inherits a tenant it did not establish itself.
+
+    Deliberately depends on the previous test having run - same engine, same
+    pool, same connections - because a check-out backstop that only looks
+    correct on a freshly created pool proves nothing.
+    """
+    Session = _orm_session_factory(pg_engine.owner)
+    session = Session()
+    try:
+        assert _org_count(session) == 0, "a tenant survived onto a pooled connection"
+    finally:
+        session.close()
+
+
+def test_clear_tenant_denies_the_session_again(pg_engine, tenants):
+    """Clearing is not advisory - it takes effect on the very next query."""
+    Session = _orm_session_factory(pg_engine.owner)
+    session = Session()
+    try:
+        set_tenant(session, tenants["alpha"]["org_id"], tenants["alpha"]["user_id"])
+        assert _org_count(session) == 1, "precondition"
+        clear_tenant(session)
+        assert _org_count(session) == 0, "clear_tenant did not take effect"
+    finally:
+        session.close()
 
 
 # ----------------------------------------------------------------------
