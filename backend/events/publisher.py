@@ -151,6 +151,32 @@ class RedisEventPublisher:
         )
         return entry_id
 
+    def publish_raw(self, stream: str, fields: dict[str, Any]) -> str:
+        """Publish an already-shaped event to a named stream.
+
+        Added for the transactional outbox relay, which holds generic events
+        that are not job envelopes (a mailbox synced, an eligibility gate
+        evaluated). ``publish()`` keeps its stricter ``JobEnvelope`` signature;
+        this method is deliberately the looser escape hatch rather than
+        weakening that one, because every job-shaped caller depends on the
+        envelope's fields being guaranteed present.
+
+        Same encoding, same trimming, same failure semantics as ``publish``.
+        """
+        encoded = _encode(fields)
+        try:
+            entry_id = self.client.xadd(stream, encoded, maxlen=100_000, approximate=True)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the caller
+            raise EventPublisherError(
+                f"failed to publish to {stream}: {exc}"
+            ) from exc
+
+        logger.info(
+            "event published",
+            extra={"stream": stream, "entry_id": entry_id, "event_type": fields.get("event_type")},
+        )
+        return entry_id
+
     def ping(self) -> bool:
         """True when Redis answers. Used by health checks, never by request paths."""
         try:

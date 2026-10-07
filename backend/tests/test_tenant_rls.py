@@ -109,28 +109,20 @@ pytestmark = pytest.mark.skipif(
 def _real_alembic():
     """Import the *installed* alembic, not the local ``alembic/`` package.
 
-    ``Auth/backend/alembic/`` is a directory whose name shadows the installed
-    alembic distribution whenever the backend directory leads ``sys.path``
-    (recorded as ADR-0003; the directory was kept rather than renamed because
-    ``alembic.ini`` points at it and renaming churns every migration path).
+    ``Auth/backend/alembic/`` contains an ``__init__.py``, so it is a real
+    package whose name shadows the installed alembic distribution whenever the
+    backend directory leads ``sys.path`` (recorded as ADR-0003; the directory
+    was kept rather than renamed because ``alembic.ini`` points at it and
+    renaming churns every migration path).
 
-    Dropping the backend from ``sys.path`` for the duration of the import, and
-    evicting any already-imported shadow, makes CPython find the genuine
-    distribution. Once it is cached in ``sys.modules`` the shadow cannot take
-    it back, so ``env.py`` and the migration modules - which all do
-    ``from alembic import op`` - keep resolving correctly too.
+    ``conftest`` performs the de-shadowing once for the whole process, because
+    doing it per-module made the result depend on collection order - see the
+    note on ``conftest.import_real_alembic``. This wrapper keeps the module
+    self-documenting and gives both callers one implementation.
     """
-    for name in [n for n in list(sys.modules) if n == "alembic" or n.startswith("alembic.")]:
-        del sys.modules[name]
+    from conftest import ALEMBIC_COMMAND, ALEMBIC_CONFIG
 
-    saved = sys.path[:]
-    sys.path = [p for p in sys.path if Path(p or ".").resolve() != BACKEND.resolve()]
-    try:
-        from alembic import command
-        from alembic.config import Config
-    finally:
-        sys.path = saved
-    return command, Config
+    return ALEMBIC_COMMAND, ALEMBIC_CONFIG
 
 
 @pytest.fixture(scope="module")

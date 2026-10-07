@@ -38,6 +38,60 @@ BACKEND = pathlib.Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
+
+def import_real_alembic():
+    """Import the installed alembic distribution, never ``Auth/backend/alembic``.
+
+    The migration script directory is also a package: it contains an
+    ``__init__.py``, so while the backend root leads ``sys.path`` it shadows the
+    installed distribution and ``from alembic import command`` resolves to the
+    migration folder (recorded as ADR-0003; the directory was kept because
+    ``alembic.ini`` points at it).
+
+    Hiding the backend root for the duration of the import is not sufficient on
+    its own, and the reason is worth stating because the failure it caused was
+    order-dependent and looked like a migration defect:
+
+    Two test modules each repaired ``sys.modules`` only for the duration of
+    their own import, and one of them put the saved shadow *back* afterwards
+    (``sys.modules.update(saved)``). That reinstates the migration folder as
+    ``alembic`` while the real ``alembic.context`` stays cached, so the next
+    ``from alembic import context`` inside ``env.py`` resolves against a
+    half-shadowed package and ``context.config`` raises ``AttributeError``.
+    ``test_schema_drift.py`` therefore passed when run alone and errored when
+    run after ``test_tenant_rls.py``.
+
+    The invariant this establishes: once the real distribution is imported it
+    stays in ``sys.modules`` for the rest of the process. Nothing depends on
+    importing the migration folder as a package - Alembic loads ``env.py`` and
+    every revision by filesystem path.
+    """
+    for name in [n for n in list(sys.modules) if n == "alembic" or n.startswith("alembic.")]:
+        del sys.modules[name]
+
+    saved_path = sys.path[:]
+    sys.path[:] = [
+        p for p in sys.path
+        if not (p and pathlib.Path(p).resolve() == BACKEND.resolve())
+    ]
+    try:
+        from alembic import command
+        from alembic.config import Config
+    finally:
+        sys.path[:] = saved_path
+
+    resolved = pathlib.Path(getattr(command, "__file__", "") or "").resolve()
+    if resolved.parent.parent == BACKEND.resolve():
+        raise RuntimeError(
+            f"the local ./alembic package shadowed the distribution: {resolved}"
+        )
+    return command, Config
+
+
+# Establish the real distribution before any test module is imported, so the
+# suite does not depend on the order pytest happens to collect modules in.
+ALEMBIC_COMMAND, ALEMBIC_CONFIG = import_real_alembic()
+
 os.environ.setdefault("ARGON2_MEMORY", "8192")
 os.environ.setdefault("ARGON2_TIME", "1")
 os.environ.setdefault("ARGON2_PARALLELISM", "1")

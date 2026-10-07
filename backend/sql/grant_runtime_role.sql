@@ -65,8 +65,8 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
 -- ---------------------------------------------------------------------------
 -- Verification
 -- ---------------------------------------------------------------------------
--- Run after applying. Expected: 18 rows, all four privileges, and
--- alembic_version absent.
+-- Run after applying. Expected: one row per application table (22 as of
+-- revision 004), all four privileges, and alembic_version absent.
 --
 --   SELECT table_name,
 --          string_agg(privilege_type, ',' ORDER BY privilege_type)

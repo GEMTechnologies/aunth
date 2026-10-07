@@ -326,8 +326,159 @@ class OAuthAuthCode(Base):
     user: Mapped["User"] = relationship("User")
 
 
+# ---------------------------------------------------------------------------
+# Agent runtime ledger
+#
+# Redis Streams is the delivery mechanism, never the record of what happened.
+# Every job, attempt and published event is also written here, inside the same
+# transaction as the state change that caused it. A trimmed or lost stream entry
+# then costs at worst a redelivery, never a fact. See ADR-0007.
+# ---------------------------------------------------------------------------
+
+
+class Job(Base):
+    """One unit of durable agent work.
+
+    ``state`` is deliberately a closed vocabulary rather than a free string:
+    the worker's recovery logic branches on it, and a typo in a status column
+    would otherwise silently strand a job forever.
+
+    ``idempotency_key`` is what makes redelivery safe. A worker must refuse work
+    it has already recorded under the same (org, type, key). NULL keys never
+    collide in either PostgreSQL or SQLite, so jobs that are legitimately
+    repeatable simply leave the column NULL.
+    """
+
+    __tablename__ = "jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "org_id", "job_type", "idempotency_key", name="uq_jobs_idempotency"
+        ),
+    )
+
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    DEAD_LETTER = "DEAD_LETTER"
+    CANCELLED = "CANCELLED"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[Optional[str]] = mapped_column(ForeignKey("organisations.id"), index=True)
+    stream: Mapped[str] = mapped_column(String(128), index=True)
+    job_type: Mapped[str] = mapped_column(String(100), index=True)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(255))
+    payload: Mapped[Optional[dict]] = mapped_column(JSON)
+    state: Mapped[str] = mapped_column(String(20), default=QUEUED, index=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5)
+    # Retry backoff: a job is not eligible for dispatch before this instant.
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    # Worker lease. A worker that dies holding a job leaves these set; the
+    # recovery sweep reclaims anything whose lease has expired.
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(128))
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text)
+    failure_category: Mapped[Optional[str]] = mapped_column(String(40))
+    trace_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    attempts: Mapped[List["JobAttempt"]] = relationship(
+        "JobAttempt", back_populates="job", cascade="all, delete-orphan"
+    )
+
+
+class JobAttempt(Base):
+    """One execution of a job.
+
+    Kept as its own rows rather than a column on ``jobs`` so that a DLQ
+    investigation can see the whole history - what failed, in which category,
+    how long each try took - instead of only the last error.
+    """
+
+    __tablename__ = "job_attempts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE"), index=True
+    )
+    attempt: Mapped[int] = mapped_column(Integer)
+    worker_id: Mapped[Optional[str]] = mapped_column(String(128))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    outcome: Mapped[Optional[str]] = mapped_column(String(24))
+    failure_category: Mapped[Optional[str]] = mapped_column(String(40))
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer)
+
+    job: Mapped["Job"] = relationship("Job", back_populates="attempts")
+
+
+class OutboxEvent(Base):
+    """Transactional outbox: an event written in the same commit as the change.
+
+    Publishing straight to Redis from a request handler loses the event whenever
+    the process dies between the database commit and the ``XADD`` - and it
+    cannot publish an event for a change that later rolls back. Writing here
+    first makes "the state changed" and "the event exists" a single atomic
+    fact; the relay then moves it to Redis asynchronously.
+    """
+
+    __tablename__ = "outbox_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[Optional[str]] = mapped_column(ForeignKey("organisations.id"), index=True)
+    stream: Mapped[str] = mapped_column(String(128), index=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+    trace_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text)
+
+
+class InboxEvent(Base):
+    """Dedupe ledger for inbound provider webhooks.
+
+    Providers redeliver. Gmail in particular retries a webhook for up to days
+    and may deliver the same message id twice. Without a unique constraint on
+    the provider's own event id, one inbound mail can create two application
+    threads, or an award notification can be handed to two workers at once.
+
+    ``org_id`` is resolved after receipt, because the tenant is not known until
+    the mailbox or submission is correlated - which is precisely why this table
+    is pre-tenant and why it is not FORCE-protected. See ADR-0007.
+    """
+
+    __tablename__ = "inbox_events"
+    __table_args__ = (
+        UniqueConstraint("source", "external_event_id", name="uq_inbox_source_event"),
+    )
+
+    RECEIVED = "RECEIVED"
+    PROCESSED = "PROCESSED"
+    IGNORED = "IGNORED"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[Optional[str]] = mapped_column(ForeignKey("organisations.id"), index=True)
+    source: Mapped[str] = mapped_column(String(64), index=True)
+    external_event_id: Mapped[str] = mapped_column(String(255))
+    payload: Mapped[Optional[dict]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(20), default=RECEIVED, index=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    note: Mapped[Optional[str]] = mapped_column(Text)
+
+
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)
+Index("ix_jobs_dispatch", Job.state, Job.available_at)
+Index("ix_jobs_lease", Job.lease_expires_at)
+Index("ix_outbox_unpublished", OutboxEvent.published_at, OutboxEvent.created_at)
 Index("ix_refresh_tokens_expires", RefreshToken.expires_at)
 Index("ix_audit_logs_user_event", AuditLog.user_id, AuditLog.event)
 Index("ix_oauth_accounts_user", OAuthAccount.user_id)
