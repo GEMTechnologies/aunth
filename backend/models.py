@@ -380,6 +380,13 @@ class Job(Base):
     lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
     last_error: Mapped[Optional[str]] = mapped_column(Text)
     failure_category: Mapped[Optional[str]] = mapped_column(String(40))
+    #: Which logical agent this work belongs to. This is the column that makes
+    #: "one agent per organisation, one shared worker pool" work: a worker loads
+    #: the agent named here rather than being dedicated to it. Nullable because
+    #: system-level work (the outbox relay, an uncorrelated webhook) belongs to no
+    #: agent, and inventing one would attribute work to a customer that did not
+    #: ask for it.
+    agent_id: Mapped[Optional[str]] = mapped_column(ForeignKey("granada_agents.id"), index=True)
     trace_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -1129,6 +1136,188 @@ class ApplicationTransition(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# The persistent Granada Agent (Phase 6)
+# ---------------------------------------------------------------------------
+class GranadaAgent(Base):
+    """One persistent logical agent per organisation. The unit of autonomy.
+
+    The product promise is *"create your profile once; Granada creates your
+    agent; your agent works for you continuously."* This row **is** that agent.
+
+    **Logical, not a process.** Ten thousand NGOs get ten thousand of these rows
+    and **one** shared worker pool. There is deliberately no process, thread,
+    scheduler or Redis lock per agent, because that model costs a fixed amount per
+    customer whether or not they are doing anything. Instead every job carries
+    ``agent_id``; a worker picks up a job, loads *that* agent's state, does the
+    work, stores the result, and becomes available for another organisation. The
+    customer experiences a private 24/7 agent; the operator runs one fleet.
+
+    **This is the scope for everything.** Facts, documents, applications, mail
+    identities, decisions and workflows all belong to an agent, so "which
+    organisation's memory am I acting on" has exactly one answer and it is not
+    inferred from whichever request happens to be in flight.
+
+    ``autonomy`` lives here rather than on the organisation because the agent is
+    what acts. A specialist agent can never exceed its parent's level - the parent
+    is the ceiling, and that is enforced in code rather than by convention.
+    """
+
+    __tablename__ = "granada_agents"
+
+    #: The four verticals share one engine. Kept explicit so domain data stays
+    #: separated without four copies of the runtime.
+    VERTICAL_NGO = "NGO"
+    VERTICAL_ACADEMIA = "ACADEMIA"
+    VERTICAL_BUSINESS = "BUSINESS"
+    VERTICAL_JOBS = "JOBS"
+    VERTICALS = (VERTICAL_NGO, VERTICAL_ACADEMIA, VERTICAL_BUSINESS, VERTICAL_JOBS)
+
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+    PROVISIONING = "PROVISIONING"
+    SUSPENDED = "SUSPENDED"
+
+    __table_args__ = (
+        UniqueConstraint("org_id", name="uq_agent_org"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+
+    #: What the organisation sees: "Your Granada Agent". Not an internal id.
+    display_name: Mapped[str] = mapped_column(String(200))
+    vertical: Mapped[str] = mapped_column(String(20), default=VERTICAL_NGO, index=True)
+    status: Mapped[str] = mapped_column(String(20), default=PROVISIONING, index=True)
+
+    #: The authority ceiling for every specialist under this agent.
+    autonomy: Mapped[str] = mapped_column(String(30), default="MONITOR_ONLY", index=True)
+    #: Configuration that is genuinely per-agent rather than per-org: funding
+    #: preferences, search cadence, notification settings.
+    settings: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    #: Denormalised so "last worked 3 minutes ago" is one read rather than an
+    #: aggregate over the ledger. Updated by the worker that does the work.
+    last_active_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    #: Bumped on every material change, so a cached or in-flight decision can tell
+    #: that the agent it was made for has changed underneath it.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
+class AgentSpecialist(Base):
+    """A named specialist under an agent: Opportunity Hunter, Proposal Writer, ...
+
+    Exists so the organisation can see *which* part of its agent is doing what -
+    "Proposal Agent - preparing EU application" - rather than a single opaque
+    worker. That visibility is the difference between an agent the customer trusts
+    and a black box they have to take on faith.
+
+    ``current_activity`` is a short human string, set by the worker while it holds
+    a job and cleared afterwards. It is deliberately not a job log: the durable
+    record is ``jobs`` and ``job_attempts``, and this is only what to display.
+    """
+
+    __tablename__ = "agent_specialists"
+
+    IDLE = "IDLE"
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+
+    __table_args__ = (
+        UniqueConstraint("agent_id", "key", name="uq_specialist_agent_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+
+    #: One of OPPORTUNITY_HUNTER, MATCHER, DONOR_RESEARCHER, PROPOSAL_WRITER,
+    #: BUDGET, COMPLIANCE, DOCUMENT, EMAIL, SUBMISSION, FOLLOW_UP.
+    key: Mapped[str] = mapped_column(String(40), index=True)
+    display_name: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(20), default=IDLE, index=True)
+    current_activity: Mapped[Optional[str]] = mapped_column(String(255))
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    #: Rolling counters for the agent summary. Reset deliberately, never by a
+    #: rollover that could silently zero a customer's visible history.
+    runs_completed: Mapped[int] = mapped_column(Integer, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class AgentWorkflow(Base):
+    """A durable workflow instance belonging to one agent.
+
+    **Every autonomous workflow belongs to a persistent agent.** This is the
+    correction that keeps Granada from becoming ordinary background-job software:
+    a workflow is not anonymous work, it is *War Child's agent pursuing this
+    opportunity*, and the record says so.
+
+    ``subject_type``/``subject_id`` point at whatever the workflow is about - an
+    opportunity, an application, a mail thread - so one table serves all of them
+    without a column per case. ``next_run_at`` is the wake-up: a workflow waiting
+    on a deadline or a follow-up window is scheduled here rather than being held by
+    a sleeping process.
+    """
+
+    __tablename__ = "agent_workflows"
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    WAITING = "WAITING"          # waiting on a person, a document, or a deadline
+    BLOCKED = "BLOCKED"          # waiting on something we cannot control
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+    FAILED = "FAILED"
+
+    SUBJECT_OPPORTUNITY = "OPPORTUNITY"
+    SUBJECT_APPLICATION = "APPLICATION"
+    SUBJECT_MAIL = "MAIL"
+    SUBJECT_ORG = "ORGANISATION"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id", "workflow_type", "subject_type", "subject_id",
+            name="uq_workflow_agent_subject",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+
+    #: Which specialist owns the next step. Null while unassigned.
+    specialist_key: Mapped[Optional[str]] = mapped_column(String(40), index=True)
+    workflow_type: Mapped[str] = mapped_column(String(60), index=True)
+    state: Mapped[str] = mapped_column(String(20), default=PENDING, index=True)
+
+    subject_type: Mapped[Optional[str]] = mapped_column(String(20), index=True)
+    subject_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    #: The wake-up. A workflow that needs to run in three days is scheduled, not
+    #: held open by a process.
+    next_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    #: Why it is waiting, in words a human can act on.
+    waiting_on: Mapped[Optional[str]] = mapped_column(String(255))
+
+    priority: Mapped[int] = mapped_column(Integer, default=100, index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    context: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)
 Index("ix_jobs_dispatch", Job.state, Job.available_at)
@@ -1157,6 +1346,12 @@ Index("ix_decisions_cache_lookup", DecisionRecord.organisation_id, DecisionRecor
 Index("ix_applications_org_state", Application.org_id, Application.state, Application.deadline)
 Index("ix_applications_org_updated", Application.org_id, Application.updated_at)
 Index("ix_transitions_application_version", ApplicationTransition.application_id, ApplicationTransition.version)
+# The agent layer. The dispatcher query is "what is due for any agent", and the
+# per-agent view is "what is my agent doing" - both index-shaped.
+Index("ix_jobs_agent_dispatch", Job.agent_id, Job.state, Job.available_at)
+Index("ix_workflows_due", AgentWorkflow.state, AgentWorkflow.next_run_at)
+Index("ix_workflows_agent_state", AgentWorkflow.agent_id, AgentWorkflow.state)
+Index("ix_specialists_agent_status", AgentSpecialist.agent_id, AgentSpecialist.status)
 Index("ix_refresh_tokens_expires", RefreshToken.expires_at)
 Index("ix_audit_logs_user_event", AuditLog.user_id, AuditLog.event)
 Index("ix_oauth_accounts_user", OAuthAccount.user_id)
