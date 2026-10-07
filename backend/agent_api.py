@@ -74,6 +74,19 @@ def _iso(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat() if value else None
 
 
+def _agent_for(db: Session, org_id: str):
+    """The organisation's Granada agent, or None if it has not been provisioned.
+
+    Returns None rather than raising: an organisation that has never used the platform
+    has no agent, and a dashboard asking about its grants should render an empty state
+    rather than a 500.
+    """
+    try:
+        return GranadaAgentService(db, org_id).get()
+    except Exception:  # noqa: BLE001 - not provisioned yet is a normal state
+        return None
+
+
 def _organisation(tenant: TenantContext) -> str:
     if not tenant.primary_org_id:
         raise HTTPException(
@@ -191,6 +204,238 @@ def agent_status(
             "high_risk_always_refused": True,
         },
     }
+
+
+
+# ===========================================================================
+# DELIVERY — what the organisation owes, and what it is owed
+# ===========================================================================
+class GrantSummary(BaseModel):
+    id: str
+    reference: str
+    title: str
+    donor_name: Optional[str] = None
+    currency: str
+    awarded_amount: Optional[float] = None
+    requested_amount: Optional[float] = None
+    size_relative_to_request: Optional[str] = None
+    status: str
+    awarded_at: Optional[str] = None
+    starts_on: Optional[str] = None
+    ends_on: Optional[str] = None
+    # Provenance: which authorised package every figure came from.
+    source_package_id: Optional[str] = None
+    application_id: Optional[str] = None
+
+
+class DeadlineSummary(BaseModel):
+    kind: str
+    id: str
+    title: str
+    due_on: str
+    days_remaining: int
+    overdue: bool
+    blocks_payment: bool = False
+    grant_id: Optional[str] = None
+
+
+@router.get("/grants", summary="Grants this organisation holds")
+def list_grants(
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+    user: Any = Depends(get_current_user),
+    status_filter: Optional[str] = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """The portfolio.
+
+    Amounts are returned as numbers rather than strings so a client does not have to
+    parse money, and ``size_relative_to_request`` is included because an award smaller
+    than the request changes the whole workplan - and it is invisible from the amount
+    alone.
+    """
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    statement = select(models.Grant).where(models.Grant.org_id == org_id)
+    if status_filter:
+        statement = statement.where(models.Grant.status == status_filter)
+    statement = statement.order_by(models.Grant.created_at.desc()).limit(max(1, min(limit, 500)))
+
+    rows = db.execute(statement).scalars().all()
+    return {
+        "organisation_id": org_id,
+        "count": len(rows),
+        "grants": [
+            GrantSummary(
+                id=g.id,
+                reference=g.reference,
+                title=g.title,
+                donor_name=g.donor_name,
+                currency=g.currency,
+                awarded_amount=float(g.awarded_amount) if g.awarded_amount is not None else None,
+                requested_amount=float(g.requested_amount) if g.requested_amount is not None else None,
+                size_relative_to_request=g.size_relative_to_request,
+                status=g.status,
+                awarded_at=_iso(g.awarded_at),
+                starts_on=_iso(g.starts_on),
+                ends_on=_iso(g.ends_on),
+                source_package_id=g.source_package_id,
+                application_id=g.application_id,
+            ).model_dump()
+            for g in rows
+        ],
+    }
+
+
+@router.get("/grants/{grant_id}", summary="One grant, with its obligations")
+def get_grant(
+    grant_id: str,
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+    user: Any = Depends(get_current_user),
+) -> dict[str, Any]:
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    grant = db.execute(
+        select(models.Grant).where(
+            models.Grant.id == grant_id, models.Grant.org_id == org_id
+        )
+    ).scalars().first()
+    if grant is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such grant")
+
+    conditions = db.execute(
+        select(models.GrantCondition).where(models.GrantCondition.grant_id == grant.id)
+    ).scalars().all()
+    obligations = db.execute(
+        select(models.ReportingObligation).where(
+            models.ReportingObligation.grant_id == grant.id
+        )
+    ).scalars().all()
+    tranches = db.execute(
+        select(models.Disbursement).where(models.Disbursement.grant_id == grant.id)
+    ).scalars().all()
+    project = db.execute(
+        select(models.Project).where(models.Project.grant_id == grant.id)
+    ).scalars().first()
+
+    return {
+        "grant": GrantSummary(
+            id=grant.id, reference=grant.reference, title=grant.title,
+            donor_name=grant.donor_name, currency=grant.currency,
+            awarded_amount=float(grant.awarded_amount) if grant.awarded_amount is not None else None,
+            requested_amount=float(grant.requested_amount) if grant.requested_amount is not None else None,
+            size_relative_to_request=grant.size_relative_to_request,
+            status=grant.status, awarded_at=_iso(grant.awarded_at),
+            starts_on=_iso(grant.starts_on), ends_on=_iso(grant.ends_on),
+            source_package_id=grant.source_package_id, application_id=grant.application_id,
+        ).model_dump(),
+        "project": None if project is None else {
+            "id": project.id, "name": project.name, "status": project.status,
+            "budget_total": float(project.budget_total) if project.budget_total is not None else None,
+            "baseline_workplan": project.baseline_workplan,
+        },
+        "conditions": [
+            {
+                "id": c.id, "title": c.title, "kind": c.kind, "status": c.status,
+                "blocks_payment": c.blocks_payment, "due_on": _iso(c.due_on),
+                # Present only when it truly was satisfied - the service refuses without
+                # it, so a client can treat a null here as "not actually evidenced".
+                "evidence_ref": c.evidence_ref, "satisfied_at": _iso(c.satisfied_at),
+            }
+            for c in conditions
+        ],
+        "reporting_obligations": [
+            {
+                "id": o.id, "title": o.title, "kind": o.kind, "period": o.period,
+                "status": o.status, "due_on": _iso(o.due_on),
+                "submitted_at": _iso(o.submitted_at), "reference": o.reference,
+                "remind_days_before": o.remind_days_before,
+            }
+            for o in obligations
+        ],
+        "disbursements": [
+            {
+                "id": d.id, "label": d.label, "tranche_number": d.tranche_number,
+                "status": d.status, "amount": float(d.amount) if d.amount is not None else None,
+                "amount_received": (
+                    float(d.amount_received) if d.amount_received is not None else None
+                ),
+                "currency": d.currency, "expected_on": _iso(d.expected_on),
+                "received_on": _iso(d.received_on), "reference": d.reference,
+                "variance_note": d.variance_note,
+            }
+            for d in tranches
+        ],
+    }
+
+
+@router.get("/deadlines", summary="Everything with a date, soonest first")
+def list_deadlines(
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+    user: Any = Depends(get_current_user),
+    within_days: int = 30,
+) -> dict[str, Any]:
+    """Conditions, reports and tranches together.
+
+    Deliberately one list from all three sources: an organisation's obligations are not
+    separated by which table they live in, and a view showing only reports would hide the
+    precondition blocking the next payment.
+    """
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    agent = _agent_for(db, org_id)
+    if agent is None:
+        return {"organisation_id": org_id, "count": 0, "deadlines": []}
+
+    from agent.delivery.service import DeliveryService
+
+    service = DeliveryService(db, org_id=org_id, agent_id=agent.id)
+    found = service.deadlines(within_days=max(1, min(within_days, 365)))
+    return {
+        "organisation_id": org_id,
+        "within_days": within_days,
+        "count": len(found),
+        "deadlines": [d.as_dict() for d in found],
+    }
+
+
+@router.get("/compliance", summary="What is at risk right now")
+def compliance(
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+    user: Any = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Blocked payments, overdue reports and late money, as three separate lists.
+
+    Not a score. A score would require weighting a blocked payment against a late report,
+    and the right response to each is different: one is a phone call, the other is
+    writing.
+    """
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    agent = _agent_for(db, org_id)
+    if agent is None:
+        return {
+            "organisation_id": org_id, "grants_active": 0,
+            "blocking_conditions": [], "overdue_reports": [], "late_disbursements": [],
+            "portfolio": {"scheduled_total": "0", "received_total": "0", "outstanding_total": "0"},
+            "counts": {"blocking_conditions": 0, "overdue_reports": 0, "late_disbursements": 0},
+        }
+
+    from agent.delivery.service import DeliveryService
+
+    service = DeliveryService(db, org_id=org_id, agent_id=agent.id)
+    summary = service.compliance_summary()
+    # Persist the status transitions the scan just derived, so a later read is
+    # consistent rather than re-deriving from a different clock.
+    db.commit()
+    return {"organisation_id": org_id, **summary}
 
 
 @router.get("/health", summary="Fleet, relay and autonomy health")

@@ -1,4 +1,18 @@
-from sqlalchemy import String, DateTime, Boolean, Text, ForeignKey, Integer, JSON, Index, UniqueConstraint, Float
+from decimal import Decimal
+
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from datetime import datetime, timezone
 import uuid
@@ -2490,6 +2504,297 @@ class SubmissionReceipt(Base):
     )
     captured_by: Mapped[Optional[str]] = mapped_column(String(36))
     recorded_by_agent: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Grant(Base):
+    """An award, derived from the authorised submission package.
+
+    The brief's exit criterion for Phase 9 is that **no data already approved in the
+    application is re-entered by hand.** So this is built from the frozen package's
+    manifest rather than typed in: the budget, the answers and the documents are the
+    ones a human authorised, and re-keying them is how the record and the application
+    drift apart.
+
+    ``source_package_id`` is therefore not a convenience pointer. It is the provenance
+    of every figure here, and it is what makes "the grant says what we applied for"
+    checkable rather than asserted.
+    """
+
+    __tablename__ = "grants"
+
+    #: Signed. Not "active" - a grant exists from the moment it is recorded, and its
+    #: lifecycle is separate from the project's.
+    STATUS_ACTIVE = "ACTIVE"
+    STATUS_COMPLETED = "COMPLETED"
+    STATUS_TERMINATED = "TERMINATED"
+    STATUS_SUSPENDED = "SUSPENDED"
+
+    #: Whether the award is what was applied for, more, or less. An award smaller than
+    #: the request is the common case and it changes the whole workplan, so it is
+    #: recorded rather than discovered later.
+    SIZE_AS_REQUESTED = "AS_REQUESTED"
+    SIZE_REDUCED = "REDUCED"
+    SIZE_INCREASED = "INCREASED"
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "reference", name="uq_grant_org_reference"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    application_id: Mapped[str] = mapped_column(String(36), index=True)
+    opportunity_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    #: The frozen package this was derived from. Provenance, not convenience.
+    source_package_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    #: The funder's own grant number. Required: a grant with no external reference is a
+    #: belief, the same rule the workspace applies to a submitted application.
+    reference: Mapped[str] = mapped_column(String(255), index=True)
+    donor_name: Mapped[Optional[str]] = mapped_column(String(255))
+    title: Mapped[str] = mapped_column(String(500))
+
+    currency: Mapped[str] = mapped_column(String(3), default="USD")
+    #: What was asked for, from the frozen package.
+    requested_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
+    #: What was awarded. The difference drives everything downstream.
+    awarded_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=Decimal("0"))
+    size_relative_to_request: Mapped[str] = mapped_column(
+        String(20), default=SIZE_AS_REQUESTED
+    )
+
+    status: Mapped[str] = mapped_column(String(20), default=STATUS_ACTIVE, index=True)
+    awarded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    starts_on: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ends_on: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+
+    #: The donor mail thread, so correspondence lands against the grant rather than in a
+    #: shared inbox. Phase 9's "connect donor mail thread to grant".
+    mail_thread_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    donor_contact_email: Mapped[Optional[str]] = mapped_column(String(320))
+
+    #: The budget as authorised, copied from the frozen manifest. A copy rather than a
+    #: reference, because the package is immutable and the grant must stay readable if
+    #: anything ever compacts old packages.
+    approved_budget: Mapped[Optional[dict]] = mapped_column(JSON)
+    #: Currency and total agreed at award, which may differ from the application.
+    awarded_budget: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+
+
+class Project(Base):
+    """The delivery project and its baseline workplan.
+
+    The baseline is stored, not recomputed, because a workplan is *agreed*: a change to
+    it is a conversation with the funder, not a refresh. Keeping the baseline makes
+    "what did we commit to" answerable after the fact, which is the question an audit
+    asks.
+    """
+
+    __tablename__ = "projects"
+
+    STATUS_PLANNED = "PLANNED"
+    STATUS_ACTIVE = "ACTIVE"
+    STATUS_COMPLETED = "COMPLETED"
+    STATUS_SUSPENDED = "SUSPENDED"
+    STATUS_CANCELLED = "CANCELLED"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    grant_id: Mapped[str] = mapped_column(ForeignKey("grants.id"), index=True)
+
+    name: Mapped[str] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(20), default=STATUS_PLANNED, index=True)
+
+    #: The baseline workplan: milestones with dates. Derived from the application's own
+    #: stated activities where it has them, so nothing is re-entered.
+    baseline_workplan: Mapped[Optional[dict]] = mapped_column(JSON)
+    #: Sum of the workplan's budgeted lines, for checking against the awarded amount.
+    budget_total: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
+
+    starts_on: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ends_on: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class GrantCondition(Base):
+    """A condition attached to an award, and the evidence that satisfied it.
+
+    **A condition is never satisfied by inference.** Funders attach conditions that
+    gate disbursement - a signed agreement, a safeguarding policy, a bank confirmation -
+    and marking one met because it *looks* met is how an organisation finds its next
+    tranche withheld. So ``satisfied`` requires an ``evidence_ref``, and the service
+    refuses without one.
+    """
+
+    __tablename__ = "grant_conditions"
+
+    KIND_PRECONDITION = "PRECONDITION"       # before any money moves
+    KIND_REPORTING = "REPORTING"
+    KIND_FINANCIAL = "FINANCIAL"
+    KIND_LEGAL = "LEGAL"
+    KIND_SAFEGUARDING = "SAFEGUARDING"
+    KIND_PROCUREMENT = "PROCUREMENT"
+    KIND_OTHER = "OTHER"
+
+    STATUS_OPEN = "OPEN"
+    STATUS_SATISFIED = "SATISFIED"
+    STATUS_WAIVED = "WAIVED"
+    STATUS_OVERDUE = "OVERDUE"
+
+    #: Conditions that block money. Distinct because a precondition has a hard
+    #: consequence, and treating every condition alike hides which ones do.
+    BLOCKING_KINDS = frozenset({KIND_PRECONDITION, KIND_FINANCIAL, KIND_LEGAL})
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    grant_id: Mapped[str] = mapped_column(ForeignKey("grants.id"), index=True)
+
+    kind: Mapped[str] = mapped_column(String(20), default=KIND_OTHER, index=True)
+    status: Mapped[str] = mapped_column(String(20), default=STATUS_OPEN, index=True)
+    title: Mapped[str] = mapped_column(String(500))
+    detail: Mapped[Optional[str]] = mapped_column(Text)
+
+    #: Blocks disbursement when unmet.
+    blocks_payment: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    due_on: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+
+    satisfied_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    satisfied_by: Mapped[Optional[str]] = mapped_column(String(36))
+    #: What proves it. Required for SATISFIED - see the class docstring.
+    evidence_ref: Mapped[Optional[str]] = mapped_column(String(500))
+    evidence_note: Mapped[Optional[str]] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class ReportingObligation(Base):
+    """A report owed to the funder, with a deadline.
+
+    **This is where money is lost to silence rather than to a bad application.** A
+    missed narrative report is the most common reason a subsequent tranche is withheld,
+    and it is entirely preventable by knowing the date in advance.
+
+    A report is only ``SUBMITTED`` with a reference, for the same reason an application
+    is: believing a report was filed when it was not is worse than knowing it is late.
+    """
+
+    __tablename__ = "reporting_obligations"
+
+    KIND_NARRATIVE = "NARRATIVE"
+    KIND_FINANCIAL = "FINANCIAL"
+    KIND_INDICATOR = "INDICATOR"       # M&E results against the logframe
+    KIND_AUDIT = "AUDIT"
+    KIND_AD_HOC = "AD_HOC"
+
+    PERIOD_MONTHLY = "MONTHLY"
+    PERIOD_QUARTERLY = "QUARTERLY"
+    PERIOD_SEMI_ANNUAL = "SEMI_ANNUAL"
+    PERIOD_ANNUAL = "ANNUAL"
+    PERIOD_FINAL = "FINAL"
+    PERIOD_ONE_OFF = "ONE_OFF"
+
+    STATUS_PENDING = "PENDING"
+    STATUS_DUE_SOON = "DUE_SOON"
+    STATUS_OVERDUE = "OVERDUE"
+    STATUS_SUBMITTED = "SUBMITTED"
+    STATUS_ACCEPTED = "ACCEPTED"
+    STATUS_WAIVED = "WAIVED"
+
+    #: Statuses that mean work is outstanding. The monitor scans these.
+    OUTSTANDING = frozenset({STATUS_PENDING, STATUS_DUE_SOON, STATUS_OVERDUE})
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    grant_id: Mapped[str] = mapped_column(ForeignKey("grants.id"), index=True)
+    project_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    kind: Mapped[str] = mapped_column(String(20), default=KIND_NARRATIVE, index=True)
+    period: Mapped[str] = mapped_column(String(20), default=PERIOD_ONE_OFF, index=True)
+    status: Mapped[str] = mapped_column(String(20), default=STATUS_PENDING, index=True)
+    title: Mapped[str] = mapped_column(String(500))
+
+    due_on: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    #: Covering period, for a report that is about a window rather than a date.
+    period_starts_on: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    period_ends_on: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    submitted_by: Mapped[Optional[str]] = mapped_column(String(36))
+    #: The funder's acknowledgement reference. Required for SUBMITTED.
+    reference: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    #: Reference into uploaded evidence.
+    report_document_ref: Mapped[Optional[str]] = mapped_column(String(500))
+
+    #: How many days before the deadline to raise it. Stored per obligation because a
+    #: final audit needs more warning than a monthly update.
+    remind_days_before: Mapped[int] = mapped_column(Integer, default=14)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class Disbursement(Base):
+    """Money the grant says will arrive, and money that did.
+
+    ``EXPECTED`` and ``RECEIVED`` are separate rows rather than a status on one, because
+    they are different facts: a tranche is expected on a date, and separately it is
+    received with a bank reference. Collapsing them loses the ability to answer "what is
+    late" - which is the only question that matters about a disbursement schedule.
+
+    **Received requires a reference.** Money that "probably arrived" is not received, and
+    a project that spends against a tranche it has not got is a project in trouble.
+    """
+
+    __tablename__ = "disbursements"
+
+    EXPECTED = "EXPECTED"
+    RECEIVED = "RECEIVED"
+    OVERDUE = "OVERDUE"
+    CANCELLED = "CANCELLED"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    grant_id: Mapped[str] = mapped_column(ForeignKey("grants.id"), index=True)
+
+    status: Mapped[str] = mapped_column(String(20), default=EXPECTED, index=True)
+    #: Which tranche, in the funder's own words.
+    label: Mapped[Optional[str]] = mapped_column(String(255))
+    tranche_number: Mapped[Optional[int]] = mapped_column(Integer)
+
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=Decimal("0"))
+    currency: Mapped[str] = mapped_column(String(3), default="USD")
+
+    expected_on: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    received_on: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    #: The bank or funder reference. Required for RECEIVED.
+    reference: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    #: Condition(s) that must be met before this tranche moves.
+    gated_by_condition_ids: Mapped[Optional[dict]] = mapped_column(JSON)
+
+    amount_received: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
+    #: A short receipt is a real and common event, and it is invisible if only the
+    #: expected amount is recorded.
+    variance_note: Mapped[Optional[str]] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
 
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)
