@@ -41,6 +41,16 @@ class Capability(str, Enum):
     #: Sending is permitted ONLY with an approval of the exact fingerprint.
     MAIL_SEND_HUMAN_APPROVED = "MAIL_SEND_HUMAN_APPROVED"
     MAIL_RECONCILE_SEND = "MAIL_RECONCILE_SEND"
+    #: Phase 7c: an unattended send, permitted only when an
+    #: `AutonomousPolicy.evaluate` has cleared every gate for THIS message.
+    #:
+    #: Deliberately a different capability from `MAIL_SEND_AUTONOMOUS`, which stays
+    #: forbidden forever. The distinction is the whole safety argument: this one
+    #: cannot be reached by a caller asserting a boolean, because the flag it needs
+    #: is produced by the policy engine evaluating a specific intent, not by a caller
+    #: deciding it is allowed. `MAIL_SEND_AUTONOMOUS` remains what it always was - a
+    #: name for the thing this platform does not do.
+    MAIL_SEND_AUTONOMOUS_LOW_RISK = "MAIL_SEND_AUTONOMOUS_LOW_RISK"
 
     # -- forbidden, in this phase and by design ----------------------------
     MAIL_SEND = "MAIL_SEND"                       # autonomous sending
@@ -80,11 +90,18 @@ PHASE_7B_ALLOWED: frozenset[Capability] = frozenset({
     Capability.MAIL_REQUEST_APPROVAL,
     Capability.MAIL_SEND_HUMAN_APPROVED,
     Capability.MAIL_RECONCILE_SEND,
+    Capability.MAIL_SEND_AUTONOMOUS_LOW_RISK,
 })
 
 #: Requires an approval of the exact fingerprint, checked at the call site.
 CAPABILITIES_REQUIRING_APPROVAL: frozenset[Capability] = frozenset({
     Capability.MAIL_SEND_HUMAN_APPROVED,
+})
+
+#: Capabilities that are available only when the policy engine has cleared them for
+#: this specific message. A caller cannot assert these; it has to hold a decision.
+CAPABILITIES_REQUIRING_POLICY: frozenset[Capability] = frozenset({
+    Capability.MAIL_SEND_AUTONOMOUS_LOW_RISK,
 })
 
 PHASE_7B_FORBIDDEN: frozenset[Capability] = frozenset(
@@ -119,7 +136,16 @@ class ApprovalRequired(CapabilityRefused):
     """
 
 
-def assert_capability(capability: Capability, *, human_approved: bool = False) -> None:
+class PolicyRefused(CapabilityRefused):
+    """An unattended send was attempted without a cleared policy decision."""
+
+
+def assert_capability(
+    capability: Capability,
+    *,
+    human_approved: bool = False,
+    policy_cleared: bool = False,
+) -> None:
     """Refuse anything outside the ceiling.
 
     **Deny by default.** The check is ``not in PHASE_7B_ALLOWED`` rather than ``in
@@ -141,7 +167,18 @@ def assert_capability(capability: Capability, *, human_approved: bool = False) -
         raise ApprovalRequired(
             f"{capability.value} requires an approval of the exact message "
             "fingerprint. Platform policy requires human approval for every "
-            "outbound message in this phase, regardless of organisation autonomy."
+            "outbound message, regardless of organisation autonomy."
+        )
+    if capability in CAPABILITIES_REQUIRING_POLICY and not policy_cleared:
+        # `policy_cleared` is produced by `AutonomousPolicy.evaluate`, which checks
+        # the platform switch, the organisation's opt-in, the autonomy level, the risk
+        # class, the classification, the recipient's familiarity, the security flags
+        # and the daily ceiling. A bare True from a caller is not that, and the only
+        # durable proof is the AUTONOMOUS_POLICY approval row written alongside.
+        raise PolicyRefused(
+            f"{capability.value} requires a cleared autonomous policy decision for "
+            "this specific message. Platform policy does not permit unattended "
+            "sending on a caller's assertion."
         )
 
 

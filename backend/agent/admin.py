@@ -574,6 +574,93 @@ class AdminCommands:
         return CommandResult("retry-confirmed-not-sent", True, "requeued",
                              {"send_intent_id": intent.id, "previous_status": previous})
 
+    def enable_autonomous_mail(self, daily_limit: int = 10) -> CommandResult:
+        """Let this organisation's agent send low-risk replies unattended.
+
+        Deliberately a command that must be run on purpose, per organisation, with an
+        attributed operator - not a settings file somebody edits while debugging
+        something else. It is also the only way to turn it on: the platform switch
+        gates it separately, so an operator has to intend both.
+
+        **It does not send anything.** It changes a policy input; the gates and the
+        final authority check still decide every individual message.
+        """
+        self._require_actor("enable-autonomous-mail")
+        from agent.mail.autonomy import (
+            AUTONOMOUS_CLASSIFICATION_ALLOWLIST,
+            AUTONOMOUS_RISK_ALLOWLIST,
+            enable_for_organisation,
+            platform_autonomy_enabled,
+        )
+
+        agent = enable_for_organisation(self.db, org_id=self.org_id, daily_limit=daily_limit)
+        self._audit(
+            action="enable_autonomous_mail", subject=agent.id,
+            detail=f"daily_limit={daily_limit}",
+        )
+        return CommandResult(
+            "enable-autonomous-mail", True,
+            "autonomous mail enabled for this organisation",
+            {
+                "agent_id": agent.id,
+                "daily_limit": daily_limit,
+                "platform_enabled": platform_autonomy_enabled(),
+                "risk_allowlist": sorted(AUTONOMOUS_RISK_ALLOWLIST),
+                "classification_allowlist": sorted(AUTONOMOUS_CLASSIFICATION_ALLOWLIST),
+                "note": (
+                    "the PLATFORM switch must also be on, or every unattended send is "
+                    "refused with AUTONOMOUS_MAIL_DISABLED"
+                ),
+            },
+        )
+
+    def disable_autonomous_mail(self, reason: str = "") -> CommandResult:
+        """Stop this organisation's agent sending unattended. Takes effect at once.
+
+        Because the policy is re-evaluated from live state immediately before each
+        send, a message already authorised by policy but not yet sent is refused too.
+        """
+        self._require_actor("disable-autonomous-mail")
+        from agent.mail.autonomy import disable_for_organisation
+
+        agent = disable_for_organisation(self.db, org_id=self.org_id)
+        self._audit(action="disable_autonomous_mail", subject=agent.id,
+                    detail=reason or "disabled by an operator")
+        return CommandResult(
+            "disable-autonomous-mail", True, "autonomous mail disabled",
+            {"agent_id": agent.id,
+             "note": "already-authorised but unsent messages are refused at the final check"},
+        )
+
+    def show_autonomy(self) -> CommandResult:
+        """Why is (or isn't) this agent sending by itself?"""
+        from agent.mail.autonomy import (
+            AUTONOMOUS_CLASSIFICATION_ALLOWLIST,
+            AUTONOMOUS_RISK_ALLOWLIST,
+            platform_autonomy_enabled,
+        )
+
+        agent = GranadaAgentService(self.db, self.org_id).get()
+        if agent is None:
+            raise NotFound("no agent for this organisation")
+        settings = agent.settings or {}
+        return CommandResult(
+            "show-autonomy", True,
+            "autonomous mail is "
+            + ("enabled" if settings.get("autonomous_mail_enabled") else "disabled")
+            + " for this organisation",
+            {
+                "platform_enabled": platform_autonomy_enabled(),
+                "organisation_enabled": bool(settings.get("autonomous_mail_enabled")),
+                "autonomy_level": agent.autonomy,
+                "agent_status": agent.status,
+                "daily_limit": settings.get("autonomous_mail_daily_limit", 10),
+                "risk_allowlist": sorted(AUTONOMOUS_RISK_ALLOWLIST),
+                "classification_allowlist": sorted(AUTONOMOUS_CLASSIFICATION_ALLOWLIST),
+                "high_risk_always_refused": True,
+            },
+        )
+
     def drain_fleet(self, *, rounds: int = 3) -> CommandResult:
         """Run bounded sweeps. Convenience for an operator after a fix."""
         self._require_actor("drain-fleet")
@@ -636,6 +723,10 @@ COMMANDS = (
     # way around the approval the whole phase depends on.
     "show-send-intent", "show-send-attempts", "cancel-send", "reconcile-send",
     "retry-confirmed-not-sent",
+    # Phase 7c autonomy controls. Note again what is absent: there is no command that
+    # sends a message, and none that grants an approval. Every command here changes a
+    # policy input; the gates still decide each message.
+    "show-autonomy", "enable-autonomous-mail", "disable-autonomous-mail",
 )
 
 
@@ -666,6 +757,11 @@ def run_command(
         "cancel-send": lambda: commands.cancel_send(rest[0], reason=" ".join(rest[1:])),
         "reconcile-send": lambda: commands.reconcile_send(rest[0]),
         "retry-confirmed-not-sent": lambda: commands.retry_confirmed_not_sent(rest[0]),
+        "show-autonomy": lambda: commands.show_autonomy(),
+        "enable-autonomous-mail": lambda: commands.enable_autonomous_mail(
+            daily_limit=int(rest[0]) if rest and rest[0].isdigit() else 10
+        ),
+        "disable-autonomous-mail": lambda: commands.disable_autonomous_mail(reason=" ".join(rest)),
     }
     handler = table.get(name)
     if handler is None:

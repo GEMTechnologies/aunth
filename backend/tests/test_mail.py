@@ -45,6 +45,7 @@ from agent.mail.vocabulary import (  # noqa: E402
     PHASE_7A_FORBIDDEN,
     PHASE_7B_ALLOWED,
     PHASE_7B_FORBIDDEN,
+    CAPABILITIES_REQUIRING_POLICY,
     ApprovalRequired,
     Capability,
     CorrelationState,
@@ -52,6 +53,7 @@ from agent.mail.vocabulary import (  # noqa: E402
     DraftStatus,
     ExternalActionDisabled,
     MailClassification,
+    PolicyRefused,
     assert_capability,
 )
 from agent.workflow_engine import (  # noqa: E402
@@ -215,12 +217,25 @@ def test_every_forbidden_capability_is_refused():
 
 def test_every_allowed_capability_is_permitted():
     for capability in sorted(PHASE_7B_ALLOWED, key=lambda c: c.value):
-        # `human_approved=True` where the capability requires it; the ceiling itself
-        # decides which, so this loop does not need to know.
+        # Each gated capability is passed the proof it requires, and the CEILING
+        # decides which proof that is - so this loop does not need to know, and a
+        # capability added later cannot be silently un-gated.
         if capability in CAPABILITIES_REQUIRING_APPROVAL:
             assert_capability(capability, human_approved=True)
+        elif capability in CAPABILITIES_REQUIRING_POLICY:
+            assert_capability(capability, policy_cleared=True)
         else:
             assert_capability(capability)
+
+    # The policy-gated capabilities refuse WITHOUT their proof. That is the whole
+    # reason they exist separately from `MAIL_SEND_AUTONOMOUS`: a caller cannot
+    # obtain an unattended send by asserting a boolean, only by holding a policy
+    # decision the engine produced for this specific message.
+    for capability in sorted(CAPABILITIES_REQUIRING_POLICY, key=lambda c: c.value):
+        with pytest.raises(PolicyRefused):
+            assert_capability(capability)
+        with pytest.raises(PolicyRefused):
+            assert_capability(capability, human_approved=True)
 
 
 def test_the_two_lists_do_not_overlap_and_cover_the_vocabulary():

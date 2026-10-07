@@ -2176,6 +2176,12 @@ class MailApproval(Base):
     APPROVE = "APPROVE"
     REJECT = "REJECT"
     REQUEST_CHANGES = "REQUEST_CHANGES"
+    #: Authorised by policy rather than by a person (Phase 7c). Kept in the SAME
+    #: table as a human approval, and distinguished rather than merged, so the
+    #: question "was this sent by a person or by the policy engine?" is one column
+    #: read away - and so the daily autonomous ceiling can be counted from the same
+    #: durable rows a human approval produces.
+    AUTONOMOUS_POLICY = "AUTONOMOUS_POLICY"
 
     STATUS_ACTIVE = "ACTIVE"
     STATUS_REVOKED = "REVOKED"
@@ -2207,6 +2213,11 @@ class MailApproval(Base):
     permission_used: Mapped[Optional[str]] = mapped_column(String(80))
     membership_id: Mapped[Optional[str]] = mapped_column(String(36))
     approval_version: Mapped[int] = mapped_column(Integer, default=1)
+
+    #: For an AUTONOMOUS_POLICY decision: every gate and its result, so "why did the
+    #: agent send this without asking?" is answerable from the record rather than from
+    #: the code that happened to be deployed at the time.
+    policy_evidence: Mapped[Optional[dict]] = mapped_column(JSON)
 
     status: Mapped[str] = mapped_column(String(20), default=STATUS_ACTIVE, index=True)
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))

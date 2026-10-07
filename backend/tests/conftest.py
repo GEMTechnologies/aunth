@@ -234,6 +234,26 @@ def make_sqlite_db(tmp_path, name: str = "test.db"):
     shutil.copyfile(template, db_path)
 
     engine = create_engine(f"sqlite:///{db_path.as_posix()}", future=True)
+
+    # **Enforce foreign keys, deterministically.**
+    #
+    # SQLite has foreign keys OFF by default, so whether a constraint fired depended
+    # on which module had run first and issued `PRAGMA foreign_keys=ON`. That is how a
+    # test that fabricated a `send_intent_id` passed alone and failed in the full
+    # suite with an IntegrityError - and the inconsistency is worse than the bug,
+    # because it means the suite enforces different rules depending on order.
+    #
+    # Turning it on always means the tests exercise the constraints the deployed
+    # database actually has: the composite agent/org keys, the dedupe uniqueness, and
+    # the foreign keys that make a fabricated row impossible.
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "connect")
+    def _enforce_foreign_keys(dbapi_connection, _record):  # pragma: no cover - driver hook
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     session = sessionmaker(bind=engine, future=True)()
     return engine, session
 

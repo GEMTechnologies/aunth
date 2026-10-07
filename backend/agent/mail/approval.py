@@ -434,12 +434,18 @@ class ApprovalService:
         whether it is authorised, so "the approval still matches" is answered in one
         place rather than three.
         """
+        # Either a person approved it, or the policy engine cleared it for
+        # unattended sending. Both are authorisations, and both are bound to the
+        # fingerprint - so the one question the send path asks ("is this authorised
+        # as it currently stands?") has one answer regardless of which produced it.
         approval = self.db.execute(
             select(models.MailApproval).where(
                 models.MailApproval.send_intent_id == intent.id,
                 models.MailApproval.org_id == self.org_id,
                 models.MailApproval.status == models.MailApproval.STATUS_ACTIVE,
-                models.MailApproval.decision == models.MailApproval.APPROVE,
+                models.MailApproval.decision.in_(
+                    [models.MailApproval.APPROVE, models.MailApproval.AUTONOMOUS_POLICY]
+                ),
             ).order_by(models.MailApproval.approved_at.desc())
         ).scalars().first()
         if approval is None:

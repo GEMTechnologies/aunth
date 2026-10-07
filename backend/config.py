@@ -234,6 +234,14 @@ class Settings(BaseSettings):
     #: sweep, so a large organisation cannot fill the batch.
     fleet_per_agent_limit: int = 25
 
+    # -- Autonomous mail (Phase 7c) ---------------------------------------
+    #: THE KILL SWITCH for unattended outbound mail. Defaults to **off**, so the
+    #: capability is inert on every deployment until somebody turns it on
+    #: deliberately. An operator can stop every autonomous send in the fleet with this
+    #: one setting, which matters at 3am when there is no time to audit which
+    #: organisations opted in.
+    autonomous_mail_enabled: bool = False
+
     # -- Validators -------------------------------------------------------
     @field_validator("log_level")
     @classmethod

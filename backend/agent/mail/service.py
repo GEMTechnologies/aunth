@@ -1799,6 +1799,33 @@ class GranadaMail:
             models.MailSendIntent.status == models.MailSendIntent.HIGH_RISK_BLOCKED,
         )
 
+        # -- Phase 7c: how many went out without a person ----------------
+        # Counted from the approval rows rather than from a counter, so the number a
+        # customer sees is the same number the daily ceiling is enforced against.
+        autonomous_sent = count(
+            models.MailApproval,
+            models.MailApproval.org_id == self.org_id,
+            models.MailApproval.decision == models.MailApproval.AUTONOMOUS_POLICY,
+            models.MailApproval.approved_at >= midnight,
+        )
+        try:
+            from agent.mail.autonomy import platform_autonomy_enabled
+
+            platform_autonomy = platform_autonomy_enabled()
+        except Exception:  # noqa: BLE001 - an unreadable setting is off, not on
+            platform_autonomy = False
+        agent_row = self.db.execute(
+            select(models.GranadaAgent).where(
+                models.GranadaAgent.id == self.agent_id,
+                models.GranadaAgent.org_id == self.org_id,
+            )
+        ).scalars().first()
+        organisation_autonomy = bool(
+            (agent_row.settings or {}).get("autonomous_mail_enabled")
+            if agent_row is not None
+            else False
+        )
+
         return {
             "mail_accounts": accounts,
             # -- outbound ------------------------------------------------
@@ -1812,6 +1839,14 @@ class GranadaMail:
             "mail_reauth_required": reauth,
             "bounces": bounced,
             "high_risk_blocked": high_risk_blocked,
+            # -- autonomous sending (Phase 7c) ---------------------------
+            "autonomous_sent_today": autonomous_sent,
+            # Both flags, deliberately. "Why is my agent not sending by itself?" has
+            # two possible answers - the platform switch and the organisation's own
+            # opt-in - and a panel that reported one number would send an operator
+            # looking in the wrong place.
+            "autonomous_platform_enabled": platform_autonomy,
+            "autonomous_organisation_enabled": organisation_autonomy,
             "emails_received_today": received,
             "emails_processed_today": processed,
             "emails_unlinked": unlinked,

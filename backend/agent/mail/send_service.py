@@ -201,6 +201,11 @@ class SendService:
         documents: Any = (),
         known_donor_domains: Any = (),
         known_donors: Any = (),
+        autonomous: bool = False,
+        classification: Optional[str] = None,
+        thread_participants: Any = (),
+        security_flags: Any = (),
+        source_message_id: Optional[str] = None,
     ) -> models.MailSendIntent:
         """Freeze a draft into an intent a human can approve.
 
@@ -328,6 +333,18 @@ class SendService:
                 **risk.as_dict(),
                 "recipient_report": recipients.as_dict(),
                 "attachment_report": attachment_report.as_dict(),
+                # The policy inputs, frozen alongside the message.
+                #
+                # The autonomous re-evaluation at send time needs them, and without
+                # them the re-evaluation would see classification=None and refuse
+                # every unattended send with NO_CLASSIFICATION. That gate fails
+                # closed, so the bug would have looked like correct caution rather
+                # than a defect - which is the kind of failure that survives review.
+                "classification": classification,
+                "thread_participants": list(thread_participants or []),
+                "known_donor_domains": list(known_donor_domains or []),
+                "security_flags": [str(f) for f in (security_flags or [])],
+                "source_message_id": source_message_id,
             },
             status=models.MailSendIntent.WAITING_FOR_APPROVAL,
             agent_version=agent.version,
@@ -349,6 +366,95 @@ class SendService:
             if winner is None:  # pragma: no cover
                 raise
             return winner
+
+        # -- Phase 7c: may this go WITHOUT a person? ----------------------
+        if autonomous:
+            # Every gate is evaluated here, at intent creation, and the decision is
+            # recorded. It is NOT re-derived later by a caller, and it is re-evaluated
+            # again at send time from live state - because the organisation can opt
+            # out, or hit its ceiling, between the two moments.
+            from agent.mail.autonomy import AutonomousPolicy
+
+            decision = AutonomousPolicy(
+                self.db, org_id=self.org_id, agent_id=self.agent_id
+            ).evaluate(
+                risk_class=risk.risk_class.value,
+                classification=classification,
+                recipients=recipients.normalised,
+                thread_participants=thread_participants,
+                known_donor_domains=known_donor_domains,
+                security_flags=security_flags,
+            )
+            if decision.allowed:
+                assert_capability(
+                    Capability.MAIL_SEND_AUTONOMOUS_LOW_RISK, policy_cleared=True
+                )
+                self.db.add(
+                    models.MailApproval(
+                        id=str(uuid.uuid4()), org_id=self.org_id, agent_id=self.agent_id,
+                        send_intent_id=intent.id,
+                        decision=models.MailApproval.AUTONOMOUS_POLICY,
+                        fingerprint=intent.message_fingerprint,
+                        risk_class=intent.risk_class,
+                        fingerprint_input=intent.fingerprint_input,
+                        # Not a person. Recorded explicitly so "who authorised this?"
+                        # never has to be inferred from the decision column.
+                        approved_by=f"policy:{intent.id}",
+                        approved_at=_now(),
+                        permission_used="mail.autonomous_policy",
+                        approval_version=1,
+                        status=models.MailApproval.STATUS_ACTIVE,
+                        policy_evidence=decision.as_dict(),
+                        note=(
+                            "authorised by the Phase 7c autonomous policy: every gate "
+                            "passed for this specific message"
+                        ),
+                    )
+                )
+                intent.status = models.MailSendIntent.APPROVED
+                intent.approved_at = _now()
+                intent.status_reason = "authorised by policy for unattended sending"
+                self.db.flush()
+                self._stage_event(
+                    event_type="mail.send_autonomous_authorised",
+                    payload={
+                        "send_intent_id": intent.id,
+                        "risk_class": intent.risk_class,
+                        "gates": decision.gate_results,
+                    },
+                )
+                self._record_activity(
+                    summary_key="mail.autonomous_authorised",
+                    structured={
+                        "send_intent_id": intent.id,
+                        "risk_class": intent.risk_class,
+                        "recipients": intent.to_addresses,
+                    },
+                    subject_id=intent.id,
+                )
+                self.db.flush()
+                return intent
+
+            # Refused. The intent still exists and still awaits a person - the gate
+            # failing means "not unattended", never "not sent at all".
+            intent.status = models.MailSendIntent.WAITING_FOR_APPROVAL
+            intent.status_reason = (
+                f"not eligible for unattended sending ({decision.code}): "
+                + "; ".join(decision.reasons)
+            )[:1000]
+            self.db.flush()
+            self._record_activity(
+                summary_key="mail.autonomous_refused",
+                structured={
+                    "send_intent_id": intent.id,
+                    "code": decision.code,
+                    "reasons": decision.reasons,
+                    "gates": decision.gate_results,
+                },
+                subject_id=intent.id,
+            )
+            self.db.flush()
+            return intent
 
         self._stage_event(
             event_type="mail.send_approval_requested",
@@ -484,6 +590,42 @@ class SendService:
         authority = self._final_authority_check(intent)
         if authority is not None:
             return None, authority
+
+        # -- an unattended authorisation is re-evaluated, not trusted -----
+        # A policy decision taken when the intent was created is a statement about
+        # the world THEN. The organisation can opt out, the ceiling can be hit, the
+        # agent can be paused and the message can be re-flagged in between. Reusing
+        # the stored decision would make every gate a one-time check, which is the
+        # same as no check for a message that sat in a queue overnight.
+        if approval.decision == models.MailApproval.AUTONOMOUS_POLICY:
+            from agent.mail.autonomy import AutonomousPolicy
+
+            reevaluated = AutonomousPolicy(
+                self.db, org_id=self.org_id, agent_id=self.agent_id
+            ).evaluate(
+                risk_class=intent.risk_class,
+                classification=(intent.risk_detail or {}).get("classification"),
+                recipients=intent.to_addresses or [],
+                thread_participants=(intent.risk_detail or {}).get("thread_participants") or [],
+                known_donor_domains=(intent.risk_detail or {}).get("known_donor_domains") or [],
+                security_flags=(intent.risk_detail or {}).get("security_flags") or [],
+            )
+            if not reevaluated.allowed:
+                intent.status = models.MailSendIntent.WAITING_FOR_APPROVAL
+                intent.status_reason = (
+                    "the autonomous authorisation is no longer valid "
+                    f"({reevaluated.code}): " + "; ".join(reevaluated.reasons)
+                )[:1000]
+                self.db.commit()
+                # `_claim` returns (intent, refusal), so the refusal is the SECOND
+                # element. Returning a bare SendResult made the caller try to unpack
+                # it and fail with a TypeError - the gate worked and the plumbing did
+                # not, which is the kind of bug that hides a working safety check.
+                return None, SendResult(
+                    intent_id=intent.id, state=intent.status, refused=True,
+                    refusal_code=f"AUTONOMOUS_REVOKED_{reevaluated.code}",
+                    detail=intent.status_reason,
+                )
 
         # -- risk, re-checked against the frozen content --------------
         if intent.risk_class in {r.value for r in HIGH_RISK_CLASSES}:

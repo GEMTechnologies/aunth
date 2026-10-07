@@ -26,6 +26,7 @@ from enum import Enum
 # send" because a list was widened in one file and not the other.
 from agent.mail.ceiling import (  # noqa: E402
     CAPABILITIES_REQUIRING_APPROVAL,
+    CAPABILITIES_REQUIRING_POLICY,
     HIGH_RISK_CLASSES,
     PHASE_7A_ALLOWED,
     PHASE_7A_FORBIDDEN,
@@ -37,6 +38,7 @@ from agent.mail.ceiling import (  # noqa: E402
     CapabilityRefused,
     ExternalActionDisabled,
     OutboundRisk,
+    PolicyRefused,
     RiskRefused,
     assert_capability,
 )
