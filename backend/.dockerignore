@@ -1,0 +1,67 @@
+# Build context exclusions for the backend image.
+#
+# WHY THIS FILE MATTERS MORE THAN IT LOOKS
+# ----------------------------------------
+# Two of these lines are security controls rather than build hygiene:
+#
+#   .env        The real environment file holds DATABASE_URL with the database password,
+#               SECRET_KEY and JWT_SECRET. Without this exclusion `COPY . /app/backend`
+#               bakes all of them into a layer, where they remain readable by anyone who
+#               can pull the image - and `docker history` will not show them because they
+#               arrive through a COPY rather than a RUN.
+#
+#   .venv/      A 500 MB virtual environment built for the host. Copying it in would
+#               roughly triple the image and shadow the one built in the builder stage.
+#
+# `.dockerignore` is also the difference between a 30-second build and a five-minute one.
+
+# -- secrets ---------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+.pgpass
+credentials.json
+
+# -- local state that must never ship -------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+pytest-of-*/
+
+# -- test and development artefacts ----------------------------------------
+tests/
+*.db
+*.sqlite
+*.sqlite3
+test.db
+
+# -- version control and tooling -------------------------------------------
+.git/
+.gitignore
+.github/
+.dockerignore
+Dockerfile
+docker-compose*.yml
+
+# -- documentation ---------------------------------------------------------
+README*
+CHANGELOG*
+docs/
+*.md
+
+# -- editors ---------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+.DS_Store
