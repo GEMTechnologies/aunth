@@ -756,13 +756,29 @@ def test_research_never_invents_donor_information(db):
 
 
 def test_research_is_versioned_not_overwritten(db):
-    """An application keeps the research version it was built against."""
+    """An application keeps the research version it was built against.
+
+    A new version is created for a **new opportunity revision**, not for every
+    call. The crash matrix forced that distinction: a worker that persists
+    research and dies before advancing its workflow is recovered and re-executes
+    the step, and if research appended on every call that recovery would leave two
+    versions for one revision with no way for a proposal to know which it used.
+    """
     org = _org(db)
     service = _provision(db, org)
     opportunity = _opportunity(db)
     research_service = DonorResearchService(db, service.get())
 
     first = research_service.research(opportunity)
+    db.commit()
+
+    # The recovered job re-runs the same revision: same record, no duplicate.
+    assert research_service.research(opportunity).id == first.id
+    db.commit()
+    assert len(research_service.history(opportunity.id)) == 1
+
+    # A material change to the opportunity is a NEW revision, so it appends.
+    opportunity.version += 1
     db.commit()
     second = research_service.research(opportunity)
     db.commit()
@@ -773,6 +789,7 @@ def test_research_is_versioned_not_overwritten(db):
     history = research_service.history(opportunity.id)
     assert [r.version for r in history] == [1, 2]
     assert history[0].donor_identity == history[1].donor_identity
+    assert history[1].opportunity_version > history[0].opportunity_version
 
 
 def test_research_knows_when_it_is_stale(db):

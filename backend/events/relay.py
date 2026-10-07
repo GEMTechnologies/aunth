@@ -122,7 +122,24 @@ class OutboxRelay:
             self.db.commit()
             logger.info("outbox.relay.drained", extra={"published": published})
         else:
-            self.db.rollback()
+            # COMMIT the failure bookkeeping, and do not roll it back.
+            #
+            # This was a real defect: the previous version rolled back when
+            # nothing published, which discarded the `attempts += 1` and
+            # `last_error` it had just recorded. Two consequences, both bad.
+            # `max_attempts` became unreachable for publish failures, so the
+            # "stop hammering and log abandoned" path could never fire during an
+            # outage; and an operator inspecting the outbox saw attempts=0 for an
+            # event that had been failing for hours, which reads as "fine".
+            #
+            # The rollback was presumably there to avoid committing a partial
+            # batch, but a failed publish changes nothing except the counters -
+            # and those are exactly what must survive.
+            self.db.commit()
+            logger.warning(
+                "outbox.relay.nothing_published",
+                extra={"pending": len(self.pending())},
+            )
         return published
 
     def _fields(self, event: models.OutboxEvent) -> dict[str, Any]:

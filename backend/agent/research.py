@@ -153,11 +153,24 @@ class DonorResearchService:
         application_id: Optional[str] = None,
         eligibility: Optional[dict[str, Any]] = None,
     ) -> models.DonorResearch:
-        """Produce and persist a new research version.
+        """Produce and persist research, idempotent per opportunity revision.
 
-        A new version is always created rather than the current one being updated:
-        the version an existing application used has to survive.
+        **Crash recovery is why this is idempotent.** A worker that persists
+        research and then dies before advancing the workflow will have its job
+        recovered and re-executed. If research always appended, that recovery
+        would leave *two* versions for one opportunity revision - and downstream a
+        proposal could not tell which one it was built on.
+
+        So: if a version already exists for this opportunity revision and this
+        agent, it is returned rather than duplicated. A genuinely *new* revision
+        still appends, because that is the change-detection case rather than the
+        retry case.
         """
+        existing = self.current(opportunity.id)
+        current_version = getattr(opportunity, "version", 1) or 1
+        if existing is not None and (existing.opportunity_version or 0) == current_version:
+            return existing
+
         result = self.build(opportunity, eligibility=eligibility)
         return self.persist(result, opportunity, application_id=application_id)
 

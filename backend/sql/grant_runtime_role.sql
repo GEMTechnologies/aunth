@@ -72,7 +72,8 @@ DECLARE
 BEGIN
     FOREACH evidence_table IN ARRAY ARRAY[
         'jobs', 'job_attempts', 'model_invocations', 'org_facts', 'documents',
-        'decision_records', 'application_transitions'
+        'decision_records', 'application_transitions', 'agent_activity',
+        'donor_research'
     ]
     LOOP
         IF EXISTS (
@@ -80,10 +81,10 @@ BEGIN
              WHERE table_schema = 'public' AND table_name = evidence_table
         ) THEN
             EXECUTE format('REVOKE DELETE ON TABLE %I FROM granada_app', evidence_table);
-            -- The append-only trail must not be editable either. A history a
-            -- caller can rewrite is worse than no history, because it looks
-            -- authoritative.
-            IF evidence_table = 'application_transitions' THEN
+            -- Append-only tables must not be editable either. A history or an
+            -- evidence record a caller can rewrite is worse than none, because it
+            -- looks authoritative.
+            IF evidence_table IN ('application_transitions', 'agent_activity', 'donor_research') THEN
                 EXECUTE format('REVOKE UPDATE ON TABLE %I FROM granada_app', evidence_table);
             END IF;
         END IF;

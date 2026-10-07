@@ -103,7 +103,13 @@ def _aware(value: Optional[datetime]) -> Optional[datetime]:
 
 @dataclass
 class AgentStatus:
-    """Exactly what the customer sees. Named fields, not prose."""
+    """Exactly what the customer sees. Named fields, not prose.
+
+    Every figure is a real count over a real table. ``emails_handled_today`` and
+    ``applications_submitted`` are structurally zero until Phases 7 and 8 exist,
+    and they are **shown as zero rather than omitted** - a dashboard that hides a
+    missing capability is a dashboard that implies it.
+    """
 
     agent_id: str
     display_name: str
@@ -112,11 +118,29 @@ class AgentStatus:
     autonomy: str
     #: "Active 24/7" is a claim; this is the evidence for it.
     last_active_at: Optional[datetime]
-    opportunities_scanned_today: int
-    applications_in_progress: int
-    emails_handled_today: int
-    actions_requiring_you: int
-    active_workflows: int
+    #: Distinguishing these two matters: a failed attempt must not read as work
+    #: that succeeded.
+    last_successful_work: Optional[datetime] = None
+    last_attempted_work: Optional[datetime] = None
+
+    opportunities_evaluated_today: int = 0
+    hard_rule_rejects: int = 0
+    matches: int = 0
+    strong_matches: int = 0
+    applications_created: int = 0
+    research_completed: int = 0
+    waiting_for_data: int = 0
+    waiting_for_approval: int = 0
+    active_workflows: int = 0
+    failed_workflows: int = 0
+
+    #: Kept for the original panel's shape, and both stay zero until their
+    #: features exist.
+    applications_in_progress: int = 0
+    emails_handled_today: int = 0
+    applications_submitted: int = 0
+    actions_requiring_you: int = 0
+    opportunities_scanned_today: int = 0
     next_wake_at: Optional[datetime] = None
 
     @property
@@ -130,14 +154,30 @@ class AgentStatus:
             "vertical": self.vertical,
             "status": self.status,
             "autonomy": self.autonomy,
-            "last_active_at": self.last_active_at.isoformat() if self.last_active_at else None,
-            "opportunities_scanned_today": self.opportunities_scanned_today,
+            "last_active_at": _iso(self.last_active_at),
+            "last_successful_work": _iso(self.last_successful_work),
+            "last_attempted_work": _iso(self.last_attempted_work),
+            "opportunities_evaluated_today": self.opportunities_evaluated_today,
+            "hard_rule_rejects": self.hard_rule_rejects,
+            "matches": self.matches,
+            "strong_matches": self.strong_matches,
+            "applications_created": self.applications_created,
+            "research_completed": self.research_completed,
+            "waiting_for_data": self.waiting_for_data,
+            "waiting_for_approval": self.waiting_for_approval,
+            "active_workflows": self.active_workflows,
+            "failed_workflows": self.failed_workflows,
             "applications_in_progress": self.applications_in_progress,
             "emails_handled_today": self.emails_handled_today,
+            "applications_submitted": self.applications_submitted,
             "actions_requiring_you": self.actions_requiring_you,
-            "active_workflows": self.active_workflows,
-            "next_wake_at": self.next_wake_at.isoformat() if self.next_wake_at else None,
+            "opportunities_scanned_today": self.opportunities_scanned_today,
+            "next_wake_at": _iso(self.next_wake_at),
         }
+
+
+def _iso(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if value else None
 
 
 class GranadaAgentService:
@@ -474,67 +514,117 @@ class GranadaAgentService:
         Every number here is a real count over a real table. Nothing is
         estimated, and nothing is a placeholder: a status panel that flatters the
         agent is worse than no panel, because the customer makes decisions on it.
+
+        ``emails_handled_today`` and ``applications_submitted`` are counted from
+        the tables that would hold them, so they read **zero** until Phases 7 and 8
+        populate those tables - rather than being absent, which would let the UI
+        imply the capability exists.
         """
         agent = self.require()
         moment = today or _now()
         midnight = moment.replace(hour=0, minute=0, second=0, microsecond=0)
 
-        scanned = self.db.execute(
-            select(func.count(models.OpportunityMatch.id)).where(
-                models.OpportunityMatch.org_id == self.org_id,
-                models.OpportunityMatch.computed_at >= midnight,
+        def count(model, *conditions) -> int:
+            return int(
+                self.db.execute(
+                    select(func.count(model.id)).where(*conditions)
+                ).scalar() or 0
             )
-        ).scalar() or 0
 
-        in_progress = self.db.execute(
-            select(func.count(models.Application.id)).where(
-                models.Application.org_id == self.org_id,
-                models.Application.closed_at.is_(None),
-            )
-        ).scalar() or 0
+        # -- matching, from the machine-written resource summaries ------------
+        # Read from agent_activity rather than re-deriving from opportunity_matches,
+        # because the activity ledger is the *record of what the agent did* and the
+        # panel should report the agent's work, not a parallel computation that
+        # could disagree with it.
+        evaluated = count(
+            models.AgentActivity,
+            models.AgentActivity.org_id == self.org_id,
+            models.AgentActivity.occurred_at >= midnight,
+            models.AgentActivity.summary_key.in_(
+                ["match.passed", "match.rejected_by_rule", "match.needs_data"]
+            ),
+        )
+        rejected = count(
+            models.AgentActivity,
+            models.AgentActivity.org_id == self.org_id,
+            models.AgentActivity.occurred_at >= midnight,
+            models.AgentActivity.summary_key == "match.rejected_by_rule",
+        )
+        research_done = count(
+            models.AgentActivity,
+            models.AgentActivity.org_id == self.org_id,
+            models.AgentActivity.summary_key == "research.completed",
+        )
 
-        # Mail landed in Phase 7; the count is over the durable classification
-        # record rather than invented, so it reads 0 until mail exists.
-        emails = self.db.execute(
-            select(func.count(models.DecisionRecord.id)).where(
-                models.DecisionRecord.organisation_id == self.org_id,
-                models.DecisionRecord.decision_type == "email_triage",
-                models.DecisionRecord.created_at >= midnight,
-            )
-        ).scalar() or 0
+        matches = count(
+            models.OpportunityMatch,
+            models.OpportunityMatch.org_id == self.org_id,
+            models.OpportunityMatch.state == models.OpportunityMatch.MATCHED,
+        )
+        # "Strong" is deliberately a high semantic score rather than merely a
+        # passed gate: everything in that table already passed the gates, so a
+        # count of them would be the same number twice.
+        strong = count(
+            models.OpportunityMatch,
+            models.OpportunityMatch.org_id == self.org_id,
+            models.OpportunityMatch.state == models.OpportunityMatch.MATCHED,
+            models.OpportunityMatch.semantic_score >= 0.85,
+        )
+        waiting_data = count(
+            models.OpportunityMatch,
+            models.OpportunityMatch.org_id == self.org_id,
+            models.OpportunityMatch.state == models.OpportunityMatch.NEEDS_DATA,
+        )
 
-        # "Actions requiring you": everything parked on a human, counted from the
-        # records that park things rather than from a separate tally that could
-        # drift out of agreement with them.
-        approvals = self.db.execute(
-            select(func.count(models.Application.id)).where(
-                models.Application.org_id == self.org_id,
-                models.Application.state.in_(["WAITING_FOR_APPROVAL", "RESPONSE_WAITING_APPROVAL"]),
-            )
-        ).scalar() or 0
-        needs_data = self.db.execute(
-            select(func.count(models.OpportunityMatch.id)).where(
-                models.OpportunityMatch.org_id == self.org_id,
-                models.OpportunityMatch.state == models.OpportunityMatch.NEEDS_DATA,
-            )
-        ).scalar() or 0
-        escalated = self.db.execute(
-            select(func.count(models.DecisionRecord.id)).where(
-                models.DecisionRecord.organisation_id == self.org_id,
-                models.DecisionRecord.shadow.is_(False),
-                models.DecisionRecord.policy_outcome.is_(False),
-            )
-        ).scalar() or 0
+        applications = count(
+            models.Application, models.Application.org_id == self.org_id
+        )
+        in_progress = count(
+            models.Application,
+            models.Application.org_id == self.org_id,
+            models.Application.closed_at.is_(None),
+        )
+        submitted = count(
+            models.Application,
+            models.Application.org_id == self.org_id,
+            models.Application.submitted_at.isnot(None),
+        )
+        pending_approval = count(
+            models.Application,
+            models.Application.org_id == self.org_id,
+            models.Application.state.in_(
+                ["WAITING_FOR_APPROVAL", "RESPONSE_WAITING_APPROVAL"]
+            ),
+        )
 
-        active_workflows = self.db.execute(
-            select(func.count(models.AgentWorkflow.id)).where(
-                models.AgentWorkflow.agent_id == agent.id,
-                models.AgentWorkflow.state.in_(
-                    [models.AgentWorkflow.PENDING, models.AgentWorkflow.RUNNING,
-                     models.AgentWorkflow.WAITING, models.AgentWorkflow.BLOCKED]
-                ),
-            )
-        ).scalar() or 0
+        # Mail lands in Phase 7; counted from the table that will hold it, so it
+        # is honestly zero rather than invented.
+        emails = count(
+            models.DecisionRecord,
+            models.DecisionRecord.organisation_id == self.org_id,
+            models.DecisionRecord.decision_type == "email_triage",
+            models.DecisionRecord.created_at >= midnight,
+        )
+        escalated = count(
+            models.DecisionRecord,
+            models.DecisionRecord.organisation_id == self.org_id,
+            models.DecisionRecord.shadow.is_(False),
+            models.DecisionRecord.policy_outcome.is_(False),
+        )
+
+        active_workflows = count(
+            models.AgentWorkflow,
+            models.AgentWorkflow.agent_id == agent.id,
+            models.AgentWorkflow.state.in_(
+                [models.AgentWorkflow.PENDING, models.AgentWorkflow.RUNNING,
+                 models.AgentWorkflow.WAITING, models.AgentWorkflow.BLOCKED]
+            ),
+        )
+        failed_workflows = count(
+            models.AgentWorkflow,
+            models.AgentWorkflow.agent_id == agent.id,
+            models.AgentWorkflow.state == models.AgentWorkflow.FAILED,
+        )
 
         next_wake = self.db.execute(
             select(func.min(models.AgentWorkflow.next_run_at)).where(
@@ -546,6 +636,22 @@ class GranadaAgentService:
             )
         ).scalar()
 
+        # Successful versus attempted work, from the ledger's own attempt records
+        # rather than from the job's current state - a job that failed and was then
+        # requeued is both.
+        last_success = self.db.execute(
+            select(func.max(models.JobAttempt.finished_at))
+            .select_from(models.JobAttempt)
+            .join(models.Job, models.Job.id == models.JobAttempt.job_id)
+            .where(models.Job.agent_id == agent.id, models.JobAttempt.outcome == "SUCCEEDED")
+        ).scalar()
+        last_attempt = self.db.execute(
+            select(func.max(models.JobAttempt.started_at))
+            .select_from(models.JobAttempt)
+            .join(models.Job, models.Job.id == models.JobAttempt.job_id)
+            .where(models.Job.agent_id == agent.id)
+        ).scalar()
+
         return AgentStatus(
             agent_id=agent.id,
             display_name=agent.display_name,
@@ -553,10 +659,22 @@ class GranadaAgentService:
             status=agent.status,
             autonomy=agent.autonomy,
             last_active_at=_aware(agent.last_active_at),
-            opportunities_scanned_today=int(scanned),
-            applications_in_progress=int(in_progress),
-            emails_handled_today=int(emails),
-            actions_requiring_you=int(approvals + needs_data + escalated),
-            active_workflows=int(active_workflows),
+            last_successful_work=_aware(last_success),
+            last_attempted_work=_aware(last_attempt),
+            opportunities_evaluated_today=evaluated,
+            hard_rule_rejects=rejected,
+            matches=matches,
+            strong_matches=strong,
+            applications_created=applications,
+            research_completed=research_done,
+            waiting_for_data=waiting_data,
+            waiting_for_approval=pending_approval,
+            active_workflows=active_workflows,
+            failed_workflows=failed_workflows,
+            applications_in_progress=in_progress,
+            emails_handled_today=emails,
+            applications_submitted=submitted,
+            actions_requiring_you=int(pending_approval + waiting_data + escalated),
+            opportunities_scanned_today=evaluated,
             next_wake_at=_aware(next_wake) if next_wake else None,
         )

@@ -834,11 +834,27 @@ def test_runtime_role_cannot_delete_the_ledger_or_the_evidence(pg_engine):
                         f"{role} holds {privilege} on application_transitions; an "
                         "append-only history must not be rewritable"
                     )
-                for privilege in ("SELECT", "INSERT"):
-                    assert conn.execute(
-                        text("SELECT has_table_privilege(:r, :t, :p)"),
-                        {"r": role, "t": f'"{schema}".application_transitions', "p": privilege},
-                    ).scalar(), f"{role} cannot {privilege} the history it must write"
+                # -- the append-only records ------------------------------
+                # History and evidence. A trail its own subject can rewrite is
+                # worse than no trail, because it looks authoritative. UPDATE is
+                # refused here as well as DELETE, and that is asserted separately
+                # because these are the tables where the difference matters.
+                for append_only in (
+                    "application_transitions", "agent_activity", "donor_research",
+                ):
+                    for privilege in ("UPDATE", "DELETE", "TRUNCATE"):
+                        assert not conn.execute(
+                            text("SELECT has_table_privilege(:r, :t, :p)"),
+                            {"r": role, "t": f'"{schema}".{append_only}', "p": privilege},
+                        ).scalar(), (
+                            f"{role} holds {privilege} on {append_only}; an "
+                            "append-only record must not be rewritable"
+                        )
+                    for privilege in ("SELECT", "INSERT"):
+                        assert conn.execute(
+                            text("SELECT has_table_privilege(:r, :t, :p)"),
+                            {"r": role, "t": f'"{schema}".{append_only}', "p": privilege},
+                        ).scalar(), f"{role} cannot {privilege} {append_only}"
         finally:
             engine.dispose()
     finally:

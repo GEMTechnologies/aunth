@@ -562,11 +562,22 @@ def test_the_status_panel_counts_real_work(service, db, org):
         created_at=datetime.now(timezone.utc),
     ))
     service.schedule(workflow_type="pursuit", subject_id=str(uuid.uuid4()))
+    # The panel counts what the AGENT DID, from the activity ledger, rather than
+    # re-deriving it from matches. A parallel computation could disagree with the
+    # record of work, and then two screens would show the customer different
+    # numbers - so the panel reports the record.
+    db.add(models.AgentActivity(
+        agent_id=service.get().id, org_id=org.id, specialist_key="MATCHER",
+        activity_type="match", summary_key="match.passed",
+        occurred_at=datetime.now(timezone.utc),
+    ))
     db.commit()
 
     status = service.status()
+    assert status.opportunities_evaluated_today == 1
     assert status.opportunities_scanned_today == 1
     assert status.applications_in_progress == 1
+    assert status.applications_created == 1
     assert status.actions_requiring_you >= 1, "an approval waiting did not show as an action"
     assert status.active_workflows == 1
 
@@ -608,6 +619,11 @@ def test_the_status_panel_is_scoped_to_one_organisation(service, db, org):
         state="WAITING_FOR_APPROVAL", version=1,
         created_at=datetime.now(timezone.utc),
     ))
+    db.add(models.AgentActivity(
+        agent_id=other_service.get().id, org_id=other.id, specialist_key="MATCHER",
+        activity_type="match", summary_key="match.needs_data",
+        occurred_at=datetime.now(timezone.utc),
+    ))
     db.commit()
 
     mine = service.status()
@@ -615,11 +631,13 @@ def test_the_status_panel_is_scoped_to_one_organisation(service, db, org):
 
     # Ours: nothing. Theirs: everything. Every counted field is asserted, so a
     # missing org_id filter on any one of them fails here.
+    assert mine.opportunities_evaluated_today == 0
     assert mine.opportunities_scanned_today == 0
     assert mine.applications_in_progress == 0
     assert mine.actions_requiring_you == 0
     assert mine.active_workflows == 0
 
+    assert theirs.opportunities_evaluated_today == 1
     assert theirs.opportunities_scanned_today == 1
     assert theirs.applications_in_progress == 1
     assert theirs.actions_requiring_you >= 1

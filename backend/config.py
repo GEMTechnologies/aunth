@@ -224,6 +224,16 @@ class Settings(BaseSettings):
     typesafe_base_url: str = ""
     typesafe_default_model: str = "jev-latest"
 
+    # -- Fleet dispatcher (Phase 6d) --------------------------------------
+    # One fleet-level loop, NOT one timer per agent. Ten thousand organisations
+    # are ten thousand rows in one query, not ten thousand scheduled tasks.
+    fleet_dispatch_interval_seconds: int = 15
+    #: Bounded per sweep, so the loop cannot load the whole table.
+    fleet_dispatch_batch_size: int = 200
+    #: Fairness cap: how many workflows one agent may have dispatched in a single
+    #: sweep, so a large organisation cannot fill the batch.
+    fleet_per_agent_limit: int = 25
+
     # -- Validators -------------------------------------------------------
     @field_validator("log_level")
     @classmethod
