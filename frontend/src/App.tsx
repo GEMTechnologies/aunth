@@ -3,12 +3,11 @@ import AuthPage from './pages/AuthPage';
 import ProfilePage from './pages/ProfilePage';
 import OrganizationPage from './pages/OrganizationPage';
 import SecurityPage from './pages/SecurityPage';
-import { apiMe } from './lib/api';
+import { apiMe, apiLogout, restoreSession } from './lib/api';
 import './index.css';
 
 // Assume these components are defined elsewhere and handle context selection and routing
-import ContextRouter from './components/ContextRouter'; // Placeholder for ContextRouter component
-import ContextPicker from './components/ContextPicker'; // Placeholder for ContextPicker component
+import ContextRouter from './components/ContextRouter'; // Resolves which context a user lands in
 
 type Page = 'auth' | 'profile' | 'organizations' | 'security';
 
@@ -35,10 +34,17 @@ function App() {
     checkAuth();
   }, []);
 
+  /**
+   * On boot there is no token in memory: credentials are not persisted to
+   * localStorage. The session is therefore re-established from the HttpOnly
+   * refresh cookie, which the browser sends without the page having to hold it.
+   * A visitor with no cookie simply lands on the auth page, which is not an
+   * error worth logging.
+   */
   const checkAuth = async () => {
     try {
-      const token = localStorage.getItem('access_token');
-      if (!token) {
+      const restored = await restoreSession();
+      if (!restored) {
         setLoading(false);
         return;
       }
@@ -47,8 +53,6 @@ function App() {
       setUser(userData);
       setCurrentPage('profile');
     } catch (error) {
-      localStorage.removeItem('access_token');
-      localStorage.removeItem('refresh_token');
       console.error('Auth check failed:', error);
     } finally {
       setLoading(false);
@@ -60,9 +64,8 @@ function App() {
     setShowContextRouter(true);
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem('access_token');
-    localStorage.removeItem('refresh_token');
+  const handleLogout = async () => {
+    await apiLogout();
     setUser(null);
     setCurrentPage('auth');
     setCurrentContext(null); // Reset context on logout
@@ -89,9 +92,12 @@ function App() {
     return <AuthPage onLogin={handleLogin} />;
   }
 
-  // Render ContextPicker if user is logged in and context needs to be selected
+  // Gate the app on context resolution. This is ContextRouter, not
+  // ContextPicker: ContextRouter resolves which context the user should land in
+  // from the account itself, which is what a returning user needs. ContextPicker
+  // is an interactive list and has never been wired up here.
   if (showContextRouter && user) {
-    return <ContextPicker user={user} onContextResolved={handleContextResolved} />;
+    return <ContextRouter user={user} onContextResolved={handleContextResolved} />;
   }
 
   // Render main application if context is resolved or not needed
@@ -148,16 +154,16 @@ function App() {
 
       {/* Page Content */}
       <main className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
-        {/* Render ContextRouter if a context is selected, otherwise render the specific page */}
-        {currentContext ? (
-          <ContextRouter currentContext={currentContext} user={user} />
-        ) : (
-          <>
-            {currentPage === 'profile' && <ProfilePage user={user} onUserUpdate={setUser} />}
-            {currentPage === 'organizations' && <OrganizationPage />}
-            {currentPage === 'security' && <SecurityPage user={user} />}
-          </>
-        )}
+        {/* The resolved context is recorded on state; it is not a reason to
+            re-enter context resolution, which is what this used to do. Once
+            `handleContextResolved` had fired, every page under this nav was
+            replaced by ContextRouter, so the application appeared to vanish
+            the moment it finished signing in. */}
+        <>
+          {currentPage === 'profile' && <ProfilePage user={user} onUserUpdate={setUser} />}
+          {currentPage === 'organizations' && <OrganizationPage user={user} />}
+          {currentPage === 'security' && <SecurityPage user={user} />}
+        </>
       </main>
     </div>
   );

@@ -22,7 +22,7 @@ non-development environments and rejected when they still hold their default.
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -71,6 +71,27 @@ class Settings(BaseSettings):
     access_token_ttl_min: int = 30
     refresh_token_ttl_days: int = 30
     token_rotation: bool = True
+
+    # -- Refresh token delivery -------------------------------------------
+    # "body"  -> refresh_token travels in the JSON response. Correct for
+    #            first-party API and CLI clients that must hold the credential.
+    # "cookie"-> refresh_token is set as an HttpOnly cookie and OMITTED from
+    #            the JSON body. Required for browser clients: a token in
+    #            localStorage is readable by any script that manages to run on
+    #            the origin, so XSS becomes credential theft.
+    refresh_token_delivery: str = "body"
+
+    refresh_token_cookie_name: str = "granada_refresh"
+    #: Scoped to the auth surface so the credential is not attached to every
+    #: request the browser makes to this origin, including static assets.
+    refresh_token_cookie_path: str = "/api/v1/auth"
+    #: "lax" is correct when the SPA is served from the same site as this API.
+    #: "none" is required when they are on different sites, and browsers drop
+    #: a SameSite=None cookie unless it is also Secure -- guarded at startup.
+    refresh_token_cookie_samesite: str = "lax"
+    #: Must be True for SameSite=None, and for any non-localhost deployment.
+    refresh_token_cookie_secure: bool = False
+    refresh_token_cookie_domain: Optional[str] = None
 
     # -- Password hashing (Argon2id) --------------------------------------
     argon2_memory: int = 65536  # 64 MB
@@ -179,6 +200,48 @@ class Settings(BaseSettings):
 
         if len(self.jwt_secret) < 32:
             raise ValueError("jwt_secret must be at least 32 characters")
+        return self
+
+    @field_validator("refresh_token_delivery")
+    @classmethod
+    def _known_delivery(cls, value: str) -> str:
+        mode = (value or "").strip().lower()
+        if mode not in {"body", "cookie"}:
+            raise ValueError(
+                f"REFRESH_TOKEN_DELIVERY must be 'body' or 'cookie', got {value!r}. "
+                "'body' is correct for API clients; 'cookie' is required for "
+                "browser clients."
+            )
+        return mode
+
+    @field_validator("refresh_token_cookie_samesite")
+    @classmethod
+    def _known_samesite(cls, value: str) -> str:
+        mode = (value or "").strip().lower()
+        if mode not in {"lax", "strict", "none"}:
+            raise ValueError(
+                f"REFRESH_TOKEN_COOKIE_SAMESITE must be lax, strict or none, got {value!r}"
+            )
+        return mode
+
+    @model_validator(mode="after")
+    def _reject_cookie_delivery_that_browsers_will_drop(self) -> "Settings":
+        """Fail on cookie settings the browser silently ignores.
+
+        A SameSite=None cookie without Secure is discarded by every current
+        browser. The symptom is a login that appears to work and a refresh that
+        fails a minute later with "Missing or invalid refresh token" -- with no
+        hint that the cookie was the reason. Failing at startup converts a
+        confusing runtime failure into a clear one.
+        """
+        if self.refresh_token_delivery != "cookie":
+            return self
+        if self.refresh_token_cookie_samesite == "none" and not self.refresh_token_cookie_secure:
+            raise ValueError(
+                "REFRESH_TOKEN_COOKIE_SAMESITE=none requires "
+                "REFRESH_TOKEN_COOKIE_SECURE=true; browsers drop the cookie "
+                "otherwise and every refresh will fail."
+            )
         return self
 
 

@@ -73,7 +73,11 @@ class SessionResponse(BaseModel):
 
 class TokenResponse(BaseModel):
     access_token: str
-    refresh_token: str
+    #: Optional because in REFRESH_TOKEN_DELIVERY=cookie mode this credential is
+    #: delivered as an HttpOnly cookie and deliberately omitted from the body, so
+    #: that it is unreachable from JavaScript. A browser client that finds it
+    #: null should call /auth/refresh with credentials included.
+    refresh_token: Optional[str] = None
     token_type: str = "Bearer"
     expires_in: int
     user: UserResponse
@@ -124,7 +128,8 @@ class UserCreate(BaseModel):
 
 class TokenPair(BaseModel):
     access_token: str
-    refresh_token: str
+    #: Optional in cookie delivery mode; see TokenResponse.refresh_token.
+    refresh_token: Optional[str] = None
     token_type: str = "Bearer"
     expires_in: int = 15 * 60  # 15 minutes default
 

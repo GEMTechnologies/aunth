@@ -1,5 +1,5 @@
 from typing import Optional, Dict, Any, List
-from fastapi import HTTPException, status, Depends, APIRouter
+from fastapi import HTTPException, status, Depends, APIRouter, Response
 from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -10,7 +10,14 @@ import logging
 
 import models, schemas
 from config import settings
-from security import generate_secure_token, create_access_token, create_refresh_token, hash_token
+from security import (
+    generate_secure_token,
+    create_access_token,
+    create_refresh_token,
+    hash_token,
+    set_refresh_cookie,
+    refresh_token_in_cookie,
+)
 from database import get_db
 from models import User, OAuthState, OAuthAccount, AuditLog, OAuthAuthCode
 
@@ -518,6 +525,10 @@ class CodeExchangeRequest(BaseModel):
 async def exchange_oauth_code(
     payload: CodeExchangeRequest,
     db: Session = Depends(get_db),
+    # Annotated Response is injected by FastAPI regardless of the default. The
+    # default exists because tests call this handler directly rather than over
+    # HTTP, and a required parameter here would break those calls positionally.
+    response: Response = None,
 ):
     """Trade a one-time redirect code for the tokens it stands for.
 
@@ -563,9 +574,16 @@ async def exchange_oauth_code(
     pair = SessionService.issue_tokens(db, user, session_record)
     db.commit()
 
+    # The OAuth redirect returns to the browser carrying only the one-time code;
+    # this exchange is the first point at which a credential can be issued, so it
+    # honours the same cookie policy as password login. The redirect URL has no
+    # way to carry a token, and must not be able to.
+    if refresh_token_in_cookie() and response is not None:
+        set_refresh_cookie(response, pair.refresh_token)
+
     return {
         "access_token": pair.access_token,
-        "refresh_token": pair.refresh_token,
+        "refresh_token": None if refresh_token_in_cookie() else pair.refresh_token,
         "token_type": "bearer",
         "expires_in": settings.access_token_ttl_min * 60,
     }

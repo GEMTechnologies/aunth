@@ -426,3 +426,76 @@ def decode_token(token: str, expected_type: str = "access") -> Dict[str, Any]:
             f"Expected token type '{expected_type}', got '{payload.get('type')}'"
         )
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Refresh-token delivery
+# ---------------------------------------------------------------------------
+# A refresh token in localStorage is readable by any script that runs on the
+# origin, so a single XSS becomes permanent credential theft: the token is
+# long-lived (30 days), rotates, and the attacker can replay it from elsewhere.
+# Delivering it as an HttpOnly cookie removes it from the JavaScript reach of the
+# page entirely. The access token stays in JS memory because it must be attached
+# to every request; it is short-lived and re-obtainable from the cookie.
+#
+# This is opt-in via REFRESH_TOKEN_DELIVERY=cookie so that first-party API and
+# CLI clients, which have no cookie jar to rely on, keep working unchanged.
+
+
+def refresh_token_in_cookie() -> bool:
+    """True when refresh tokens are delivered as an HttpOnly cookie."""
+    return settings.refresh_token_delivery == "cookie"
+
+
+def set_refresh_cookie(response: Any, token: str) -> None:
+    """Attach the refresh token to ``response`` as an HttpOnly cookie."""
+    response.set_cookie(
+        key=settings.refresh_token_cookie_name,
+        value=token,
+        max_age=settings.refresh_token_ttl_days * 24 * 60 * 60,
+        path=settings.refresh_token_cookie_path,
+        domain=settings.refresh_token_cookie_domain,
+        secure=settings.refresh_token_cookie_secure,
+        httponly=True,
+        samesite=settings.refresh_token_cookie_samesite,
+    )
+
+
+def clear_refresh_cookie(response: Any) -> None:
+    """Remove the refresh cookie.
+
+    The attributes must match those used when setting it, or the browser treats
+    this as a different cookie and silently keeps the original. In particular
+    omitting ``secure`` or ``samesite`` here makes logout appear to do nothing.
+    """
+    response.delete_cookie(
+        key=settings.refresh_token_cookie_name,
+        path=settings.refresh_token_cookie_path,
+        domain=settings.refresh_token_cookie_domain,
+        secure=settings.refresh_token_cookie_secure,
+        httponly=True,
+        samesite=settings.refresh_token_cookie_samesite,
+    )
+
+
+def read_refresh_token(
+    cookies: Any,
+    authorization: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve a refresh token from the cookie jar, else the Bearer header.
+
+    The cookie is preferred so that a browser client cannot be forced to fall
+    back to a header value if a stale token is still present in JavaScript. The
+    header path is retained because non-browser clients have no cookie jar.
+    """
+    cookie = None
+    if cookies is not None:
+        try:
+            cookie = cookies.get(settings.refresh_token_cookie_name)
+        except Exception:
+            cookie = None
+    if cookie:
+        return cookie
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization.split(" ", 1)[1]
+    return None

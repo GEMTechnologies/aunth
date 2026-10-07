@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { apiLogin, apiRegister, apiMe, apiRefresh } from "../lib/api";
+import { apiLogin, apiRegister, apiMe, handleOAuthCallback as handleOAuthCallbackRequest } from "../lib/api";
 import SocialButton from "../components/SocialButton";
 
 type Mode = "login" | "register" | "forgotPassword";
@@ -77,12 +77,21 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
     return () => clearInterval(interval);
   }, []);
 
-  // Handle OAuth callback
+  /**
+   * Complete an OAuth sign-in.
+   *
+   * The provider redirects back with a single-use `code` in the query string
+   * and nothing else. No token has ever travelled through a URL: they would be
+   * captured by browser history, the Referer header on the next navigation,
+   * and every proxy and access log along the way. This page previously read
+   * `access_token` and `refresh_token` straight out of `window.location.search`,
+   * which was both a credential-in-URL leak and dead code, since the backend
+   * stopped emitting that shape.
+   */
   useEffect(() => {
     const handleOAuthCallback = () => {
       const urlParams = new URLSearchParams(window.location.search);
-      const accessToken = urlParams.get('access_token');
-      const refreshToken = urlParams.get('refresh_token');
+      const code = urlParams.get('code');
       const errorParam = urlParams.get('error');
 
       if (errorParam) {
@@ -90,22 +99,21 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
         return;
       }
 
-      if (accessToken && refreshToken) {
-        // Store tokens
-        localStorage.setItem('access_token', accessToken);
-        localStorage.setItem('refresh_token', refreshToken);
-
-        // Get user info and call onLogin
-        apiMe().then(user => {
-          onLogin(user);
-        }).catch(err => {
-          setError('Failed to get user information');
-          console.error('Error getting user info:', err);
-        });
-
-        // Clean up URL
-        window.history.replaceState({}, document.title, window.location.pathname);
+      if (!code) {
+        return;
       }
+
+      // Drop the code from the address bar before awaiting anything, so it
+      // cannot survive in history or leak through a later Referer header.
+      window.history.replaceState({}, document.title, window.location.pathname);
+
+      handleOAuthCallbackRequest(code)
+        .then(() => apiMe())
+        .then(user => onLogin(user))
+        .catch(err => {
+          setError('Failed to complete sign-in');
+          console.error('OAuth exchange failed:', err);
+        });
     };
 
     handleOAuthCallback();
@@ -122,20 +130,17 @@ const AuthPage: React.FC<AuthPageProps> = ({ onLogin }) => {
         if (formData.password !== formData.confirmPassword) {
           throw new Error("Passwords don't match");
         }
-        const response = await apiRegister(
+        // Three arguments: this endpoint has no "intent" concept, and passing a
+        // fourth was silently ignored by the old signature.
+        await apiRegister(
           formData.email,
           formData.password,
-          formData.displayName || "",
-          formData.intent || ""
+          formData.displayName || ""
         );
-        localStorage.setItem("access_token", response.access_token);
-        localStorage.setItem("refresh_token", response.refresh_token);
         const user = await apiMe();
         onLogin(user);
       } else if (mode === "login") {
-        const response = await apiLogin(formData.email, formData.password);
-        localStorage.setItem("access_token", response.access_token);
-        localStorage.setItem("refresh_token", response.refresh_token);
+        await apiLogin(formData.email, formData.password);
         const user = await apiMe();
         onLogin(user);
       } else if (mode === "forgotPassword") {

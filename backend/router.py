@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Header, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Header, Request, Response
 from fastapi.security import OAuth2PasswordBearer, HTTPBearer
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import text
@@ -227,6 +227,7 @@ def register(
 @router.post("/auth/login", response_model=schemas.TokenResponse, tags=["Authentication"])
 def login(
     request: Request,
+    response: Response,
     payload: schemas.LoginRequest,
     db: Session = Depends(get_db)
 ):
@@ -249,9 +250,12 @@ def login(
 
         tokens = SessionService.issue_tokens(db, user, session)
 
+        if security.refresh_token_in_cookie():
+            security.set_refresh_cookie(response, tokens.refresh_token)
+
         return schemas.TokenResponse(
             access_token=tokens.access_token,
-            refresh_token=tokens.refresh_token,
+            refresh_token=None if security.refresh_token_in_cookie() else tokens.refresh_token,
             token_type=tokens.token_type,
             expires_in=tokens.expires_in,
             user=schemas.UserResponse(
@@ -279,38 +283,63 @@ def login(
 
 @router.post("/auth/refresh", response_model=schemas.TokenPair, tags=["Authentication"])
 def refresh_token(
+    request: Request,
+    response: Response,
     authorization: Optional[str] = Header(default=None),
     db: Session = Depends(get_db)
 ):
-    """Refresh access token using refresh token"""
-    if not authorization or not authorization.lower().startswith("bearer "):
+    """Refresh access token using refresh token.
+
+    Accepts the token from the HttpOnly cookie or from an Authorization header,
+    so browser and API clients share one endpoint.
+    """
+    token = security.read_refresh_token(request.cookies, authorization)
+    if not token:
         raise HTTPException(status_code=401, detail="Missing or invalid refresh token")
 
-    refresh_token = authorization.split(" ", 1)[1]
-
     try:
-        tokens = SessionService.rotate_refresh_token(db, refresh_token)
-        return tokens
+        tokens = SessionService.rotate_refresh_token(db, token)
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Token refresh error: {str(e)}")
         raise HTTPException(status_code=401, detail="Token refresh failed")
 
+    if security.refresh_token_in_cookie():
+        # Rotate the cookie too, so the credential is single-use on both paths.
+        security.set_refresh_cookie(response, tokens.refresh_token)
+        return schemas.TokenPair(
+            access_token=tokens.access_token,
+            refresh_token=None,
+            token_type=tokens.token_type,
+            expires_in=tokens.expires_in,
+        )
+    return tokens
+
 @router.post("/auth/logout", status_code=204, tags=["Authentication"])
 def logout(
+    response: Response,
+    request: Request,
     authorization: Optional[str] = Header(default=None),
     db: Session = Depends(get_db)
 ):
-    """Logout user by revoking refresh token"""
-    if authorization and authorization.lower().startswith("bearer "):
-        refresh_token = authorization.split(" ", 1)[1]
+    """Logout user by revoking refresh token.
+
+    The cookie is always cleared, even when no token was presented: otherwise a
+    browser whose token had already been revoked server-side would keep
+    replaying a dead cookie and the UI would sit in a logged-in-looking state
+    that never refreshes.
+    """
+    refresh_token = security.read_refresh_token(request.cookies, authorization)
+    if refresh_token:
         try:
             SessionService.revoke_refresh_token(db, refresh_token)
         except Exception as e:
             logger.warning(f"Logout error: {str(e)}")
             # Don't fail logout even if token revocation fails
 
+    if security.refresh_token_in_cookie():
+        security.clear_refresh_cookie(response)
     return
 
 @router.post("/auth/logout-all", status_code=204, tags=["Authentication"])

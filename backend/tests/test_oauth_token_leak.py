@@ -63,9 +63,16 @@ def user(db):
 
 
 async def _exchange(db, code: str):
+    """Call the handler the way FastAPI would.
+
+    Keyword arguments, deliberately: a positional call here silently re-binds
+    ``db`` the moment another parameter is added to the signature, which fails
+    deep inside the handler as ``'Depends' object has no attribute 'query'``
+    rather than at the call site. It has already happened once.
+    """
     from oauth import exchange_oauth_code, CodeExchangeRequest
 
-    return await exchange_oauth_code(CodeExchangeRequest(code=code), db)
+    return await exchange_oauth_code(payload=CodeExchangeRequest(code=code), db=db)
 
 
 # ---------------------------------------------------------------------------
