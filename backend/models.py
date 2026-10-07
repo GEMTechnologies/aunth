@@ -2294,6 +2294,203 @@ class MailSendAttempt(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
     )
 
+
+class SubmissionPackage(Base):
+    """The FROZEN artefact set a human authorises before anything is submitted.
+
+    The same reasoning as ``mail_send_intents``, applied to something more
+    consequential. A submission is not "submit application 12": it is a specific set of
+    documents at specific versions, specific answers to specific questions, and a
+    specific budget. Freeze the fingerprint, and a human authorises **that**; change a
+    document, an answer or a figure, and the authorisation no longer applies.
+
+    Why this matters more than mail
+    -------------------------------
+    An email can be apologised for. A submitted application is a legally consequential
+    statement to a funder, made in the organisation's name, containing documents the
+    organisation is accountable for. Submitting the wrong version of an audited
+    statement, or a budget with a transposed digit, is not recoverable by a follow-up
+    message.
+
+    **SUBMITTED requires a receipt.** An application with no external reference is not
+    submitted; it is *possibly* submitted, and claiming otherwise is how an
+    organisation comes to believe it applied when it did not - which the workspace's
+    own docstring already says. ``receipt`` is therefore a separate table, and a state
+    transition without one is refused.
+    """
+
+    __tablename__ = "submission_packages"
+
+    DRAFT = "DRAFT"
+    AWAITING_AUTHORISATION = "AWAITING_AUTHORISATION"
+    AUTHORISED = "AUTHORISED"
+    SUBMITTING = "SUBMITTING"
+    SUBMITTED = "SUBMITTED"
+    REJECTED = "REJECTED"
+    SUPERSEDED = "SUPERSEDED"
+    WITHDRAWN = "WITHDRAWN"
+    #: The provider may or may not have received it. NEVER collapsed into a failure,
+    #: because retrying an unknown submission files a second application with the same
+    #: funder - which is worse than an email, because the funder sees two bids.
+    SUBMISSION_UNKNOWN = "SUBMISSION_UNKNOWN"
+    FAILED_FINAL = "FAILED_FINAL"
+    NEEDS_DATA = "NEEDS_DATA"
+
+    #: How the package reaches the funder.
+    #: ``HANDOFF`` prepares everything and a person submits it in the funder's own
+    #: portal. It performs no external action at all, which is why it is the mode
+    #: Phase 8 implements fully.
+    MODE_HANDOFF = "HANDOFF"
+    #: ``ADAPTER`` hands the package to a provider that submits it. Implemented against
+    #: a fake only; no real adapter exists and none may be enabled without a separate
+    #: decision.
+    MODE_ADAPTER = "ADAPTER"
+
+    TERMINAL = frozenset({SUBMITTED, REJECTED, SUPERSEDED, WITHDRAWN, FAILED_FINAL})
+    #: No further external action may be taken from these.
+    UNCERTAIN = frozenset({SUBMISSION_UNKNOWN, SUBMITTING})
+    AWAITING_DECISION = frozenset({AWAITING_AUTHORISATION})
+
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_submission_package_idempotency"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    application_id: Mapped[str] = mapped_column(String(36), index=True)
+    opportunity_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    #: SHA-256 over the canonical manifest. THE authorisation is of this value.
+    package_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    fingerprint_input: Mapped[Optional[str]] = mapped_column(Text)
+    #: {documents: [...], answers: [...], budget: {...}, organisation_profile_version}
+    manifest: Mapped[Optional[dict]] = mapped_column(JSON)
+    application_version: Mapped[Optional[int]] = mapped_column(Integer)
+
+    status: Mapped[str] = mapped_column(String(30), default=DRAFT, index=True)
+    status_reason: Mapped[Optional[str]] = mapped_column(Text)
+    submission_mode: Mapped[str] = mapped_column(String(20), default=MODE_HANDOFF, index=True)
+
+    #: The authority the package was built under, compared at submission time.
+    agent_version: Mapped[Optional[int]] = mapped_column(Integer)
+
+    target_url: Mapped[Optional[str]] = mapped_column(String(1000))
+    provider: Mapped[Optional[str]] = mapped_column(String(40), index=True)
+    provider_submission_id: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    funder_reference: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+
+    idempotency_key: Mapped[str] = mapped_column(String(255))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    authorised_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    authorised_by: Mapped[Optional[str]] = mapped_column(String(36))
+    handoff_ready_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    retry_not_before: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    failure_code: Mapped[Optional[str]] = mapped_column(String(60), index=True)
+    failure_summary: Mapped[Optional[str]] = mapped_column(Text)
+
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+
+
+class SubmissionAttempt(Base):
+    """One handover to a provider. **Append-only.**
+
+    The three outcomes are the same three as outbound mail, and for a sharper reason:
+    a timeout during submission does not mean the funder did not receive it. Filing a
+    second application because a response was lost is worse than sending a duplicate
+    email - the funder sees two bids from one organisation, and many programmes
+    disqualify both.
+    """
+
+    __tablename__ = "submission_attempts"
+
+    CONFIRMED_SUBMITTED = "CONFIRMED_SUBMITTED"
+    CONFIRMED_NOT_SUBMITTED = "CONFIRMED_NOT_SUBMITTED"
+    SUBMISSION_UNKNOWN = "SUBMISSION_UNKNOWN"
+
+    RECON_UNKNOWN = "UNKNOWN"
+    RECON_ACCEPTED = "ACCEPTED"
+    RECON_NOT_ACCEPTED = "NOT_ACCEPTED"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    package_id: Mapped[str] = mapped_column(ForeignKey("submission_packages.id"), index=True)
+
+    attempt_number: Mapped[int] = mapped_column(Integer)
+    attempt_id: Mapped[str] = mapped_column(String(64), index=True)
+    provider: Mapped[str] = mapped_column(String(40), index=True)
+    request_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
+
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer)
+
+    result: Mapped[str] = mapped_column(String(30), index=True)
+    error_code: Mapped[Optional[str]] = mapped_column(String(60), index=True)
+    safe_error_summary: Mapped[Optional[str]] = mapped_column(Text)
+    provider_submission_id: Mapped[Optional[str]] = mapped_column(String(255))
+    reconciliation_state: Mapped[str] = mapped_column(
+        String(20), default=RECON_UNKNOWN, index=True
+    )
+    reconciled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    worker_id: Mapped[Optional[str]] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class SubmissionReceipt(Base):
+    """Proof that a funder received the application.
+
+    **The workspace's rule is that ``SUBMITTED`` requires a receipt.** Without one an
+    application is *possibly* submitted, and an organisation that believes it applied
+    when it did not has lost the grant and does not know it.
+
+    A receipt is therefore evidence rather than a flag: where the acknowledgement came
+    from, what it said, and when it was captured. A receipt entered by hand and one
+    captured from a portal are both allowed, and are distinguishable - because they
+    deserve different levels of trust.
+    """
+
+    __tablename__ = "submission_receipts"
+
+    SOURCE_PORTAL = "PORTAL"
+    SOURCE_EMAIL = "EMAIL"
+    SOURCE_PROVIDER = "PROVIDER"
+    #: A person recorded it, having seen the funder's acknowledgement themselves.
+    SOURCE_MANUAL = "MANUAL"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("granada_agents.id"), index=True)
+    package_id: Mapped[str] = mapped_column(ForeignKey("submission_packages.id"), index=True)
+    application_id: Mapped[str] = mapped_column(String(36), index=True)
+
+    #: The funder's own reference. The workspace refuses SUBMITTED without one, because
+    #: a receipt with no external reference cannot be checked against anything.
+    reference: Mapped[str] = mapped_column(String(255), index=True)
+    source: Mapped[str] = mapped_column(String(20), index=True)
+    acknowledgement_text: Mapped[Optional[str]] = mapped_column(Text)
+    #: Where the evidence lives - the object store, an email id, a screenshot.
+    evidence_ref: Mapped[Optional[str]] = mapped_column(String(500))
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    captured_by: Mapped[Optional[str]] = mapped_column(String(36))
+    recorded_by_agent: Mapped[bool] = mapped_column(Boolean, default=False)
+
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)
 Index("ix_jobs_dispatch", Job.state, Job.available_at)

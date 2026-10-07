@@ -52,6 +52,21 @@ class Capability(str, Enum):
     #: name for the thing this platform does not do.
     MAIL_SEND_AUTONOMOUS_LOW_RISK = "MAIL_SEND_AUTONOMOUS_LOW_RISK"
 
+    # -- submission (Phase 8) ----------------------------------------------
+    #: Freezing a package and computing its fingerprint. Files NOTHING and acts on
+    #: nothing outside the database, so it needs no human approval - the same position
+    #: as MAIL_DRAFT. Without this distinction every attempt to even prepare an
+    #: application would demand an approval for something that has no external effect.
+    SUBMISSION_PREPARE = "SUBMISSION_PREPARE"
+    #: Preparing a handoff bundle. Files nothing either, but it names the exact
+    #: documents and answers that are to be submitted in the organisation's name, so it
+    #: requires an authorisation of the frozen package.
+    SUBMISSION_HANDOFF = "SUBMISSION_HANDOFF"
+    #: Filing through an adapter. The most consequential action in the platform.
+    SUBMISSION_HUMAN_AUTHORISED = "SUBMISSION_HUMAN_AUTHORISED"
+    #: Establishing what happened to an uncertain filing. Reads only.
+    SUBMISSION_RECONCILE = "SUBMISSION_RECONCILE"
+
     # -- forbidden, in this phase and by design ----------------------------
     MAIL_SEND = "MAIL_SEND"                       # autonomous sending
     MAIL_SEND_AUTONOMOUS = "MAIL_SEND_AUTONOMOUS"
@@ -91,11 +106,23 @@ PHASE_7B_ALLOWED: frozenset[Capability] = frozenset({
     Capability.MAIL_SEND_HUMAN_APPROVED,
     Capability.MAIL_RECONCILE_SEND,
     Capability.MAIL_SEND_AUTONOMOUS_LOW_RISK,
+    # Phase 8. `APPLICATION_SUBMISSION` and `SUBMISSION` remain FORBIDDEN: those are the
+    # names for filing without a person, and they stay forbidden.
+    Capability.SUBMISSION_PREPARE,
+    Capability.SUBMISSION_HANDOFF,
+    Capability.SUBMISSION_HUMAN_AUTHORISED,
+    Capability.SUBMISSION_RECONCILE,
 })
 
 #: Requires an approval of the exact fingerprint, checked at the call site.
 CAPABILITIES_REQUIRING_APPROVAL: frozenset[Capability] = frozenset({
     Capability.MAIL_SEND_HUMAN_APPROVED,
+    # Submitting is the most consequential thing the platform does: a filed application
+    # is a legally consequential statement to a funder, and filing twice can disqualify
+    # BOTH bids. Both submission paths that touch the outside world require an
+    # authorisation of the exact package.
+    Capability.SUBMISSION_HUMAN_AUTHORISED,
+    Capability.SUBMISSION_HANDOFF,
 })
 
 #: Capabilities that are available only when the policy engine has cleared them for
