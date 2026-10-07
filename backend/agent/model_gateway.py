@@ -475,11 +475,14 @@ class ModelGateway:
             json_mode=response_schema is not None,
         )
 
-        started = time.monotonic()
+        # perf_counter, not monotonic: Windows monotonic has ~15 ms granularity
+        # (measured: 0.0 for 20,000 of 20,000 back-to-back reads), so a fast
+        # scripted or cached call would record exactly 0 ms of latency.
+        started = time.perf_counter()
         try:
             response = self.provider.complete(request, timeout_seconds=self.timeout_seconds)
         except ModelGatewayError as exc:
-            latency_ms = int((time.monotonic() - started) * 1000)
+            latency_ms = int((time.perf_counter() - started) * 1000)
             self._record(
                 route=route, tier=tier, prompt_version=prompt_version,
                 prompt_text=safe_prompt, response_text=None, redaction=redaction,
@@ -491,7 +494,7 @@ class ModelGateway:
             )
             raise
         except Exception as exc:
-            latency_ms = int((time.monotonic() - started) * 1000)
+            latency_ms = int((time.perf_counter() - started) * 1000)
             self._record(
                 route=route, tier=tier, prompt_version=prompt_version,
                 prompt_text=safe_prompt, response_text=None, redaction=redaction,
@@ -503,7 +506,7 @@ class ModelGateway:
             )
             raise ModelCallFailed(f"{type(exc).__name__}: {exc}") from exc
 
-        latency_ms = int((time.monotonic() - started) * 1000)
+        latency_ms = int((time.perf_counter() - started) * 1000)
         cost_micros = estimate_cost_micros(
             route.model, response.input_tokens, response.output_tokens, self.prices
         )
