@@ -2,9 +2,12 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from contextlib import asynccontextmanager
 import logging
+import threading
+import os
+import asyncio
 import time
 import uuid
 
@@ -23,11 +26,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+#: Set when shutdown begins. `/readyz` consults it so a load balancer stops routing
+#: BEFORE the process stops answering - the difference between a clean drain and a burst
+#: of connection-refused errors.
+_SHUTTING_DOWN = threading.Event()
+
+#: How long to stay up after reporting unready. It must outlast the load balancer's
+#: health-check interval, or the drain accomplishes nothing; longer only delays deploys.
+GRACEFUL_SHUTDOWN_SECONDS = float(os.environ.get("GRACEFUL_SHUTDOWN_SECONDS", "5"))
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     # Startup
     logger.info("Starting Granada Authentication Service...")
+    _SHUTTING_DOWN.clear()
 
     # Create database tables
     try:
@@ -49,7 +62,29 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
-    logger.info("Shutting down Granada Authentication Service...")
+    # Shutdown. THE ORDER IS THE POINT, and it is the thing most services get wrong.
+    #
+    # 1. Mark unready FIRST. A load balancer only stops sending traffic once /readyz
+    #    answers 503, and it needs time to notice. If the process simply exits, the LB
+    #    keeps routing to it until the next health check, and every request in that
+    #    window is a connection refused - exactly the error graceful shutdown exists to
+    #    prevent.
+    # 2. Wait the drain window. Uvicorn finishes in-flight requests itself, so this only
+    #    has to outlast the LB's check interval.
+    # 3. Release the pool. Disposing the engine closes pooled connections cleanly;
+    #    leaving them to the OS produces "unexpected EOF on client connection" in the
+    #    PostgreSQL log, which looks like an incident and is not one.
+    _SHUTTING_DOWN.set()
+    logger.info("Shutdown requested; /readyz now answers 503 so a load balancer can drain")
+    await asyncio.sleep(GRACEFUL_SHUTDOWN_SECONDS)
+
+    try:
+        from database import engine as _engine
+
+        _engine.dispose()
+        logger.info("Database connection pool released")
+    except Exception as exc:  # noqa: BLE001 - shutdown must not fail on a pool error
+        logger.warning("Could not release the database pool: %s", exc)
 
 # Create FastAPI application
 app = FastAPI(
@@ -96,6 +131,42 @@ async def add_request_id(request: Request, call_next):
 
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Process-Time"] = str(process_time)
+
+    # -- security headers -------------------------------------------
+    # On EVERY response including errors, because an error page is exactly where a
+    # browser is most likely to be persuaded to do something.
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Permissions-Policy", "geolocation=(), microphone=(), camera=()"
+    )
+    # API responses carry organisation data, and a shared cache holding one tenant's
+    # response is a disclosure.
+    if request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+        response.headers.setdefault("Pragma", "no-cache")
+    if settings.app_env == "production":
+        # Production only: HSTS from a development origin pins the browser to https
+        # for localhost and breaks unrelated local work.
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+
+    # -- metrics -----------------------------------------------------
+    # The ROUTE TEMPLATE, read after routing has run, so a request to
+    # /api/v1/agent/grants/<uuid> is ONE series and not one per id.
+    try:
+        from prometheus_metrics import http_metrics
+
+        http_metrics.observe(
+            method=request.method,
+            route=http_metrics.route_label(request),
+            status_code=response.status_code,
+            seconds=process_time,
+        )
+    except Exception:  # noqa: BLE001 - metrics must never break a request
+        pass
 
     # Log request
     logger.info(
@@ -195,6 +266,18 @@ async def readiness_probe():
     transport outage into a data outage.
     """
     from health import readiness as _readiness
+    if _SHUTTING_DOWN.is_set():
+        # Unready although every dependency is healthy: this instance is going away, and
+        # the honest answer to "can it do its job" is no.
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "ready": False,
+                "status": "NOT_READY",
+                "detail": "shutting down; drain this instance",
+            },
+        )
+
 
     report = _readiness(include_redis=False)
     payload = report.as_dict()
@@ -223,6 +306,32 @@ async def deep_health():
     return payload
 
 
+@app.get("/metrics", tags=["Health"], include_in_schema=False)
+async def prometheus_metrics():
+    """Prometheus text exposition.
+
+    Unauthenticated, and deliberately so: the values are counts and ages, never data. No
+    organisation id, email address, message subject or request path appears in it, and
+    the HTTP labels come from the **route template** rather than the path - which also
+    means a scanner probing random URLs cannot create a time series per request.
+
+    When the cross-tenant operational gauges cannot be measured they are **omitted** and
+    `granada_metrics_operational_available` is 0. They are never reported as zero: a
+    backlog gauge reading 0 because the role cannot see the table is worse than no gauge
+    at all, because the alert on it never fires.
+    """
+    from prometheus_metrics import content_type as prometheus_content_type
+    from prometheus_metrics import exposition
+
+    body = exposition(metrics_url=settings.metrics_database_url)
+    # The header is set directly rather than through `media_type=`, because Starlette
+    # appends its own charset to a media type that already declares one.
+    return Response(
+        content=body,
+        headers={"Content-Type": prometheus_content_type()},
+    )
+
+
 @app.get("/api/v1/metrics", tags=["Health"])
 async def metrics():
     """Counter and gauge snapshot.
@@ -234,9 +343,14 @@ async def metrics():
     maintains by construction.
     """
     try:
-        from observability import snapshot
+        # `observability` exposes the registry as an INSTANCE, not a module-level
+        # function. The first version did `from observability import snapshot`, which
+        # raises ImportError on every call - so this endpoint answered 503 permanently
+        # and looked like a deliberate "metrics unavailable" state. Found by exercising
+        # it with traffic while testing the Prometheus endpoint beside it.
+        from observability import metrics as registry
 
-        return {"metrics": snapshot()}
+        return {"metrics": registry.snapshot()}
     except Exception as exc:  # noqa: BLE001
         logger.warning("metrics.unavailable: %s", exc)
         return JSONResponse(

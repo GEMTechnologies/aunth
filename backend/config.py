@@ -112,6 +112,20 @@ class Settings(BaseSettings):
     # -- Database / cache -------------------------------------------------
     database_url: str = "sqlite:///./test.db"
     database_echo: bool = False
+    # The connection the /metrics operational gauges are read through.
+    #
+    # DELIBERATELY SEPARATE from `database_url`, and normally unset. The operational
+    # gauges are cross-tenant counts (outbox backlog, stuck jobs, unknown submissions),
+    # and the application role is RLS-bound, so it reads ZERO rows unscoped:
+    #
+    #     app role, unscoped: outbox backlog 0, jobs 0   <- the tables are not empty
+    #
+    # A gauge computed from that reports 0 on a system whose relay died hours ago, and
+    # the alert on it never fires. So the block is either measured through a role that
+    # can read across tenants (the owner, or a BYPASSRLS metrics role - the same
+    # prerequisite as backups) or it is OMITTED and reported as unavailable. It is never
+    # reported as zero.
+    metrics_database_url: Optional[str] = None
     redis_url: str = "redis://0.0.0.0:6379/0"
 
     # -- URLs -------------------------------------------------------------
