@@ -692,6 +692,201 @@ class Document(Base):
     )
 
 
+# ---------------------------------------------------------------------------
+# Opportunity catalogue (Phase 4)
+# ---------------------------------------------------------------------------
+class Opportunity(Base):
+    """The canonical funding opportunity - successor to ``donor_opportunities``.
+
+    Compatibility is the whole point of this table, so it is stated precisely.
+
+    **Every column of the legacy ``donor_opportunities`` is preserved**, with
+    the same names and compatible types, because the legacy bot subsystem is the
+    only surviving artifact of the existing ingestion pipeline and the producer
+    contract is defined in terms of it. See ``docs/BOT_INGESTION_CONTRACT.md``.
+
+    **Both legacy UNIQUE constraints are preserved and must never be dropped:**
+
+    * ``content_hash`` - the contract's content-dedupe key. It is a
+      ``varchar(64)``: the width of a SHA-256 hex digest. **The normalisation
+      that produces it is not recoverable from anywhere**, because the legacy
+      table is empty and the producer code does not exist on this machine. It is
+      therefore treated as **opaque**: stored exactly as the producer supplies
+      it, never recomputed, never inferred. An adapter that "helpfully"
+      recomputed it would silently create duplicates of every opportunity whose
+      producer normalised differently.
+    * ``source_url`` - the same opportunity re-listed at the same URL is an
+      update, not an insert.
+
+    **Three additions**, each addressing something the legacy table cannot
+    express:
+
+    ``dedupe_fingerprint``
+        An *internal* identity that does not depend on the producer's opaque
+        hash, so the agentic pipeline can dedupe opportunities arriving from a
+        second producer or a future contract version without guessing how the
+        first one hashed. Distinct from ``content_hash`` on purpose: conflating
+        them would mean changing one silently changed the other.
+
+    ``org_id``
+        Deliberately **NULL and unused**. The funding catalogue is shared, not
+        tenant-owned - a funding opportunity published on a website belongs to
+        nobody - and the legacy table had no tenant either. Inventing one here
+        would mean every tenant re-scraped the world. Tenant scoping begins at
+        ``matches``, which is genuinely per-organisation. Recorded as ADR-0009
+        because it is a deliberate exception to "everything is tenant-scoped".
+
+    ``contract_version``
+        Which producer contract produced this row. The contract explicitly says
+        that changing the meaning of ``content_hash`` is a breaking change
+        requiring a new version, and that is only enforceable if the version is
+        recorded per row.
+    """
+
+    __tablename__ = "opportunities"
+
+    # --- legacy donor_opportunities columns, preserved ---
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    title: Mapped[str] = mapped_column(String(500))
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    deadline: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    amount_min: Mapped[Optional[int]] = mapped_column(Integer)
+    amount_max: Mapped[Optional[int]] = mapped_column(Integer)
+    currency: Mapped[Optional[str]] = mapped_column(String(10))
+    source_url: Mapped[str] = mapped_column(Text, unique=True, index=True)
+    source_name: Mapped[str] = mapped_column(String(200), index=True)
+    country: Mapped[str] = mapped_column(String(100), index=True)
+    sector: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    eligibility_criteria: Mapped[Optional[str]] = mapped_column(Text)
+    application_process: Mapped[Optional[str]] = mapped_column(Text)
+    contact_email: Mapped[Optional[str]] = mapped_column(String(200))
+    contact_phone: Mapped[Optional[str]] = mapped_column(String(50))
+    keywords: Mapped[Optional[dict]] = mapped_column(JSON)
+    focus_areas: Mapped[Optional[dict]] = mapped_column(JSON)
+    content_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    scraped_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    last_verified: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    is_verified: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    verification_score: Mapped[Optional[float]] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # --- agentic additions ---
+    dedupe_fingerprint: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    source_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    contract_version: Mapped[str] = mapped_column(String(20), default="v1", index=True)
+
+
+class OpportunityPayload(Base):
+    """The raw payload exactly as the producer delivered it.
+
+    The directive is **"never lose the original payload"**, and the legacy
+    ``donor_opportunities`` table has nowhere to put one. This is that place.
+
+    Why a separate table rather than a column: a bot's raw output is a full
+    scraped document - HTML, JSON-LD, headers - and it arrives on *every*
+    delivery, not only when something changed. Storing it inline would multiply
+    the catalogue's size by the crawl frequency and make the query-shaped
+    indexes on ``opportunities`` progressively useless.
+
+    Every delivery is recorded, including one that resulted in ``UNCHANGED``.
+    That is deliberate: the question this table answers is "what did the producer
+    actually say, and when", and a producer that suddenly starts omitting a
+    field is a defect you can only see by keeping the deliveries that changed
+    nothing.
+    """
+
+    __tablename__ = "opportunity_payloads"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    opportunity_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("opportunities.id"), index=True
+    )
+    source_url: Mapped[str] = mapped_column(Text, index=True)
+    source_name: Mapped[str] = mapped_column(String(200))
+    source_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+
+    payload: Mapped[dict] = mapped_column(JSON)  # never null, never truncated
+    payload_digest: Mapped[str] = mapped_column(String(64), index=True)
+    # The producer's own hash, opaque, stored as delivered.
+    content_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    contract_version: Mapped[str] = mapped_column(String(20), default="v1")
+
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class OpportunityChange(Base):
+    """A detected change to an already-known opportunity.
+
+    The brief requires "change detection alerting", and an alert is only useful
+    if it says what changed. A deadline moving is materially different from a
+    description being reworded: the first can invalidate an application plan,
+    the second is noise. So ``material`` is recorded rather than left to the
+    reader to infer from the field name.
+    """
+
+    __tablename__ = "opportunity_changes"
+
+    # Material changes can invalidate work in progress. An application prepared
+    # against a deadline that has since moved is worse than no application.
+    MATERIAL_FIELDS = frozenset(
+        {"deadline", "amount_min", "amount_max", "eligibility_criteria", "is_active"}
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    opportunity_id: Mapped[str] = mapped_column(ForeignKey("opportunities.id"), index=True)
+    field: Mapped[str] = mapped_column(String(80), index=True)
+    old_value: Mapped[Optional[str]] = mapped_column(Text)
+    new_value: Mapped[Optional[str]] = mapped_column(Text)
+    material: Mapped[bool] = mapped_column(Boolean, default=False)
+    detected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class IngestionJob(Base):
+    """One ingestion run - successor to ``source_ingestion_jobs``.
+
+    Preserves the legacy outcome vocabulary, which already distinguishes
+    ``opportunities_found`` ("seen") from ``opportunities_saved`` ("stored").
+    That distinction is the whole reason the table is useful: a source that is
+    reachable and yields 200 opportunities the pipeline rejects looks identical
+    to a dead source unless the two numbers are recorded separately.
+    """
+
+    __tablename__ = "ingestion_jobs"
+
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    PARTIAL = "PARTIAL"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    source_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    source_name: Mapped[str] = mapped_column(String(200), index=True)
+    country: Mapped[Optional[str]] = mapped_column(String(100))
+    query: Mapped[Optional[str]] = mapped_column(Text)
+
+    status: Mapped[str] = mapped_column(String(20), default=RUNNING, index=True)
+    opportunities_found: Mapped[int] = mapped_column(Integer, default=0)
+    opportunities_saved: Mapped[int] = mapped_column(Integer, default=0)
+    opportunities_updated: Mapped[int] = mapped_column(Integer, default=0)
+    opportunities_rejected: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+
+    contract_version: Mapped[str] = mapped_column(String(20), default="v1")
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
 # Add indexes for performance
 Index("ix_sessions_user_device", Session.user_id, Session.device_id)
 Index("ix_jobs_dispatch", Job.state, Job.available_at)
@@ -704,6 +899,15 @@ Index("ix_model_invocations_model_status", ModelInvocation.model, ModelInvocatio
 Index("ix_org_facts_current", OrgFact.org_id, OrgFact.is_current, OrgFact.key)
 Index("ix_documents_current", Document.org_id, Document.is_current, Document.doc_type)
 Index("ix_documents_expiry", Document.org_id, Document.valid_until)
+# The legacy table's query-shaped indexes, preserved: "active opportunities for
+# a country/sector ordered by deadline" is the matching and deadline-scanning
+# path the engine needs. Recreating them is not decoration - losing them would
+# turn the hot matching query into a sequential scan.
+Index("ix_opportunities_active_country_deadline", Opportunity.is_active, Opportunity.country, Opportunity.deadline)
+Index("ix_opportunities_active_sector_deadline", Opportunity.is_active, Opportunity.sector, Opportunity.deadline)
+Index("ix_opportunities_source_scraped", Opportunity.source_name, Opportunity.scraped_at)
+Index("ix_opportunity_changes_material", OpportunityChange.material, OpportunityChange.detected_at)
+Index("ix_opportunity_payloads_url_received", OpportunityPayload.source_url, OpportunityPayload.received_at)
 Index("ix_refresh_tokens_expires", RefreshToken.expires_at)
 Index("ix_audit_logs_user_event", AuditLog.user_id, AuditLog.event)
 Index("ix_oauth_accounts_user", OAuthAccount.user_id)
