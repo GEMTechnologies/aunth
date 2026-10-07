@@ -380,7 +380,12 @@ def test_append_only_tables_are_append_only_in_the_deployed_schema(pg_engine, fl
     engine = create_engine(RUNTIME_URL)
     try:
         with engine.connect() as conn:
-            for table in ("agent_activity", "donor_research", "application_transitions"):
+            # Append-only: history that can be rewritten is worse than no history,
+            # because it looks authoritative.
+            for table in (
+                "agent_activity", "donor_research", "application_transitions",
+                "mail_send_attempts", "mail_approvals",
+            ):
                 for privilege in ("UPDATE", "DELETE", "TRUNCATE"):
                     held = conn.execute(
                         text("SELECT has_table_privilege(current_user, :t, :p)"),
@@ -388,7 +393,8 @@ def test_append_only_tables_are_append_only_in_the_deployed_schema(pg_engine, fl
                     ).scalar()
                     assert not held, (
                         f"the runtime role holds {privilege} on {table} in the "
-                        "deployed schema; sql/grant_runtime_role.sql was not applied"
+                        "deployed schema; sql/grant_runtime_role.sql was not applied "
+                        "or has been made non-idempotent"
                     )
                 for privilege in ("SELECT", "INSERT"):
                     held = conn.execute(
@@ -396,6 +402,23 @@ def test_append_only_tables_are_append_only_in_the_deployed_schema(pg_engine, fl
                         {"t": table, "p": privilege},
                     ).scalar()
                     assert held, f"the runtime role cannot {privilege} {table}"
+
+            # A send intent's LIFECYCLE is not append-only: its status must advance.
+            # DELETE is still withheld, and this row exists because leaving the table
+            # out of the central REVOKE list re-granted DELETE the moment the script
+            # was re-run - found by verifying the posture AFTER applying it.
+            for privilege in ("DELETE", "TRUNCATE"):
+                held = conn.execute(
+                    text("SELECT has_table_privilege(current_user, :t, :p)"),
+                    {"t": "mail_send_intents", "p": privilege},
+                ).scalar()
+                assert not held, f"the runtime role holds {privilege} on mail_send_intents"
+            for privilege in ("SELECT", "INSERT", "UPDATE"):
+                held = conn.execute(
+                    text("SELECT has_table_privilege(current_user, :t, :p)"),
+                    {"t": "mail_send_intents", "p": privilege},
+                ).scalar()
+                assert held, f"the runtime role cannot {privilege} mail_send_intents"
 
             assert not conn.execute(
                 text("SELECT has_table_privilege(current_user, 'alembic_version', 'SELECT')")

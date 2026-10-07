@@ -73,7 +73,25 @@ BEGIN
     FOREACH evidence_table IN ARRAY ARRAY[
         'jobs', 'job_attempts', 'model_invocations', 'org_facts', 'documents',
         'decision_records', 'application_transitions', 'agent_activity',
-        'donor_research'
+        'donor_research',
+        -- Phase 7b outbound history. Added here as well as in migration 014,
+        -- because THIS script is additive and is what gets re-run: without these
+        -- entries a future run would silently hand back UPDATE and DELETE on the
+        -- append-only send history, which is the sixth occurrence of a trap that has
+        -- already bitten jobs, model_invocations, decision_records,
+        -- application_transitions, agent_activity and donor_research.
+        'mail_send_attempts', 'mail_approvals',
+        -- DELETE is withheld but UPDATE is NOT: a send intent's status must advance
+        -- from WAITING_FOR_APPROVAL to APPROVED to SENDING to SENT. Its HISTORY is
+        -- append-only; its LIFECYCLE is not.
+        --
+        -- This entry exists because leaving it out re-granted DELETE the moment the
+        -- script was re-run. It was found by verifying the posture AFTER applying the
+        -- script rather than trusting that migration 014's REVOKE still stood - which
+        -- is the only way this trap has ever been caught, and it has now caught seven
+        -- tables: jobs, model_invocations, decision_records, application_transitions,
+        -- agent_activity, donor_research and mail_send_intents.
+        'mail_send_intents'
     ]
     LOOP
         IF EXISTS (
@@ -84,7 +102,7 @@ BEGIN
             -- Append-only tables must not be editable either. A history or an
             -- evidence record a caller can rewrite is worse than none, because it
             -- looks authoritative.
-            IF evidence_table IN ('application_transitions', 'agent_activity', 'donor_research') THEN
+            IF evidence_table IN ('application_transitions', 'agent_activity', 'donor_research', 'mail_send_attempts', 'mail_approvals') THEN
                 EXECUTE format('REVOKE UPDATE ON TABLE %I FROM granada_app', evidence_table);
             END IF;
         END IF;
