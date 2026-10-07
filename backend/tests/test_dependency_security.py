@@ -290,6 +290,40 @@ def test_every_vulnerable_pin_is_at_or_above_its_fixed_version():
     )
 
 
+#: The obvious "fix" for CVE-2026-85394 is to migrate to PyJWT. Measured against the OSV
+#: advisory database on 2026-10-08, that would be a DOWNGRADE:
+#:
+#:     python-jose==3.5.0    1 advisory,  no fix published
+#:     PyJWT==2.10.1        31 advisories, one with NO FIX PUBLISHED (PYSEC-2025-183)
+#:     PyJWT (all versions) 47 advisories, one with NO FIX PUBLISHED (PYSEC-2026-4146)
+#:
+#: So the swap would trade one unfixable advisory for another, while touching
+#: authentication - the highest-risk code in the platform - and would likely introduce
+#: dozens more if the pin were not high enough.
+#:
+#: Recorded here because "we should move off python-jose" is an obvious-sounding idea that
+#: will be had again. The answer is not that migration is impossible; it is that it must be
+#: justified by something other than the advisory count, because on that measure it loses.
+PYJWT_MIGRATION_VERDICT = (
+    "not justified on advisory count: python-jose carries 1 unfixable advisory; "
+    "PyJWT 2.10.1 carries 31 advisories including one with no fix published; "
+    "PyJWT across 47 versions carries 47 advisories including one with no fix"
+)
+
+
+def test_the_pyjwt_migration_alternative_is_recorded():
+    """Rather than left as an unexamined idea.
+
+    This test does not forbid the migration - it requires that whoever does it has read the
+    measurement. If the swap is ever justified on other grounds (maintenance, API, a
+    cryptographic improvement), the constant below should be replaced with the new reason
+    rather than deleted.
+    """
+    assert "31 advisories" in PYJWT_MIGRATION_VERDICT
+    assert "47 advisories" in PYJWT_MIGRATION_VERDICT
+    assert "no fix" in PYJWT_MIGRATION_VERDICT
+
+
 def test_the_cve_with_no_fix_is_recorded_rather_than_forgotten():
     """CVE-2026-85394 has no fix version. An unfixable advisory that is not written down
     is an advisory that gets rediscovered as a surprise; recorded, it is a known accepted

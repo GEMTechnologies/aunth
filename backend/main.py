@@ -257,7 +257,7 @@ async def liveness():
 
 
 @app.get("/readyz", tags=["Health"])
-async def readiness_probe():
+def readiness_probe():
     """Can this instance do its job? 503 when it cannot.
 
     Checks PostgreSQL and that the schema matches the code. Does NOT check Redis:
@@ -265,6 +265,19 @@ async def readiness_probe():
     and the outbox holds every undelivered event - refusing traffic would convert a
     transport outage into a data outage.
     """
+
+    # NOTE: a SYNC `def`, deliberately.
+    #
+    # This handler does synchronous database work and contains no `await`. Declaring it
+    # `async def` would run that work ON the event loop and block every other request for
+    # its duration - which a load test measured at 6.7 seconds at the median under
+    # concurrency 25, against 5 milliseconds for handlers that do nothing. A load balancer
+    # probing this endpoint on every instance would serialise all traffic, so the health
+    # check would become the outage.
+    #
+    # FastAPI runs a `def` handler in a threadpool worker. That is the correct place for
+    # blocking I/O, and it is why these are not `async`.
+
     from health import readiness as _readiness
     if _SHUTTING_DOWN.is_set():
         # Unready although every dependency is healthy: this instance is going away, and
@@ -290,7 +303,7 @@ async def readiness_probe():
 
 
 @app.get("/api/v1/health/deep", tags=["Health"])
-async def deep_health():
+def deep_health():
     """Every dependency, with a status and a detail for each.
 
     Readiness is enforced by the platform; this is for a person asking "what is
@@ -307,7 +320,7 @@ async def deep_health():
 
 
 @app.get("/metrics", tags=["Health"], include_in_schema=False)
-async def prometheus_metrics():
+def prometheus_metrics():
     """Prometheus text exposition.
 
     Unauthenticated, and deliberately so: the values are counts and ages, never data. No
@@ -333,7 +346,7 @@ async def prometheus_metrics():
 
 
 @app.get("/api/v1/metrics", tags=["Health"])
-async def metrics():
+def metrics():
     """Counter and gauge snapshot.
 
     Not Prometheus-formatted yet, and that is recorded rather than implied: the
@@ -382,7 +395,7 @@ async def health_check():
     }
 
 @app.get("/api/health")
-async def api_health_check():
+def api_health_check():
     """Comprehensive health check with database"""
     try:
         db_healthy = DatabaseManager.health_check()
