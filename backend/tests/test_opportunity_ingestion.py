@@ -25,6 +25,8 @@ BACKEND = Path(__file__).resolve().parent.parent
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
+from conftest import make_sqlite_db  # noqa: E402
+
 import models  # noqa: E402
 from agent.opportunity_ingestion import (  # noqa: E402
     CONTRACT_VERSION,
@@ -41,9 +43,10 @@ from agent.opportunity_ingestion import (  # noqa: E402
 
 @pytest.fixture
 def db(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'catalogue.db'}", future=True)
-    models.Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine, future=True)()
+    # Schema copied from a session template rather than rebuilt: create_all to a
+    # file on this filesystem costs ~3.8s per test because the schema has 38 tables
+    # and 203 indexes. See tests/conftest.py::make_sqlite_db.
+    engine, session = make_sqlite_db(tmp_path, "catalogue.db")
     try:
         yield session
     finally:

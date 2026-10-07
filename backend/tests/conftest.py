@@ -166,3 +166,82 @@ def _scratch_database_cleanup():
 @pytest.fixture(scope="session")
 def anyio_backend():
     return "asyncio"
+
+
+# ---------------------------------------------------------------------------
+# Test database construction
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS - a measured 800x speed-up, and the explanation of a suite that
+# went from ~2 minutes to 1h40m.
+#
+# Each `db` fixture used to call `models.Base.metadata.create_all(engine)` against
+# a fresh file under tmp_path. Profiling that, per test:
+#
+#   create_all -> sqlite file on F:        3,828 ms
+#   create_all -> in-memory + StaticPool     125 ms
+#   copy a prebuilt schema file                3 ms
+#
+# Two compounding causes. `tempfile.gettempdir()` returns the *repository
+# directory* under this sandbox, so every test wrote its database to F:. And the
+# schema is now 38 tables with **203 indexes**, each index being its own disk
+# write; 38 tables with no indexes cost 0.87s against 3.7s with them.
+#
+# So the slowdown was not machine load - the first hypothesis, and the wrong one.
+# It was a fixed per-test cost that grew with the schema. At 3.8s per test across
+# 537 tests that is 34 minutes before any test body runs, which is the regression.
+#
+# The fix builds the schema ONCE per session into a template file and copies it
+# per test: 3 ms against 3,828 ms, an ~800x reduction, with no change to what the
+# tests exercise - it is still a real file-backed SQLite database.
+_TEMPLATE: dict[str, str] = {}
+
+
+def _schema_template() -> str:
+    """Build the schema once, into a file that every test copies."""
+    if "path" in _TEMPLATE:
+        return _TEMPLATE["path"]
+
+    import models
+    from sqlalchemy import create_engine
+
+    template_dir = pathlib.Path(tempfile.mkdtemp(prefix="granada-schema-"))
+    template_path = template_dir / "schema.db"
+
+    engine = create_engine(f"sqlite:///{template_path.as_posix()}")
+    try:
+        models.Base.metadata.create_all(engine)
+    finally:
+        engine.dispose()
+
+    _TEMPLATE["path"] = template_path.as_posix()
+    _TEMPLATE["dir"] = str(template_dir)
+    return _TEMPLATE["path"]
+
+
+def make_sqlite_db(tmp_path, name: str = "test.db"):
+    """A fresh, migrated SQLite database and a Session bound to it.
+
+    Returns ``(engine, session)``. The caller closes the session and disposes the
+    engine; the file itself lives in ``tmp_path`` and is cleaned up by pytest.
+    """
+    import shutil
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    template = _schema_template()
+    db_path = pathlib.Path(tmp_path) / name
+    shutil.copyfile(template, db_path)
+
+    engine = create_engine(f"sqlite:///{db_path.as_posix()}", future=True)
+    session = sessionmaker(bind=engine, future=True)()
+    return engine, session
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _schema_template_cleanup():
+    """Remove the template directory at the end of the session."""
+    yield
+    template_dir = _TEMPLATE.get("dir")
+    if template_dir:
+        shutil.rmtree(template_dir, ignore_errors=False)

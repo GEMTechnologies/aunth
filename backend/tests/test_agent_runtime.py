@@ -25,6 +25,8 @@ BACKEND = Path(__file__).resolve().parent.parent
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
+from conftest import make_sqlite_db  # noqa: E402
+
 import models  # noqa: E402
 from events.ledger import JobLedger, backoff_delay  # noqa: E402
 from events.relay import Inbox, OutboxRelay  # noqa: E402
@@ -35,15 +37,10 @@ from events.relay import Inbox, OutboxRelay  # noqa: E402
 # ---------------------------------------------------------------------------
 @pytest.fixture
 def db(tmp_path):
-    """A real migrated-shaped database, isolated per test.
-
-    ``create_all`` rather than Alembic: the drift test already proves the
-    migrations and the models agree, and paying for a migration per test would
-    be paying twice for the same assurance.
-    """
-    engine = create_engine(f"sqlite:///{tmp_path / 'runtime.db'}", future=True)
-    models.Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine, future=True)()
+    # Schema copied from a session template rather than rebuilt: create_all to a
+    # file on this filesystem costs ~3.8s per test because the schema has 38 tables
+    # and 203 indexes. See tests/conftest.py::make_sqlite_db.
+    engine, session = make_sqlite_db(tmp_path, "runtime.db")
     try:
         yield session
     finally:
