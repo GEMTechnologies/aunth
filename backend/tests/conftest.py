@@ -265,3 +265,171 @@ def _schema_template_cleanup():
     template_dir = _TEMPLATE.get("dir")
     if template_dir:
         shutil.rmtree(template_dir, ignore_errors=False)
+
+
+# ---------------------------------------------------------------------------
+# Leave app.user_org_ids() pointing at a schema that exists.
+#
+# THE OUTAGE THIS PREVENTS
+# ------------------------
+# `alembic/versions/003_row_level_security.py` creates the tenant-resolution bootstrap as:
+#
+#     CREATE OR REPLACE FUNCTION app.user_org_ids(p_user_id text)
+#     ...
+#     SET search_path = {current_schema()}, pg_temp
+#     AS $$ SELECT m.org_id FROM {current_schema()}.org_members m ... $$
+#
+# Resolving from `current_schema()` is deliberate, and the migration's docstring says why: the
+# PostgreSQL tests migrate into a scratch schema, so hard-coding `public` would be wrong there.
+#
+# **But the function is a single GLOBAL object in the shared `app` schema.** The RLS tests migrate
+# with `search_path=probe_xxxxxxxx`, so `CREATE OR REPLACE` overwrites the PRODUCTION function and
+# pins it to that scratch schema - and the fixture then drops the schema.
+#
+# Measured on the live database afterwards:
+#
+#     relation "probe_e0e9e3483f.org_members" does not exist
+#
+# raised inside `get_current_user` and reported to the client as **401 "Authentication failed"**, so
+# every user was locked out and the symptom pointed at their password. 1227 tests passed throughout,
+# because each one builds its world before exercising it and none calls the function afterwards.
+#
+# WHAT THIS FIXTURE DOES
+# ----------------------
+# It cannot stop the overwrite - that happens inside a module-scoped fixture this one cannot reach
+# into. What it guarantees is that **the suite does not LEAVE the database broken**: at the end of the
+# session, if the pinned schema no longer exists, it is restored to `public`.
+#
+# It reports loudly rather than silently repairing, because a suite that quietly fixes damage it
+# caused is a suite nobody learns from.
+# ---------------------------------------------------------------------------
+
+#: The canonical definition, kept in step with migration 003 and `tools/repair_bootstrap_function.sql`.
+_BOOTSTRAP_FUNCTION_SQL = """
+CREATE FUNCTION app.user_org_ids(p_user_id text)
+RETURNS SETOF text
+LANGUAGE sql
+SECURITY DEFINER
+STABLE
+SET search_path = public, pg_temp
+AS $$
+    SELECT m.org_id
+    FROM public.org_members m
+    WHERE m.user_id = p_user_id
+      AND p_user_id IS NOT NULL
+$$;
+COMMENT ON FUNCTION app.user_org_ids(text) IS
+    'Org ids the given user belongs to. SECURITY DEFINER bootstrap helper: it exposes only '
+    'memberships the caller already owns, and never row content. Calling it proves identity, '
+    'not tenancy - the caller must still set app.current_org_id.';
+REVOKE ALL ON FUNCTION app.user_org_ids(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION app.user_org_ids(text) TO granada_app;
+"""
+
+
+def _admin_postgres_url() -> str | None:
+    """The owner URL, or None when this machine has no PostgreSQL configured."""
+    for name in ("GRANADA_ADMIN_DATABASE_URL", "DATABASE_URL"):
+        value = os.environ.get(name, "")
+        if value.startswith("postgres"):
+            return value
+    env_file = pathlib.Path(BACKEND) / ".env"
+    if not env_file.is_file():
+        return None
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        if line.startswith("GRANADA_ADMIN_DATABASE_URL="):
+            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            return value if value.startswith("postgres") else None
+    return None
+
+
+def _bootstrap_pin_is_stale(engine) -> str | None:
+    """The dead schema name if `app.user_org_ids` is pinned to a schema that does not exist."""
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT array_to_string(p.proconfig, ',') "
+                "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = 'app' AND p.proname = 'user_org_ids'"
+            )
+        ).scalar()
+        if not row or "search_path" not in row:
+            return None
+        schemas = [
+            part.strip().strip('"')
+            for part in row.split("=", 1)[1].split(",")
+            if part.strip() and part.strip() != "pg_temp"
+        ]
+        for schema in schemas:
+            present = conn.execute(
+                text("SELECT count(*) FROM pg_namespace WHERE nspname = :n"), {"n": schema}
+            ).scalar()
+            if not present:
+                return schema
+    return None
+
+
+def restore_bootstrap_function(engine) -> str | None:
+    """Re-pin `app.user_org_ids` to `public` if it is pinned to a schema that does not exist.
+
+    Returns the dead schema name it repaired, or None if nothing needed repairing.
+
+    Called from the teardown of every fixture that migrates into a scratch schema, so the function
+    is healthy for the REST of the session and not merely at the end of it. The session-scoped
+    fixture below is the backstop for anything that slips through.
+    """
+    from sqlalchemy import text
+
+    stale = _bootstrap_pin_is_stale(engine)
+    if stale is None:
+        return None
+
+    print(
+        f"\n[conftest] app.user_org_ids was pinned to {stale!r}, which no longer exists.\n"
+        "[conftest] Every authenticated request would fail with 401 'Authentication failed'.\n"
+        "[conftest] Restoring it to `public` - see tests/test_bootstrap_function.py.",
+        file=sys.stderr,
+    )
+    with engine.connect() as conn:
+        conn.execute(text("DROP FUNCTION IF EXISTS app.user_org_ids(text)"))
+        conn.execute(text(_BOOTSTRAP_FUNCTION_SQL))
+
+    remaining = _bootstrap_pin_is_stale(engine)
+    if remaining:
+        print(
+            f"[conftest] RESTORE FAILED: still pinned to {remaining!r}. "
+            "Run tools/repair_bootstrap_function.sql.",
+            file=sys.stderr,
+        )
+    else:
+        print("[conftest] app.user_org_ids restored.", file=sys.stderr)
+    return stale
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _restore_bootstrap_function_after_the_suite():
+    """Backstop: restore `app.user_org_ids` if the tests left it pinned to a dropped schema.
+
+    See the block comment above: without this, running the PostgreSQL tests locks every user out of
+    the database they ran against, and reports it as a bad password.
+    """
+    yield
+
+    url = _admin_postgres_url()
+    if not url:
+        return
+
+    try:
+        from sqlalchemy import create_engine
+    except Exception:  # pragma: no cover - import failure is not this fixture's problem
+        return
+
+    engine = create_engine(url, isolation_level="AUTOCOMMIT")
+    try:
+        restore_bootstrap_function(engine)
+    except Exception as exc:  # noqa: BLE001 - never fail a suite during teardown
+        print(f"[conftest] bootstrap-function restore failed: {exc}", file=sys.stderr)
+    finally:
+        engine.dispose()

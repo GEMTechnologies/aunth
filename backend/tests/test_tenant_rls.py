@@ -43,6 +43,16 @@ from tenant_context import (  # noqa: E402
     unscoped,
 )
 
+# Migration 003 creates `app.user_org_ids` with `SET search_path = current_schema()`, and every
+# fixture in this module migrates into a scratch schema - so each one overwrites the SHARED function
+# and pins it to a schema it then drops. A dropped pin makes every authenticated request fail with
+# 401 "Authentication failed", which reads as a bad password.
+#
+# Imported at MODULE level on purpose: an earlier version imported it inside `_real_alembic()`, which
+# made it a local of that function, and the fixture teardowns then raised NameError while trying to
+# undo the damage.
+from conftest import restore_bootstrap_function  # noqa: E402
+
 
 def _postgres_url(*names: str) -> str:
     """Read a PostgreSQL URL from the environment, then from ``.env``.
@@ -239,6 +249,13 @@ def pg_engine():
         try:
             with admin.connect() as conn:
                 conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            # Migration 003 creates app.user_org_ids with `SET search_path = current_schema()`,
+            # and this fixture migrated with `search_path="{schema}"`. So the function - a single
+            # GLOBAL object in the shared `app` schema - is now pinned to the schema just dropped,
+            # and every authenticated request would fail with 401 "Authentication failed" until it
+            # is restored. Doing it here, rather than at the end of the session, keeps the function
+            # healthy for every test that runs after this fixture.
+            restore_bootstrap_function(admin)
         finally:
             admin.dispose()
 
@@ -871,5 +888,8 @@ def test_runtime_role_cannot_delete_the_ledger_or_the_evidence(pg_engine):
         try:
             with cleanup.connect() as conn:
                 conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+            # Same reason as the RLS fixture above: this migration overwrote the shared
+            # app.user_org_ids and pinned it to the schema just dropped.
+            restore_bootstrap_function(cleanup)
         finally:
             cleanup.dispose()
