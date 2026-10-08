@@ -164,6 +164,16 @@ class Settings(BaseSettings):
     # configuration. The loopback names are always added by main.py for the healthcheck.
     allowed_hosts: str = ""
 
+    # -- Producer ingestion -------------------------------------------------
+    #
+    # The key a crawler presents as X-Bot-Key. Empty DISABLES the ingestion endpoint rather than
+    # opening it: an endpoint that writes to the shared catalogue every organisation reads must be
+    # closed by default, and a deployment that has not thought about it must not be reachable.
+    #
+    # One key for all producers today. The contract's `search_bots` table implies per-bot identity
+    # and revocation, which needs a migration - so this is the honest v1, not the finished shape.
+    ingest_bot_key: str = ""
+
     api_url: str = "http://localhost:8000"
     frontend_url: str = "http://localhost:3001"
     web_url: str = "http://0.0.0.0:3001"

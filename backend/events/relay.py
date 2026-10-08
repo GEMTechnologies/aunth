@@ -30,6 +30,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import models
+from agent import heartbeat
 from events.publisher import RedisEventPublisher
 
 logger = logging.getLogger(__name__)
@@ -402,6 +403,12 @@ class OutboxRelayRunner:
                     self.sweep_once()
                 except Exception:
                     pass  # counted and logged; the loop continues
+
+                # See agent/heartbeat.py: the relay listens on no port, so Docker's HTTP
+                # healthcheck could never succeed for this service. A completed sweep is what
+                # "alive" means here.
+                heartbeat.beat()
+
                 if max_sweeps is not None and self.health.sweeps >= max_sweeps:
                     break
                 self._sleep()

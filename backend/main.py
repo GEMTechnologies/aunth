@@ -15,6 +15,7 @@ from database import engine, Base, create_tables, DatabaseManager
 from router import router
 from oauth import router as oauth_router
 from agent_api import router as agent_router
+from ingestion_api import router as ingestion_router
 from config import settings
 
 # Configure logging
@@ -194,6 +195,45 @@ async def add_request_id(request: Request, call_next):
     return response
 
 # Exception handlers
+def _serialisable_errors(exc: RequestValidationError) -> list:
+    """`exc.errors()`, made safe to serialise.
+
+    THE DEFECT THIS FIXES, and it was system-wide rather than local.
+
+    Pydantic v2 puts the ORIGINAL EXCEPTION OBJECT in `ctx` when a custom `field_validator` raises:
+
+        {"type": "value_error", "loc": (...), "msg": "Value error, ...",
+         "input": "...", "ctx": {"error": ValueError("...")}}
+
+    `JSONResponse` serialises with `json.dumps`, which cannot encode a `ValueError`. So the handler
+    meant to explain the error raised a `TypeError` instead, the generic handler caught it, and the
+    client received **500 Internal server error** for what was a 422.
+
+    On a producer API that is the worst possible failure: a crawler sending a malformed
+    `content_hash` is told the server is broken rather than which field is wrong and why. Every
+    endpoint with a custom validator had this, not only ingestion.
+
+    `ctx` values are stringified rather than dropped, because the message is the useful part and
+    discarding it would hide the reason a delivery was refused.
+    """
+    safe = []
+    for error in exc.errors():
+        item = dict(error)
+        ctx = item.get("ctx")
+        if isinstance(ctx, dict):
+            item["ctx"] = {
+                key: (value if isinstance(value, (str, int, float, bool, type(None))) else str(value))
+                for key, value in ctx.items()
+            }
+        # `input` is whatever reached the validator; it is echoed for debugging, so it must be
+        # stringified when it is not a primitive rather than crashing the response.
+        raw_input = item.get("input")
+        if raw_input is not None and not isinstance(raw_input, (str, int, float, bool, list, dict)):
+            item["input"] = str(raw_input)
+        safe.append(item)
+    return safe
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle validation errors"""
@@ -203,7 +243,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "detail": "Validation error",
-            "errors": exc.errors(),
+            "errors": _serialisable_errors(exc),
             "request_id": getattr(request.state, "request_id", None)
         }
     )
@@ -246,6 +286,9 @@ app.include_router(oauth_router, prefix="/api/v1")
 # token, never from a path parameter, so editing a URL cannot reach another
 # organisation's correspondence.
 app.include_router(agent_router, prefix="/api/v1")
+# The producer doorway. Deliberately its own router with its own credential: a crawler is a
+# machine identity feeding the shared catalogue, not a user acting inside one tenant.
+app.include_router(ingestion_router, prefix="/api/v1")
 
 # ---------------------------------------------------------------------------
 # Liveness, readiness and metrics

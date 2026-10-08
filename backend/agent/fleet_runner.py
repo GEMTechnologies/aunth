@@ -46,6 +46,7 @@ from typing import Any, Callable, Optional
 from sqlalchemy.orm import Session
 
 import models
+from agent import heartbeat
 from agent.workflow_engine import DispatchResult, FleetDispatcher
 from observability import metrics
 
@@ -256,6 +257,13 @@ class FleetRunner:
                     pass  # already counted and logged; the loop continues
                 if self._mail_sync_due():
                     self.sync_due_mail_accounts()
+
+                # AFTER the work, and after the mail sync: the heartbeat says "a full turn
+                # completed", which is exactly what liveness means for a loop. Touching it before
+                # the sweep would report a worker alive while it was stuck inside one.
+                heartbeat.beat()
+                self.health.last_heartbeat_at = datetime.now(timezone.utc)
+
                 if max_sweeps is not None and self.health.sweeps >= max_sweeps:
                     break
                 self._sleep_until_next_sweep()
