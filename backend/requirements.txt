@@ -32,17 +32,4 @@ python-dotenv==1.2.2
 
 # --- Outbound HTTP (OAuth provider calls) ---
 httpx==0.25.2
-# --- Decision gateway (Phase 5b) ---
-# The official TypeSafe SDK, for the optional Jev decision provider.
-#
-# IMPORTANT: installing this is NOT free of consequence. It requires a newer
-# pydantic than the pins above and will upgrade the whole environment:
-#   pydantic 2.5.1 -> 2.13.5, pydantic-core 2.14.3 -> 2.46.5, anyio 3.7.1 -> 4.15.1
-# That upgrade was applied and the full suite (337 tests at the time) passed on
-# it, which is the only reason it is acceptable. It is pinned exactly so the
-# environment is reproducible rather than "whatever resolved today".
-#
-# Granada does NOT depend on it at runtime: 'agent.decision.providers.jev'
-# imports the SDK lazily and the application boots, ingests opportunities and
-# triages mail without the package and without TYPESAFE_API_KEY.
-typesafe-sdk==0.7.2
+
