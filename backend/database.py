@@ -49,6 +49,31 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor.execute("PRAGMA mmap_size=268435456")  # 256MB
     cursor.close()
 
+def _startup_options(database_url: str) -> str:
+    """The libpq `options` string for a URL, PRESERVING whatever the URL already sets.
+
+    A scoped connection carries `?options=-csearch_path%3D<schema>`, and `connect_args` take
+    precedence over the URL - so returning only the timeouts here would discard the search_path and
+    every tenant query would read `public`, where row-level security denies it.
+
+    Composing is therefore not politeness; it is what keeps tenant isolation working.
+    """
+    existing = ""
+    try:
+        from sqlalchemy.engine import make_url
+
+        existing = (make_url(database_url).query.get("options") or "").strip()
+    except Exception:  # noqa: BLE001 - a URL this exotic is not worth failing startup over
+        existing = ""
+
+    timeouts = (
+        f"-c statement_timeout={settings.database_statement_timeout_ms}"
+        f" -c idle_in_transaction_session_timeout="
+        f"{settings.database_idle_transaction_timeout_ms}"
+    )
+    return f"{existing} {timeouts}".strip() if existing else timeouts
+
+
 # Engine configuration
 engine_kwargs = {
     "pool_pre_ping": True,
@@ -63,6 +88,27 @@ if settings.database_url.startswith("sqlite"):
             "check_same_thread": False,
             "timeout": 20
         }
+    })
+else:
+    # PostgreSQL, and the bounds it had none of. See the settings for why each one exists.
+    #
+    # `options` is applied by libpq AT CONNECT, so the server enforces these from the first
+    # statement - unlike a `SET` from a connect event, which is a round trip AND is transactional,
+    # so the pool's reset would roll it back. That is the same trap `blank_tenant_on_checkout`
+    # documents.
+    #
+    # IT MUST COMPOSE, NOT REPLACE. `connect_args` override the URL's query parameters, and a
+    # scoped URL carries `?options=-csearch_path%3D<schema>` - so passing `options` here without
+    # preserving it silently drops the search_path, and every tenant query then reads `public` and
+    # is denied by row-level security. That is not hypothetical: it made the request-path isolation
+    # probe report `[]` for every tenant, i.e. an isolation test failing because isolation was
+    # applied too strictly.
+    engine_kwargs.update({
+        "pool_recycle": settings.database_pool_recycle_seconds,
+        "connect_args": {
+            "connect_timeout": settings.database_connect_timeout,
+            "options": _startup_options(settings.database_url),
+        },
     })
 
 engine = create_engine(settings.database_url, **engine_kwargs)

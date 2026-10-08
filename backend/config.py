@@ -112,6 +112,33 @@ class Settings(BaseSettings):
     # -- Database / cache -------------------------------------------------
     database_url: str = "sqlite:///./test.db"
     database_echo: bool = False
+
+    # -- Database bounds --------------------------------------------------
+    #
+    # Every one of these has a default that means "no limit", and no limit is not a neutral
+    # choice for a service. They are settings rather than constants because the right value
+    # depends on the deployment's network, and a bound nobody can tune is a bound somebody
+    # will remove.
+    #
+    # Seconds to wait for a TCP connect. libpq defaults to none, so an unreachable host blocks
+    # for the operating system's TCP timeout - minutes - and `pool_pre_ping` puts that on the
+    # path of every request that checks out a connection.
+    database_connect_timeout: int = 10
+
+    # Milliseconds a single statement may run. A BACKSTOP against a runaway query, not a
+    # performance policy: nothing legitimate on the request path takes two minutes, and without
+    # it one bad plan holds a pool slot forever.
+    database_statement_timeout_ms: int = 120_000
+
+    # Milliseconds a connection may sit idle INSIDE an open transaction. PostgreSQL defaults
+    # this to 0 - disabled - so a leaked transaction holds its locks indefinitely while every
+    # writer behind it waits.
+    database_idle_transaction_timeout_ms: int = 300_000
+
+    # Seconds after which a pooled connection is discarded rather than reused. Below the idle
+    # timeout of the NATs and load balancers these deployments sit behind, which otherwise hand
+    # back a connection that is already dead.
+    database_pool_recycle_seconds: int = 300
     # The connection the /metrics operational gauges are read through.
     #
     # DELIBERATELY SEPARATE from `database_url`, and normally unset. The operational

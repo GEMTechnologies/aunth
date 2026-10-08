@@ -309,11 +309,35 @@ def build_queries() -> list[tuple[str, str, str]]:
 
 
 def _engine_from(url: Optional[str]):
+    """The engine the operational gauges are read through.
+
+    Bounded like the application engine, and for the same reasons - but with one difference
+    worth noting: this engine is used by `/metrics`, which is **unauthenticated**. An
+    unbounded connect here would let an anonymous request block a worker for the operating
+    system's TCP timeout.
+    """
     from sqlalchemy import create_engine
 
-    if url:
+    from config import settings
+
+    if not url:
+        return None
+    if url.startswith("sqlite"):
         return create_engine(url, pool_pre_ping=True)
-    return None
+
+    from database import _startup_options
+
+    return create_engine(
+        url,
+        pool_pre_ping=True,
+        pool_recycle=settings.database_pool_recycle_seconds,
+        connect_args={
+            "connect_timeout": settings.database_connect_timeout,
+            # Composed rather than replaced, for the same reason as the application engine: a
+            # scoped URL carries a search_path in its own `options`.
+            "options": _startup_options(url),
+        },
+    )
 
 
 def operational_gauges(
