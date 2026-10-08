@@ -156,6 +156,14 @@ class Settings(BaseSettings):
     redis_url: str = "redis://0.0.0.0:6379/0"
 
     # -- URLs -------------------------------------------------------------
+    # Comma-separated hosts accepted by TrustedHostMiddleware in production.
+    #
+    # This was hardcoded in main.py to a placeholder domain, which made every request - including
+    # the container healthcheck - return 400 Invalid host header on the first real deployment.
+    # A trusted-host allowlist that cannot name the real host protects nothing, so it is
+    # configuration. The loopback names are always added by main.py for the healthcheck.
+    allowed_hosts: str = ""
+
     api_url: str = "http://localhost:8000"
     frontend_url: str = "http://localhost:3001"
     web_url: str = "http://0.0.0.0:3001"

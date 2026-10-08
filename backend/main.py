@@ -98,9 +98,24 @@ app = FastAPI(
 
 # Security middleware
 if settings.app_env == "production":
+    # THE HOST LIST IS CONFIGURATION, NOT A CONSTANT.
+    #
+    # This was hardcoded to `["*.granada.example", "granada.example"]` - a placeholder domain that
+    # no deployment owns. The effect on the first production launch was that every request,
+    # including the container's own `curl /livez` healthcheck, came back `400 Invalid host header`,
+    # so the stack reported unhealthy while being perfectly functional.
+    #
+    # It is also the correct fix rather than a workaround: a trusted-host allowlist exists to stop
+    # DNS-rebinding, and a list that cannot name the real host provides none of that protection
+    # while breaking the deployment. `ALLOWED_HOSTS` is comma-separated, and the container's own
+    # loopback name is always included because the healthcheck uses it.
+    allowed = [h.strip() for h in settings.allowed_hosts.split(",") if h.strip()]
+    for loopback in ("127.0.0.1", "localhost"):
+        if loopback not in allowed:
+            allowed.append(loopback)
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["*.granada.example", "granada.example"]
+        allowed_hosts=allowed,
     )
 
 # CORS middleware

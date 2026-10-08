@@ -54,8 +54,16 @@ FROM python:3.12-slim AS runtime
 # `tini` reaps zombies and forwards signals. Without an init, PID 1 is uvicorn, which does
 # not forward SIGTERM to its own children - so `docker stop` waits out the timeout and
 # then SIGKILLs, and the graceful shutdown this codebase implements never runs at all.
+#
+# `postgresql-client` is what provides `psql`, and the MIGRATE service cannot run without it. That
+# service narrows the runtime role's privileges and then VERIFIES the append-only posture, both with
+# `psql`. Without this package the container died with exit 127 - "command not found" - which reads
+# as a script error rather than a missing binary. The test suite has psql on the host; the image
+# never did, so it was found only on the first real deployment.
+#
+# `curl` is for the healthcheck.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tini curl \
+    && apt-get install -y --no-install-recommends tini curl postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
