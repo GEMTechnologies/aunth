@@ -210,7 +210,7 @@ def test_run_py_actually_executes_as_a_script():
         cwd=str(BACKEND),
         env={"PATH": "", "SYSTEMROOT": "C:\\Windows", "ARGON2_MEMORY": "8192",
              "ARGON2_TIME": "1", "ARGON2_PARALLELISM": "1", "APP_ENV": "test"},
-    )
+             timeout=120,)
     assert result.returncode == 0, (
         f"run.py could not be imported: stdout={result.stdout!r} stderr={result.stderr!r}"
     )
@@ -232,7 +232,7 @@ def test_run_py_honours_the_environment_port():
         cwd=str(BACKEND),
         env={"PATH": "", "SYSTEMROOT": "C:\\Windows", "ARGON2_MEMORY": "8192",
              "ARGON2_TIME": "1", "ARGON2_PARALLELISM": "1", "APP_ENV": "test"},
-    )
+             timeout=120,)
     assert result.returncode == 0, result.stderr
     assert "PORT= 9123" in result.stdout, result.stdout
 
@@ -250,6 +250,6 @@ def test_a_bad_port_value_exits_with_a_clear_message():
         cwd=str(BACKEND),
         env={"PATH": "", "SYSTEMROOT": "C:\\Windows", "ARGON2_MEMORY": "8192",
              "ARGON2_TIME": "1", "ARGON2_PARALLELISM": "1", "APP_ENV": "test"},
-    )
+             timeout=120,)
     assert result.returncode != 0
     assert "must be an integer" in (result.stdout + result.stderr)

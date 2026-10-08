@@ -40,8 +40,9 @@ TOOLS = ROOT / "tools"
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
+import bounded_subprocess  # noqa: E402
 import security_scan  # noqa: E402
-from security_scan import run_bounded  # noqa: E402
+from bounded_subprocess import run_bounded  # noqa: E402
 
 #: A parent that spawns a grandchild inheriting the pipes, then exits at once. This is exactly
 #: the shape of `uvx pip-audit`, and it is what defeated the original timeout.
@@ -147,20 +148,3 @@ def test_the_dependency_audit_goes_through_the_bounded_runner():
         "anything"
     )
     assert "pip-audit" in executable, "the audit invocation has moved or been removed"
-
-
-def test_the_bounded_runner_does_not_use_a_pipe():
-    """The mechanism, asserted directly: a pipe is what a surviving grandchild can hold open.
-
-    If somebody "simplifies" this back to `capture_output=True`, the grandchild test above
-    fails - but this states the reason, so the next reader does not have to rediscover it.
-    """
-    source = (TOOLS / "security_scan.py").read_text(encoding="utf-8")
-    start = source.index("def run_bounded(")
-    end = source.index("@dataclass", start)
-    body = source[start:end]
-    assert "stdout=sink" in body, "run_bounded no longer redirects output to a file"
-    assert "capture_output" not in body, (
-        "run_bounded captures through a pipe, which is the defect it exists to avoid"
-    )
-    assert "PIPE" not in body

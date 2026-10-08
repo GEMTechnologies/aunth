@@ -265,7 +265,7 @@ def test_no_module_references_a_missing_model_attribute():
         capture_output=True,
         text=True,
         cwd=str(BACKEND),
-    )
+        timeout=120,)
     assert result.returncode == 0, result.stdout + result.stderr
 
 

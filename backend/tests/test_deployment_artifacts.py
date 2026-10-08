@@ -116,7 +116,7 @@ def test_the_dockerfile_cmd_actually_resolves():
     env = {**os.environ, **environment}
     proc = subprocess.run(
         [sys.executable, "-c", f"import {module}"],
-        capture_output=True,
+        capture_output=True, timeout=120,
         text=True,
         env=env,
         cwd=str(BACKEND),
