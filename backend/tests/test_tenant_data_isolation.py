@@ -373,7 +373,7 @@ def test_append_only_tables_are_append_only_in_the_deployed_schema(pg_engine, fl
     migrations, which is a real deployment defect rather than a test artefact.
     """
     if not RUNTIME_URL:
-        pytest.skip("no runtime role configured; the posture is checked in DEPLOYMENT.md")
+        pytest.skip("no runtime role configured; the posture is checked in docs/DEPLOYMENT.md")
 
     from sqlalchemy import create_engine
 
