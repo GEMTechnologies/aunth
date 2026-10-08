@@ -12,8 +12,18 @@ import redis
 
 
 def main() -> int:
+    # `socket_connect_timeout` alone is not enough: it bounds the CONNECT. A Redis that accepts
+    # the connection and then stops answering needs `socket_timeout`, which redis-py otherwise
+    # leaves as None - block forever. This probe's whole job is to decide whether Redis is
+    # healthy, so a probe that hangs on a wedged Redis answers nothing.
+    r = redis.Redis(
+        host="127.0.0.1",
+        port=6379,
+        socket_connect_timeout=3,
+        socket_timeout=5,
+        decode_responses=True,
+    )
     try:
-        r = redis.Redis(host="127.0.0.1", port=6379, socket_connect_timeout=5, decode_responses=True)
         r.ping()
     except Exception as exc:  # noqa: BLE001
         print(f"REDIS UNREACHABLE: {exc}")

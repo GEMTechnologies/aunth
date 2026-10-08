@@ -85,6 +85,18 @@ class HttpxTransport:
     """
 
     def __init__(self, *, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> None:
+        # REFUSED, not defaulted. `httpx.Client(timeout=None)` means WAIT FOREVER, so a caller
+        # passing None would silently remove the bound this class exists to provide - and the
+        # request path used `timeout or self.timeout`, which turns None into None.
+        #
+        # Raising rather than substituting the default is deliberate: a caller that passed None
+        # believed it was disabling a limit, and it should find out that it cannot.
+        if timeout is None or not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError(
+                f"timeout must be a positive number of seconds, got {timeout!r}. "
+                "`None` means wait forever in httpx, which would let one hung funder API call "
+                "hold a fleet worker indefinitely."
+            )
         self.timeout = timeout
 
     def request(

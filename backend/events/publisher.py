@@ -104,6 +104,22 @@ def _encode(fields: dict[str, Any]) -> dict[str, str]:
     return encoded
 
 
+#: Seconds a single Redis SOCKET operation may take before it is abandoned.
+#:
+#: redis-py defaults this and `socket_connect_timeout` to **None**, which means *block forever*.
+#: The default is fine for a script and wrong for a service: a Redis that accepts a connection and
+#: then stops answering - which is what a wedged instance does under memory pressure, and what a
+#: restart looks like from the client side - would block `xadd` in the relay, `xreadgroup` in the
+#: fleet, and `ping` behind `/readyz`, none of which raise.
+#:
+#: Five seconds is far longer than any healthy Redis operation and far shorter than an outage.
+SOCKET_TIMEOUT_SECONDS = 5.0
+
+#: Seconds to wait for the TCP connection itself. Shorter, because a host that is not answering at
+#: all should be given up on quickly.
+SOCKET_CONNECT_TIMEOUT_SECONDS = 3.0
+
+
 class RedisEventPublisher:
     """Publishes versioned events to Redis Streams.
 
@@ -125,7 +141,16 @@ class RedisEventPublisher:
                     "redis package is not installed; cannot publish events"
                 ) from exc
             self._client = redis.Redis.from_url(
-                self._url, decode_responses=True
+                self._url,
+                decode_responses=True,
+                # Without these two, every operation on this client can block forever. See the
+                # note on SOCKET_TIMEOUT_SECONDS.
+                socket_timeout=SOCKET_TIMEOUT_SECONDS,
+                socket_connect_timeout=SOCKET_CONNECT_TIMEOUT_SECONDS,
+                # A timeout must SURFACE, not be retried indefinitely. The relay already handles
+                # an unreachable Redis by leaving the outbox durable; an infinite retry would
+                # reintroduce the block it is meant to escape.
+                retry_on_timeout=False,
             )
         return self._client
 

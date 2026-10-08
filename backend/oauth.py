@@ -4,6 +4,14 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 import httpx
+
+#: Seconds an OAuth provider may take to answer.
+#:
+#: httpx defaults to 5s, so these calls were never unbounded - but relying on a library default
+#: means the bound is invisible to a reader and changes with the library. 15s is longer than a
+#: token exchange needs and far shorter than a user's patience, and it applies to the four places
+#: this module talks to a provider.
+OAUTH_HTTP_TIMEOUT_SECONDS = 15.0
 import secrets
 from datetime import datetime, timezone, timedelta
 import logging
@@ -124,7 +132,7 @@ class GoogleOAuthProvider(OAuthProvider):
             "redirect_uri": self.redirect_uri
         }
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=OAUTH_HTTP_TIMEOUT_SECONDS) as client:
             response = await client.post(self.token_url, data=data)
 
             if response.status_code != 200:
@@ -140,7 +148,7 @@ class GoogleOAuthProvider(OAuthProvider):
         """Get user info from Google"""
         headers = {"Authorization": f"Bearer {access_token}"}
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=OAUTH_HTTP_TIMEOUT_SECONDS) as client:
             response = await client.get(self.user_info_url, headers=headers)
 
             if response.status_code != 200:
@@ -186,7 +194,7 @@ class GitHubOAuthProvider(OAuthProvider):
 
         headers = {"Accept": "application/json"}
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=OAUTH_HTTP_TIMEOUT_SECONDS) as client:
             response = await client.post(self.token_url, data=data, headers=headers)
 
             if response.status_code != 200:
@@ -205,7 +213,7 @@ class GitHubOAuthProvider(OAuthProvider):
             "Accept": "application/vnd.github.v3+json"
         }
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=OAUTH_HTTP_TIMEOUT_SECONDS) as client:
             # Get user profile
             user_response = await client.get(self.user_info_url, headers=headers)
             if user_response.status_code != 200:
