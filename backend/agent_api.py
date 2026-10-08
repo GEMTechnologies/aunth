@@ -164,9 +164,9 @@ class SendIntentReview(SendIntentSummary):
 # ---------------------------------------------------------------------------
 @router.get("", summary="Your Granada Agent")
 def agent_status(
+    user: models.User = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """The customer-facing panel: what the agent has done, and what needs a person."""
     org_id = _organisation(tenant)
@@ -241,9 +241,9 @@ class DeadlineSummary(BaseModel):
 
 @router.get("/grants", summary="Grants this organisation holds")
 def list_grants(
+    user: Any = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: Any = Depends(get_current_user),
     status_filter: Optional[str] = None,
     limit: int = 100,
 ) -> dict[str, Any]:
@@ -291,9 +291,9 @@ def list_grants(
 @router.get("/grants/{grant_id}", summary="One grant, with its obligations")
 def get_grant(
     grant_id: str,
+    user: Any = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: Any = Depends(get_current_user),
 ) -> dict[str, Any]:
     org_id = _organisation(tenant)
     require_org_access(tenant, db, org_id)
@@ -374,9 +374,9 @@ def get_grant(
 
 @router.get("/deadlines", summary="Everything with a date, soonest first")
 def list_deadlines(
+    user: Any = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: Any = Depends(get_current_user),
     within_days: int = 30,
 ) -> dict[str, Any]:
     """Conditions, reports and tranches together.
@@ -406,9 +406,9 @@ def list_deadlines(
 
 @router.get("/compliance", summary="What is at risk right now")
 def compliance(
+    user: Any = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: Any = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Blocked payments, overdue reports and late money, as three separate lists.
 
@@ -478,9 +478,9 @@ def _notification_service(db: Session, org_id: str, user_id: str):
 
 @router.get("/notifications", summary="Your notifications, most urgent first")
 def list_notifications(
+    user: Any = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: Any = Depends(get_current_user),
     unread_only: bool = True,
     limit: int = 50,
 ) -> dict[str, Any]:
@@ -517,9 +517,9 @@ def list_notifications(
 def mark_notification(
     notification_id: str,
     request: NotificationMarkRequest,
+    user: Any = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: Any = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Mark a notification.
 
@@ -546,9 +546,9 @@ def mark_notification(
 
 @router.get("/health", summary="Fleet, relay and autonomy health")
 def agent_health(
+    user: models.User = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """What an operator or a probe needs, without reading logs.
 
@@ -601,9 +601,9 @@ def agent_health(
 # ---------------------------------------------------------------------------
 @router.get("/mail/send-intents", summary="Outbound messages awaiting a decision")
 def list_send_intents(
+    user: models.User = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
     status_filter: Optional[str] = None,
     limit: int = 50,
 ) -> dict[str, Any]:
@@ -662,9 +662,9 @@ def list_send_intents(
 )
 def review_send_intent(
     intent_id: str,
+    user: models.User = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
 ) -> SendIntentReview:
     """THE approval contract.
 
@@ -896,9 +896,9 @@ def _decide(action: str, intent_id: str, db: Session, org_id: str, user_id: str,
 def approve_send_intent(
     intent_id: str,
     payload: ApprovalDecisionRequest = ApprovalDecisionRequest(),
+    user: models.User = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Authorise the exact message.
 
@@ -915,9 +915,9 @@ def approve_send_intent(
 def reject_send_intent(
     intent_id: str,
     payload: ApprovalDecisionRequest = ApprovalDecisionRequest(),
+    user: models.User = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Refuse it. Needs membership only: anyone who can see it can stop it."""
     org_id = _organisation(tenant)
@@ -929,9 +929,9 @@ def reject_send_intent(
 def request_changes_send_intent(
     intent_id: str,
     payload: ApprovalDecisionRequest = ApprovalDecisionRequest(),
+    user: models.User = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """The current intent becomes unsendable, so nobody can wave it through later."""
     org_id = _organisation(tenant)
@@ -943,9 +943,9 @@ def request_changes_send_intent(
 def cancel_send_intent(
     intent_id: str,
     payload: ApprovalDecisionRequest = ApprovalDecisionRequest(),
+    user: models.User = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Stop it before it is sent. Refuses once it is SENDING: a message already handed
     to a provider cannot be recalled, and pretending otherwise would leave a
@@ -992,9 +992,9 @@ def cancel_send_intent(
 @router.post("/mail/send-intents/{intent_id}/reconcile", summary="Find out what happened")
 def reconcile_send_intent(
     intent_id: str,
+    user: models.User = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Ask the provider what happened to an uncertain attempt.
 
@@ -1028,9 +1028,9 @@ def reconcile_send_intent(
 
 @router.get("/mail/drafts", summary="Reply drafts")
 def list_drafts(
+    user: models.User = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
     limit: int = 50,
 ) -> dict[str, Any]:
     org_id = _organisation(tenant)
@@ -1069,9 +1069,9 @@ def list_drafts(
 @router.get("/mail/drafts/{draft_id}", summary="One draft, in full")
 def get_draft(
     draft_id: str,
+    user: models.User = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
 ) -> dict[str, Any]:
     org_id = _organisation(tenant)
     require_org_access(tenant, db, org_id)
@@ -1103,9 +1103,9 @@ def get_draft(
 
 @router.get("/mail/accounts", summary="Connected and managed mailboxes")
 def list_mail_accounts(
+    user: models.User = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
-    user: models.User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Mailboxes and their status.
 

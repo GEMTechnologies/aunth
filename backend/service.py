@@ -463,6 +463,54 @@ class OrganizationService:
             # raises "Could not refresh instance". SQLite cannot catch this:
             # there are no policies there, so the row is always visible.
             db.refresh(org)
+
+            # Provision the organisation's Granada agent, HERE, while its tenant is still bound.
+            #
+            # `GranadaAgentService.provision` has said "this is called from registration" since it
+            # was written, and until now nothing outside the test suite called it. Every unit test
+            # calls `service.provision(...)` in its own setup, so all 1227 passed while the
+            # production path never created an agent - and `_agent_for()` returned None for every
+            # organisation a real customer created, making the entire agent API unreachable.
+            #
+            # This is the only place it can go. The agent row carries `org_id`, and
+            # `granada_agents` is FORCE-RLS'd, so the INSERT succeeds only inside the tenant being
+            # created - which is bound right here and cleared in the `finally` below.
+            #
+            # It must not break organisation creation: an organisation without an agent is a
+            # degraded product, but an organisation that cannot be created is no product at all. So
+            # a failure is logged and swallowed, and the agent can be provisioned later.
+            try:
+                from agent.granada_agent import GranadaAgentService
+
+                # RE-BIND THE TENANT FIRST. `db.commit()` above returned the connection to the
+                # pool, and `blank_tenant_on_checkout` clears `app.current_org_id` on the next
+                # checkout - deliberately, so no unit of work inherits a tenant it did not
+                # establish. Every table this needs is FORCE-RLS'd, so without this line
+                # `provision()` finds no organisation and raises, which the handler below would
+                # swallow and log: an agent that is silently never created.
+                set_tenant(db, org.id, owner.id)
+                GranadaAgentService(db, org.id).provision()
+
+                # `provision()` only `add`s and `flush`es; it leaves the commit to its caller,
+                # which is the right shape for a service method. Without this line the agent is
+                # inserted, flushed, and then DISCARDED when the session closes - with no error
+                # anywhere, because nothing ever tried to read it back.
+                db.commit()
+
+                # Refresh again for the same load-bearing reason as above: the commit expired
+                # every attribute on `org`, and the tenant is cleared in the `finally` below.
+                # Refreshing after that matches no row under the organisations SELECT policy.
+                db.refresh(org)
+            except Exception:  # noqa: BLE001 - org creation must not depend on this
+                logger.exception(
+                    "could not provision a Granada agent for organisation %s; the organisation "
+                    "was created and the agent can be provisioned later",
+                    org.id,
+                )
+                db.rollback()
+                # Re-read the organisation, because the rollback above discarded the refreshed
+                # instance. The row is committed; only the session state was unwound.
+                db.refresh(org)
         except Exception:
             db.rollback()
             raise

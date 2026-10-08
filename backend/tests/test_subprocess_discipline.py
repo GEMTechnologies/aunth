@@ -64,6 +64,11 @@ PIPE_ALLOWED: dict[str, str] = {
         "the same: a server launched for the duration of a measurement, drained on a thread and "
         "terminated afterwards."
     ),
+    "tools/live_journey.py": (
+        "the same shape again: it launches uvicorn for one customer journey, drains stdout on a "
+        "daemon thread, bounds the readiness wait, and terminates the process in __exit__. This "
+        "entry was added because the guard CAUGHT it - which is the guard working, not a nuisance."
+    ),
     "tools/bounded_subprocess.py": (
         "the bounded runner itself. It uses a FILE rather than a pipe in run_bounded; the "
         "Popen in kill_tree captures taskkill, which cannot outlive itself."
