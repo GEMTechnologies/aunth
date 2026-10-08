@@ -419,6 +419,42 @@ def _inspect_archive(
         ))
 
 
+#: `ScanVerdict` -> `mail_attachments.scan_status`.
+#:
+#: DECLARED rather than an if/elif chain inside a 200-line method, for the reason this whole
+#: phase exists: a chain has an `else`, so a NEW verdict would fall silently into
+#: `UNAVAILABLE` instead of raising. A dict has no `else`, and `scan_status_for` raises
+#: `KeyError` naming the verdict it does not know.
+#:
+#: Plain strings, not `models.MailAttachment.SCAN_*`. This module is deliberately free of
+#: database and network dependencies - it runs on every inbound file, and it must not be
+#: something that can be down. The bridge to the model is asserted by a test instead, which
+#: also catches a value here that the model does not define.
+SCAN_STATUS_BY_VERDICT: dict["ScanVerdict", str] = {
+    ScanVerdict.CLEAN: "CLEAN",
+    ScanVerdict.SUSPICIOUS: "SUSPICIOUS",
+    # A MATCH is not the same record as a hunch. See the note on SCAN_MALICIOUS.
+    ScanVerdict.MALICIOUS: "MALICIOUS",
+    ScanVerdict.UNAVAILABLE: "UNAVAILABLE",
+}
+
+
+def scan_status_for(verdict: "ScanVerdict", *, has_content: bool) -> str:
+    """The `scan_status` for a verdict.
+
+    `has_content` is not decoration. A CLEAN verdict with no content is not a clean file: it
+    is a file that was never supplied, and recording it as CLEAN would be the exact
+    misreading `CLEAN` must never invite. It becomes UNAVAILABLE.
+
+    Raises `KeyError` for a verdict this bridge does not know, which is the point - the
+    previous if/elif chain answered `UNAVAILABLE` for an unknown verdict, so adding one to
+    the enum would have silently downgraded every file it matched.
+    """
+    if verdict is ScanVerdict.CLEAN and not has_content:
+        return "UNAVAILABLE"
+    return SCAN_STATUS_BY_VERDICT[verdict]
+
+
 def scan_many(
     attachments: Any, *, max_bytes: int = DEFAULT_MAX_BYTES
 ) -> dict[str, ScanResult]:

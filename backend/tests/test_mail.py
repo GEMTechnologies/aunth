@@ -1263,7 +1263,7 @@ def test_a_dangerous_attachment_is_quarantined_without_download(db):
     db.commit()
 
     attachment = db.execute(select(models.MailAttachment)).scalars().one()
-    assert attachment.scan_status == models.MailAttachment.SCAN_SUSPICIOUS
+    assert attachment.scan_status == models.MailAttachment.SCAN_MALICIOUS
     assert "executable" in (attachment.scan_detail or "").lower()
     assert attachment.storage_ref is None, "a dangerous attachment was stored"
 

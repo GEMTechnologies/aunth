@@ -964,7 +964,7 @@ class GranadaMail:
                 # the limitation, and it still meant an inbound file reached
                 # `scan_status = CLEAN` without anything having looked inside it -
                 # which is precisely the reading `CLEAN` must never invite.
-                from agent.mail.scanning import ScanVerdict, scan_attachment
+                from agent.mail.scanning import ScanVerdict, scan_attachment, scan_status_for
 
                 verdict = scan_attachment(
                     content=attachment.content,
@@ -973,21 +973,27 @@ class GranadaMail:
                 )
                 digest = verdict.checksum_sha256
 
+                # THE STATUS COMES FROM A DECLARED BRIDGE, not an if/elif chain here.
+                #
+                # The chain this replaced had an `else` that meant "UNAVAILABLE", so a new
+                # ScanVerdict would have fallen into it silently - and it collapsed MALICIOUS
+                # onto SUSPICIOUS, losing the one distinction the scanner exists to make.
+                scan_status = scan_status_for(
+                    verdict.verdict, has_content=attachment.content is not None
+                )
+                codes = ", ".join(f.code for f in verdict.findings)
+
                 if verdict.verdict == ScanVerdict.MALICIOUS:
-                    scan_status = models.MailAttachment.SCAN_SUSPICIOUS
-                    codes = ", ".join(f.code for f in verdict.findings)
+                    # Not stored at all. A match is not a hunch.
                     detail = f"quarantined without storing: {codes}"[:500]
                 elif verdict.verdict == ScanVerdict.SUSPICIOUS:
-                    scan_status = models.MailAttachment.SCAN_SUSPICIOUS
-                    codes = ", ".join(f.code for f in verdict.findings)
                     detail = f"quarantined: {codes}"[:500]
                     # Stored anyway, so an operator can look at it. Quarantine means
                     # "do not use", not "pretend it never arrived".
                     if attachment.content is not None:
                         storage_ref = f"mail/{self.org_id}/quarantine/{digest}"
-                elif verdict.verdict == ScanVerdict.CLEAN and attachment.content is not None:
+                elif verdict.verdict == ScanVerdict.CLEAN:
                     storage_ref = f"mail/{self.org_id}/attachments/{digest}"
-                    scan_status = models.MailAttachment.SCAN_CLEAN
                     # The detail names the COVERAGE, never the word "safe". A reader
                     # must not be able to conclude more was checked than was.
                     detail = (
@@ -996,7 +1002,6 @@ class GranadaMail:
                         "anti-virus engine: a novel payload would not be detected."
                     )[:1000]
                 else:
-                    scan_status = models.MailAttachment.SCAN_UNAVAILABLE
                     detail = "no content was supplied by the provider in this delivery"
 
             self.db.add(

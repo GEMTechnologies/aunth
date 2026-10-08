@@ -1792,6 +1792,14 @@ class MailAttachment(Base):
     SCAN_PENDING = "PENDING"
     SCAN_CLEAN = "CLEAN"
     SCAN_SUSPICIOUS = "SUSPICIOUS"
+    #: A verdict that MATCHED something - a malware signature, an executable, a macro. Kept
+    #: distinct from SUSPICIOUS, which means the file merely looked unusual.
+    #:
+    #: These were collapsed until Phase 14, so "how many malicious attachments have we seen"
+    #: could not be answered from the database: the distinction existed only inside
+    #: `scan_detail` as free text. Quarantine behaviour is identical for both - the
+    #: difference is whether the RECORD can tell them apart afterwards.
+    SCAN_MALICIOUS = "MALICIOUS"
     SCAN_FAILED = "FAILED"
     SCAN_UNAVAILABLE = "UNAVAILABLE"
 
