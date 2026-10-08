@@ -281,10 +281,10 @@ def test_the_sleeping_ngo(db):
 
 
 def test_the_fleet_needs_no_api_key(db):
-    """The complete internal pipeline works with no Jev key and no network."""
+    """The complete internal pipeline works with no external key and no network."""
     import os
 
-    os.environ.pop("TYPESAFE_API_KEY", None)
+    
     org = _org(db)
     service = _provision(db, org)
     opportunity = _opportunity(db)

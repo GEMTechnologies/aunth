@@ -8,7 +8,7 @@ require human approval, which agent should handle this event. Those are not
 writing tasks, and using a long-form model for them is both slower and less
 reliable than asking a purpose-built decision model a typed question.
 
-Jev (TypeSafe System One) is one provider behind that seam. It is **not** the
+The local engine is one provider behind that seam. It is **not** the
 proposal writer, the researcher, the email writer, or the grant-writing model.
 Prose, synthesis and long-form reasoning stay with ordinary LLMs.
 

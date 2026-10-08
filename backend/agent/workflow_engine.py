@@ -906,7 +906,7 @@ def _handle_match(db: Session, context: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_qualify(db: Session, context: dict[str, Any]) -> dict[str, Any]:
-    """The bounded decision, through the DecisionGateway. Jev stays shadow.
+    """The bounded decision, through the DecisionGateway. The decision is recorded.
 
     The gateway is given a minimal state and typed questions, and its answer feeds
     Granada's policy - never the other way round. In SHADOW nothing it returns can
@@ -967,7 +967,7 @@ def _handle_qualify(db: Session, context: dict[str, Any]) -> dict[str, Any]:
         correlation_id=context.get("correlation_id"),
     )
 
-    # Built from settings; with JEV_ENABLED=false this is rules + no LLM, which is
+    # Built from settings; by default this is rules + local + no LLM, which is
     # the supported default. No API key is required for the fleet to work.
     gateway = build_gateway(db=db_session, settings=_settings())
     try:

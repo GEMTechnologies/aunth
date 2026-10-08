@@ -1,11 +1,11 @@
 """The deterministic rules provider.
 
 This is the baseline every other provider is measured against, and it is the
-reason the fallback story is credible: when Jev is unreachable, Granada does not
+reason the fallback story is credible: when no other provider can answer, Granada does not
 stop - it falls back to rules that were already answering these questions.
 
-It is also the honest control group. An evaluation that compares Jev against
-nothing proves nothing; the brief requires comparing Jev against a deterministic
+It is also the honest control group. An evaluation that compares a model against
+nothing proves nothing; the brief requires comparing a model against a deterministic
 baseline and an LLM, and this is the deterministic one.
 
 Everything here is a pure function of the request. No network, no model, no

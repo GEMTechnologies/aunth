@@ -585,13 +585,6 @@ def validate_configuration() -> list[ConfigProblem]:
             ))
 
     # 2. A knowledge provider selected with no credentials to reach it.
-    if getattr(settings, "jev_enabled", False) and not getattr(settings, "typesafe_api_key", None):
-        problems.append(ConfigProblem(
-            "JEV_ENABLED_WITHOUT_KEY", "warn",
-            "JEV_ENABLED is true but no TYPESAFE_API_KEY is set; the provider will be "
-            "skipped at runtime.",
-        ))
-
     # 3. A model provider selected with no key.
     provider = str(getattr(settings, "model_provider", "") or "").lower()
     if provider and provider not in ("none", "disabled", "null"):

@@ -64,7 +64,6 @@ from agent.decision.policy import (  # noqa: E402
     band_for,
 )
 from agent.decision.providers.base import BaseDecisionProvider  # noqa: E402
-from agent.decision.providers.jev import JevDecisionProvider  # noqa: E402
 from agent.decision.providers.llm import LLMDecisionProvider  # noqa: E402
 from agent.decision.providers.rules import (  # noqa: E402
     RulesDecisionProvider,
@@ -665,192 +664,28 @@ class FakeSystemOneResponse:
         self.id = id
 
 
-class FakeTypeSafeClient:
-    """Stands in for ``typesafe_sdk.TypeSafeClient``.
-
-    Records the state and questions it was given, so the mapping can be asserted
-    without a network call. Ordinary CI must never make a paid API call.
-    """
-
-    def __init__(self, response=None, error=None, **kwargs):
-        self.response = response
-        self.error = error
-        self.kwargs = kwargs
-        self.calls: list[tuple[Any, Any]] = []
-
-    def system_one(self, state, questions):
-        self.calls.append((state, questions))
-        if self.error is not None:
-            raise self.error
-        return self.response
 
 
-def test_jev_provider_is_unavailable_without_a_key():
-    """Granada must boot with no TypeSafe key configured."""
-    provider = JevDecisionProvider(api_key="")
-    assert provider.available is False
-    with pytest.raises(DecisionProviderUnavailable):
-        provider.decide(triage_request(), timeout_seconds=5)
 
 
-def test_jev_provider_maps_granada_types_to_the_sdk(monkeypatch):
-    """The mapping is the only place vendor class names may appear.
-
-    Asserted against the SDK's real published surface: ``Noul`` for the
-    boolean-like type, ``Choice`` with ``criteria`` for a closed set, and
-    ``Score`` with ``criteria`` for a bounded number. The SDK details that are
-    easy to get wrong - the type is ``Noul``, not ``Bool``, and answers come back
-    from three separate collections - are exactly what this checks.
-    """
-    typesafe_sdk = pytest.importorskip("typesafe_sdk")
-
-    captured: dict[str, Any] = {}
-
-    class Noul:
-        def __init__(self, **kwargs):
-            captured.setdefault("noul", []).append(kwargs)
-
-    class Choice:
-        def __init__(self, **kwargs):
-            captured.setdefault("choice", []).append(kwargs)
-
-    class Score:
-        def __init__(self, **kwargs):
-            captured.setdefault("score", []).append(kwargs)
-
-    monkeypatch.setattr(typesafe_sdk, "Noul", Noul, raising=False)
-    monkeypatch.setattr(typesafe_sdk, "Choice", Choice, raising=False)
-    monkeypatch.setattr(typesafe_sdk, "Score", Score, raising=False)
-
-    provider = JevDecisionProvider(api_key="test-key")
-    request = DecisionRequest(
-        decision_type="test",
-        questions=(
-            DecisionQuestion("yes_no", QuestionType.BOOLEAN, "is it?"),
-            DecisionQuestion("pick", QuestionType.CHOICE, "which?", ("A", "B")),
-            DecisionQuestion("rate", QuestionType.SCORE, "how much?", minimum=1, maximum=3),
-        ),
-        state={"note": "hello"},
-    )
-    provider.build_questions(request)
-
-    assert len(captured["noul"]) == 1
-    assert captured["choice"][0]["criteria"] == {"A": None, "B": None}
-    assert captured["score"][0]["criteria"] == ["1", "2", "3"]
 
 
-def test_jev_provider_reads_answers_from_the_type_specific_collections():
-    response = FakeSystemOneResponse(
-        nouls={"worth_researching": FakeNoul(True)},
-        choices={"strategic_fit": FakeChoice("HIGH")},
-    )
-    client = FakeTypeSafeClient(response=response)
-    provider = JevDecisionProvider(
-        api_key="k", client_factory=lambda **kwargs: client
-    )
-    result = provider.decide(triage_request(), timeout_seconds=5)
-
-    assert result.provider == "jev"
-    assert result.value("worth_researching") is True
-    assert result.value("strategic_fit") == "HIGH"
-    assert result.model == "jev-latest"
-    assert result.raw_provider_reference == "resp-1"
 
 
-def test_jev_reports_no_confidence_when_the_sdk_gives_none():
-    """The documented surface has no per-answer confidence.
-
-    So the provider must report None rather than assume, and the policy engine
-    must treat that as LOW. Fabricating a confidence here is how an unmeasured
-    provider would earn authority.
-    """
-    response = FakeSystemOneResponse(nouls={"worth_researching": FakeNoul(True)})
-    provider = JevDecisionProvider(
-        api_key="k", client_factory=lambda **kwargs: FakeTypeSafeClient(response=response)
-    )
-    result = provider.decide(triage_request(), timeout_seconds=5)
-    assert result.confidence is None
-    assert result.answers["worth_researching"].confidence is None
 
 
-def test_jev_reports_a_confidence_when_the_sdk_supplies_one():
-    response = FakeSystemOneResponse(
-        nouls={"worth_researching": FakeNoul(True, confidence=0.96)}
-    )
-    provider = JevDecisionProvider(
-        api_key="k", client_factory=lambda **kwargs: FakeTypeSafeClient(response=response)
-    )
-    result = provider.decide(triage_request(), timeout_seconds=5)
-    assert result.confidence == 0.96
-    assert band_for(result.confidence) == ConfidenceBand.VERY_HIGH
 
 
-def test_jev_uses_the_lowest_reported_confidence():
-    """The weakest answer bounds the decision, not the strongest."""
-    response = FakeSystemOneResponse(
-        nouls={"worth_researching": FakeNoul(True, confidence=0.99)},
-        choices={"strategic_fit": FakeChoice("HIGH", confidence=0.55)},
-    )
-    provider = JevDecisionProvider(
-        api_key="k", client_factory=lambda **kwargs: FakeTypeSafeClient(response=response)
-    )
-    assert provider.decide(triage_request(), timeout_seconds=5).confidence == 0.55
 
 
-def test_jev_rejects_an_answer_outside_the_option_set():
-    """Granada's own validation runs on provider output, not a provider's."""
-    response = FakeSystemOneResponse(choices={"strategic_fit": FakeChoice("EXTREMELY_HIGH")})
-    provider = JevDecisionProvider(
-        api_key="k", client_factory=lambda **kwargs: FakeTypeSafeClient(response=response)
-    )
-    with pytest.raises(InvalidDecisionResult):
-        # read_answers validates against Granada's question definitions.
-        provider.decide(triage_request(), timeout_seconds=5)
 
 
-def test_jev_raises_rather_than_returning_a_partial_answer():
-    response = FakeSystemOneResponse()  # nothing readable
-    provider = JevDecisionProvider(
-        api_key="k", client_factory=lambda **kwargs: FakeTypeSafeClient(response=response)
-    )
-    with pytest.raises(InvalidDecisionResult):
-        provider.decide(triage_request(), timeout_seconds=5)
 
 
-def test_jev_normalises_sdk_exceptions_into_one_retryable_type():
-    """The SDK's exception hierarchy is not something Granada depends on."""
-    provider = JevDecisionProvider(
-        api_key="k",
-        client_factory=lambda **kwargs: FakeTypeSafeClient(error=RuntimeError("rate limited")),
-    )
-    with pytest.raises(DecisionProviderError) as excinfo:
-        provider.decide(triage_request(), timeout_seconds=5)
-    assert "rate limited" in str(excinfo.value)
 
 
-def test_jev_minimises_the_state_it_sends():
-    """References and redaction, not the organisation's whole file."""
-    client = FakeTypeSafeClient(response=FakeSystemOneResponse(
-        nouls={"worth_researching": FakeNoul(True)}
-    ))
-    provider = JevDecisionProvider(api_key="k", client_factory=lambda **kwargs: client)
-    request = triage_request()
-    request.state["contact"] = "email jane.doe@example.org about it"
-    provider.decide(request, timeout_seconds=5)
-
-    state_sent = client.calls[0][0]
-    assert "jane.doe@example.org" not in str(state_sent), "an email address was sent unredacted"
 
 
-def test_jev_is_never_asked_to_write_prose():
-    """A docstring is not enforcement, so the request shape is asserted.
-
-    Every question Granada can express is BOOLEAN, CHOICE or SCORE - there is no
-    free-text question type - which is what makes 'do not ask Jev to write' a
-    property of the type system rather than a convention.
-    """
-    assert QuestionType.ALL == {"BOOLEAN", "CHOICE", "SCORE"}
-    assert "FREE_TEXT" not in QuestionType.ALL
 
 
 # ---------------------------------------------------------------------------
@@ -927,17 +762,6 @@ def test_the_llm_provider_never_uses_the_synthesis_tier():
 # ---------------------------------------------------------------------------
 # Ensemble: LLM as the fallback for an unavailable Jev
 # ---------------------------------------------------------------------------
-def test_the_llm_falls_back_when_jev_is_unavailable(db, org):
-    """The brief's recommended chain: rules, then Jev, then an LLM."""
-    jev = StubProvider("jev", available=False)
-    llm = StubProvider("llm", answers={"worth_researching": True}, confidence=0.8)
-    rules = StubProvider("rules", error=DecisionRefused("no rule for this question"))
-    gateway = DecisionGateway(chain=ProviderChain([rules, jev, llm]), db=db)
-
-    result = gateway.decide(triage_request(organisation_id=org))
-    assert result.provider == "llm"
-    assert result.fallback_used is True
-    assert list(result.provider_chain) == ["rules", "jev", "llm"]
 
 
 # ---------------------------------------------------------------------------
@@ -1108,25 +932,8 @@ class FakeSettings:
         self.decision_store_state = False
 
 
-def test_the_default_configuration_boots_with_no_typesafe_key():
-    """The brief requires exactly this: the app must not fail to boot with
-    JEV_ENABLED=false, and no API key must be needed for development."""
-    gateway = build_gateway(settings=FakeSettings())
-    assert gateway.stage == RolloutStage.SHADOW
-    assert gateway.autonomy == Autonomy.MONITOR_ONLY
-    assert "rules" in gateway.chain.names
-    assert "jev" not in gateway.chain.names
-    assert gateway.shadow_provider is None
 
 
-def test_enabling_jev_puts_it_in_the_shadow_slot_not_the_acting_one():
-    """Shadow mode is the default, so enabling Jev must not make it the actor."""
-    gateway = build_gateway(settings=FakeSettings(jev_enabled=True, typesafe_api_key="k"))
-    assert gateway.shadow_provider is not None
-    assert gateway.shadow_provider.name == "jev"
-    assert gateway.chain.names[0] == "rules", (
-        "enabling Jev made it the acting provider; shadow mode must not act"
-    )
 
 
 def test_the_default_rollout_stage_is_shadow():

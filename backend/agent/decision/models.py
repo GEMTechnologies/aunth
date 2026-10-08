@@ -1,15 +1,15 @@
 """Canonical decision request and result models.
 
-These are Granada's own types. Nothing here is a TypeSafe class, and that is the
-point: the brief requires that Granada not become dependent on Jev, and the way
+These are Granada's own types. Nothing here is a vendor class, and that is the
+point: the brief requires that Granada not become dependent on any one provider, and the way
 a dependency creeps in is by letting a vendor's types become the vocabulary of
-the business layer. ``JevDecisionProvider`` maps these to ``Noul``/``Choice``/
+the business layer. A provider maps these onto its own types.
 ``Score`` internally and maps the answers back; no other module ever sees a
-TypeSafe name.
+vendor name.
 
 Question types are deliberately three
 -------------------------------------
-``BOOLEAN``, ``CHOICE`` and ``SCORE``. They map cleanly onto Jev's
+``BOOLEAN``, ``CHOICE`` and ``SCORE``. They map cleanly onto the
 ``Noul``/``Choice``/``Score`` and onto anything an LLM can be asked to emit as
 JSON, so a provider change is a mapping change rather than a redesign.
 
@@ -32,7 +32,7 @@ from typing import Any, Optional
 class QuestionType:
     """Granada's question vocabulary. Three shapes, no vendor types."""
 
-    BOOLEAN = "BOOLEAN"   # yes/no, mapped to Jev's Noul
+    BOOLEAN = "BOOLEAN"   # yes/no, mapped to a boolean-like answer type
     CHOICE = "CHOICE"     # one of a closed set
     SCORE = "SCORE"       # a bounded integer
 
@@ -212,7 +212,7 @@ class Answer:
     value: Any
     confidence: Optional[float] = None
     #: Distribution over the options where the provider supplies one. Optional,
-    #: because the documented Jev surface returns the chosen value and Granada
+    #: because a provider's surface may return the chosen value and Granada
     #: must not pretend a probability exists when it was not given one.
     distribution: Optional[dict[str, float]] = None
 

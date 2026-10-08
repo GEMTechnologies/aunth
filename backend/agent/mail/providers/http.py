@@ -81,7 +81,7 @@ class HttpxTransport:
 
     Imported lazily so that a deployment without httpx can still import the module
     and fail only when it actually tries to send - which is the same discipline the
-    Jev SDK follows.
+    vendored SDK follows.
     """
 
     def __init__(self, *, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> None:

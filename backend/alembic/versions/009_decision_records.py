@@ -21,7 +21,7 @@ The two columns that carry the design:
 
 ``shadow`` / ``shadow_of``
     Shadow decisions are recorded with a pointer to the decision that actually
-    acted. That is what lets the platform measure how often Jev would have agreed
+    acted. That is what lets the platform measure how often a second opinion would have agreed
     with the rules, using real Granada data, while being *structurally* unable to
     let the shadow answer influence anything.
 

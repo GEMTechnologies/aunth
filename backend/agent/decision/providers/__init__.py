@@ -8,15 +8,16 @@ the chain should require a deliberate edit.
 from __future__ import annotations
 
 from agent.decision.providers.base import BaseDecisionProvider, DecisionProvider
-from agent.decision.providers.jev import JevDecisionProvider
 from agent.decision.providers.llm import LLMDecisionProvider
+from agent.decision.providers.local import LocalDecisionProvider, Signal
 from agent.decision.providers.rules import RulesDecisionProvider, default_rules
 
 __all__ = [
     "BaseDecisionProvider",
     "DecisionProvider",
-    "JevDecisionProvider",
     "LLMDecisionProvider",
+    "LocalDecisionProvider",
     "RulesDecisionProvider",
+    "Signal",
     "default_rules",
 ]

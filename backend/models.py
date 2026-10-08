@@ -1009,7 +1009,7 @@ class DecisionRecord(Base):
     ``shadow`` / ``shadow_of``
         A shadow decision is recorded with ``shadow=True`` and a pointer to the
         decision that actually acted. This is what lets the platform answer "how
-        often would Jev have agreed with our rules" from real data, without any
+        often would a second opinion have agreed with our rules" from real data, without any
         possibility of the shadow answer having influenced anything - a claim
         that is enforced in code, because the shadow result is never returned as
         the acting one.

@@ -6,7 +6,7 @@ The shape the brief requires
     SEARCH BOTS -> POSTGRES/REDIS -> NORMALISATION -> HARD RULES
                                                           |
                                                    DECISION GATEWAY
-                                                    +-- JEV
+                                                    +-- LOCAL (Granada's own evidence engine)
                                                     +-- RULES
                                                     +-- LLM FALLBACK
                                                           |
@@ -21,7 +21,7 @@ Two properties are structural rather than documented:
 **Nothing here has a side effect.** The gateway returns a
 :class:`DecisionResult` and a :class:`PolicyOutcome`. There is no code path from a
 provider to an email, a submission or a payment. The brief's forbidden pattern -
-``Jev -> directly submits grant`` - is not merely discouraged; there is no import
+``decider -> directly submits grant`` - is not merely discouraged; there is no import
 in this package that could do it.
 
 **Shadow mode cannot influence anything, because its result is never returned as
@@ -32,7 +32,7 @@ authority.
 
 Failing open, in the right direction
 ------------------------------------
-Jev being down must not stop opportunity ingestion or mail triage. The chain
+A provider being down must not stop opportunity ingestion or mail triage. The chain
 moves to the next provider, and when the chain is exhausted, the decision is
 ``UNKNOWN`` with ``requires_human=True`` - not a default answer. "The decision
 layer is unavailable" must never silently become "the answer is yes", and it must
@@ -178,7 +178,7 @@ class ProviderChain:
 class Agreement:
     """Whether two providers agreed, per question.
 
-    Recorded in shadow mode because "did Jev agree with our rules" is the entire
+    Recorded in shadow mode because "did the second opinion agree with our rules" is the entire
     question shadow mode exists to answer, and it cannot be answered from logs
     that only kept one side.
     """
@@ -572,50 +572,51 @@ def build_gateway(
 ) -> DecisionGateway:
     """Build the configured gateway.
 
-    Deliberately never raises for a missing TypeSafe key. The brief requires that
-    a development configuration with no API key boots and runs, and the
-    ``rules`` provider alone satisfies every decision type Granada initially
-    needs.
+    Never raises for missing configuration, and has NO external dependency to be missing: the
+    default chain is ``rules -> local``, both of which are part of Granada. A self-hosted
+    deployment answers every decision it needs with no account, no key and no network.
+
+    The previous chain put a vendor provider here. The brief asks for a provider-neutral gateway
+    and forbids coupling workflows to one LLM vendor; a vendor is one way to satisfy that, and a
+    self-contained engine is a better one, because it cannot be rate-limited, cannot go down, and
+    costs nothing per decision.
+
+    ``llm`` remains available and is still opt-in, so a deployment that WANTS a model for prose
+    synthesis can have one - behind the same interface, in the same slot.
     """
     from agent.decision.providers.llm import LLMDecisionProvider
+    from agent.decision.providers.local import LocalDecisionProvider
     from agent.decision.providers.rules import RulesDecisionProvider, default_rules
 
     if providers is not None:
         chain = ProviderChain(list(providers))
     else:
         provider_name = getattr(settings, "decision_provider", "rules") if settings else "rules"
-        jev_enabled = bool(getattr(settings, "jev_enabled", False)) if settings else False
 
         rules = RulesDecisionProvider(default_rules())
+        local = LocalDecisionProvider()
         llm = LLMDecisionProvider(model_gateway) if model_gateway is not None else None
 
-        chain = ProviderChain([rules])
-        if jev_enabled or provider_name in {"jev", "hybrid"}:
-            from agent.decision.providers.jev import JevDecisionProvider
-
-            chain.add(
-                JevDecisionProvider(
-                    api_key=getattr(settings, "typesafe_api_key", "") if settings else "",
-                    base_url=getattr(settings, "typesafe_base_url", "") if settings else "",
-                    model=getattr(settings, "typesafe_default_model", "jev-latest") if settings else "jev-latest",
-                )
-            )
+        # ORDER IS THE POLICY: deterministic gates first, then Granada's own evidence engine,
+        # then - only if configured - a model.
+        chain = ProviderChain([rules, local])
         if llm is not None and provider_name in {"llm", "hybrid"}:
             chain.add(llm)
 
     stage = getattr(settings, "decision_rollout_stage", RolloutStage.SHADOW) if settings else RolloutStage.SHADOW
     autonomy = getattr(settings, "decision_autonomy", Autonomy.MONITOR_ONLY) if settings else Autonomy.MONITOR_ONLY
 
+    # No shadow vendor provider.
+    #
+    # The shadow slot used to hold an external engine, so SHADOW mode recorded "what the vendor
+    # would have decided" alongside Granada's own answer. With the vendor gone there is nothing to
+    # shadow: `rules` and `local` are both Granada's, and they run in the CHAIN rather than beside
+    # it. Inventing a shadow here would be recording Granada arguing with itself and calling it
+    # independent evidence.
+    #
+    # The slot remains in the gateway, so a deployment that later adds a second opinion - a model,
+    # or another engine - attaches it here without changing anything else.
     shadow_provider = None
-    if getattr(settings, "jev_enabled", False) if settings else False:
-        # In shadow mode Jev is attached as the shadow, never as the actor.
-        from agent.decision.providers.jev import JevDecisionProvider
-
-        shadow_provider = JevDecisionProvider(
-            api_key=getattr(settings, "typesafe_api_key", "") if settings else "",
-            base_url=getattr(settings, "typesafe_base_url", "") if settings else "",
-            model=getattr(settings, "typesafe_default_model", "jev-latest") if settings else "jev-latest",
-        )
 
     kwargs: dict[str, Any] = {
         "chain": chain,

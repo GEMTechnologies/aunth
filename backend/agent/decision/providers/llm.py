@@ -2,7 +2,7 @@
 
 Two jobs, and the second is the one people forget:
 
-1. **Fallback.** When Jev is unavailable, this answers the same questions through
+1. **Fallback.** When the local engine cannot answer, this answers the same questions through
    the model gateway's structured-output path, so ingestion and mail triage keep
    working instead of stopping at an outage.
 2. **Second opinion.** For a decision in the MEDIUM band, an independent answer

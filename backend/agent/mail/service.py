@@ -1085,7 +1085,7 @@ class GranadaMail:
         before any executor is reached.
 
         Returns ``None`` when no provider is configured, so the caller falls back to
-        the rule result or UNKNOWN. Jev remains shadow, so its answer is recorded and
+        the rule result or UNKNOWN. The local engine's answer is recorded and
         never consulted.
         """
         if self._gateway is None:
