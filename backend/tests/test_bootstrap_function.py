@@ -61,9 +61,19 @@ def _admin_url() -> str | None:
 
 
 def _query(sql: str) -> list[str]:
-    """Run SQL as the owner, outside the application's session settings."""
+    """Run SQL as the owner, outside the application's session settings.
+
+    **A server that is not running means SKIP, not FAIL.** The first version of this returned
+    psql's error text as if it were a result, so with PostgreSQL stopped the assertions read it as
+    "app.user_org_ids has no pinned search_path" and went red. That is a test crying wolf, and it
+    is exactly what a dependency-free coding session must not do.
+
+    A connection failure is categorically different from a query failure: one means there is
+    nothing to check, the other means the check ran and said something.
+    """
     url = _admin_url()
-    assert url, "no PostgreSQL configured"
+    if not url:
+        pytest.skip("no PostgreSQL configured")
     password = url.rsplit("://", 1)[1].split(":")[1].split("@")[0]
     psql = r"C:\Program Files\PostgreSQL\15\bin\psql.exe"
     result = subprocess.run(
@@ -71,8 +81,23 @@ def _query(sql: str) -> list[str]:
          "-t", "-A", "-F", "|", "-c", sql],
         capture_output=True, text=True, env=dict(os.environ, PGPASSWORD=password), timeout=60,
     )
-    output = (result.stdout or result.stderr).strip()
-    return [line for line in output.splitlines() if line]
+
+    combined = f"{result.stdout}\n{result.stderr}"
+    unreachable = (
+        "Connection refused" in combined
+        or "could not connect to server" in combined
+        or "no connection to the server" in combined
+        or "server closed the connection" in combined
+        or "the database system is starting up" in combined
+        or "the database system is shutting down" in combined
+    )
+    if unreachable:
+        pytest.skip("PostgreSQL is not running; there is nothing to check")
+
+    if result.returncode != 0:
+        raise AssertionError(f"psql failed: {result.stderr.strip()[:200]}")
+
+    return [line for line in result.stdout.strip().splitlines() if line]
 
 
 def test_the_bootstrap_function_is_pinned_to_a_schema_that_EXISTS():

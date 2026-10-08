@@ -226,7 +226,63 @@ def test_startup_options_survive_a_url_they_cannot_parse():
 
 
 # ===========================================================================
-# AGAINST THE REAL SERVER
+# A server that is not running means SKIP, not FAIL
+# ===========================================================================
+#
+# The static assertions above need no database, and must keep running without one. The behavioural
+# ones below do - and when PostgreSQL is stopped they used to FAIL with a raw psycopg2
+# `OperationalError`, which reads as a defect in the bounds rather than an absent dependency.
+#
+# A test that goes red because a dependency is not running is a test that cries wolf, and it makes
+# coding without the database impossible. This fixture turns "not reachable" into a skip WITH the
+# reason, and leaves a genuine query failure as a failure.
+#: Tests that assert on SOURCE and settings, and need no server. Declared explicitly rather than
+#: guessed from the name: the first version matched substrings of the name, missed one test, and
+#: left a failure that looked like a defect in the bounds.
+STATIC_TESTS = frozenset(
+    {
+        "test_every_database_bound_is_a_setting_and_is_positive",
+        "test_the_bounds_are_generous_enough_not_to_break_legitimate_work",
+        "test_the_postgres_engine_sets_a_connect_timeout",
+        "test_the_postgres_engine_sets_a_statement_timeout",
+        "test_the_postgres_engine_sets_an_idle_transaction_timeout",
+        "test_the_postgres_engine_recycles_connections",
+        "test_the_metrics_engine_is_bounded_too",
+        "test_startup_options_PRESERVE_what_the_url_already_sets",
+        "test_startup_options_work_when_the_url_sets_none",
+        "test_startup_options_survive_a_url_they_cannot_parse",
+    }
+)
+
+
+@pytest.fixture(autouse=True)
+def _skip_behavioural_tests_when_postgres_is_down(request):
+    """A server that is not running means SKIP, not FAIL.
+
+    The static assertions need no database and keep running without one. The behavioural ones used
+    to FAIL with a raw psycopg2 `OperationalError`, which reads as a defect in the bounds rather
+    than an absent dependency - a test crying wolf, and a reason coding without the database is
+    impossible.
+    """
+    if request.node.name.split("[")[0] in STATIC_TESTS:
+        return
+
+    url = _admin_url()
+    if not url:
+        pytest.skip("no PostgreSQL configured")
+
+    from sqlalchemy import create_engine, exc, text
+
+    engine = create_engine(url, connect_args={"connect_timeout": 3})
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except exc.OperationalError as error:
+        pytest.skip(f"PostgreSQL is not running, so there is nothing to check: {str(error)[:80]}")
+    finally:
+        engine.dispose()
+
+
 # ===========================================================================
 def _admin_url() -> str | None:
     """The admin URL from `.env`, or the environment. None when there is no PostgreSQL here."""

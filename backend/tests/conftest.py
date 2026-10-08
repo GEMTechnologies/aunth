@@ -169,6 +169,57 @@ def anyio_backend():
 
 
 # ---------------------------------------------------------------------------
+# A database that is not running means SKIP, not FAIL.
+#
+# These modules need a live PostgreSQL. With the service stopped they used to ERROR - 46 red results
+# across five files - which buries any genuine failure and makes coding without the database
+# impossible. Same crying-wolf problem as a guard that reports a non-issue.
+#
+# Declared as a list rather than detected, so adding a module is a decision and a module nobody
+# declared keeps failing loudly, which is the correct default.
+# ---------------------------------------------------------------------------
+POSTGRES_MODULES = frozenset(
+    {
+        "test_agent_org_invariant.py",
+        "test_opportunity_catalogue_rls.py",
+        "test_postgres_request_path.py",
+        "test_tenant_data_isolation.py",
+        "test_tenant_rls.py",
+    }
+)
+
+#: Port probed. A TCP connect, not a driver call: it needs no credentials, cannot hang on auth, and
+#: answers the only question that matters — is anything listening.
+POSTGRES_PORT = 5432
+
+
+def _postgres_is_listening(timeout: float = 1.5) -> bool:
+    import socket
+
+    try:
+        with socket.create_connection(("127.0.0.1", POSTGRES_PORT), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip the PostgreSQL modules wholesale when nothing is listening on the port."""
+    if _postgres_is_listening():
+        return
+
+    skip = pytest.mark.skip(
+        reason=(
+            f"PostgreSQL is not running (nothing listening on 127.0.0.1:{POSTGRES_PORT}), so "
+            "there is nothing to check. Restart with: Start-Service postgres, Memurai"
+        )
+    )
+    for item in items:
+        if pathlib.Path(str(item.fspath)).name in POSTGRES_MODULES:
+            item.add_marker(skip)
+
+
+# ---------------------------------------------------------------------------
 # Test database construction
 # ---------------------------------------------------------------------------
 # WHY THIS EXISTS - a measured 800x speed-up, and the explanation of a suite that
