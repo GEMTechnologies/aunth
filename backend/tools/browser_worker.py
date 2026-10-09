@@ -549,6 +549,28 @@ def main() -> int:
 
     out["provider"] = provider.name
     out["sandbox"] = "enabled"
+
+    # SCRUB BEFORE PRINTING. The portal password is filled into the page, and the page's own validation
+    # messages come back through observe() -> report.to_dict(). A portal that echoes the submitted value
+    # - one of the most common validation shapes there is - would put the credential in this JSON, which
+    # the caller persists as a job outcome. Nothing had to be logged for it to escape.
+    #
+    # The values are read HERE, from the environment, and handed to a run-scoped scrubber. They are never
+    # written anywhere, and `report()` records counts and names only.
+    try:
+        from agent.output_scrub import OutputScrubber
+
+        scrubber = OutputScrubber(
+            [os.environ.get("GRANADA_PORTAL_PASSWORD", ""), os.environ.get("GRANADA_PORTAL_USER", "")]
+        )
+        out = scrubber.scrub(out)
+        out["scrub"] = scrubber.report()
+    except Exception:
+        # A scrubber that fails must not stop the outcome being reported, but the report SAYS the
+        # outcome was not verified clean rather than implying it was.
+        out = dict(out)
+        out["scrub"] = {"error": "scrubber unavailable; output not verified free of credentials"}
+
     print(json.dumps(out))
     return 0
 
