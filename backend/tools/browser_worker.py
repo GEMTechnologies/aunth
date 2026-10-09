@@ -42,6 +42,7 @@ import shutil
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -205,6 +206,17 @@ class PlaywrightProvider:
                 };
             }"""
         )
+        # A SCREENSHOT IS CAPTURED WITH EVERY OBSERVATION, not only when something goes wrong.
+        #
+        # The visual path was built and unreachable: `perception.needs_vision` is true when a picture
+        # exists and the tree does not answer the question, and an observation with no picture always
+        # looked like a page with nothing to see. Capturing here is what connects them.
+        #
+        # The capture is best-effort. A screenshot that fails must not fail the run - the structural
+        # observation is still valid, and refusing to proceed because a picture could not be taken
+        # would turn a cosmetic problem into a blocked workflow.
+        shot_ref = self.screenshot()
+
         return PageState(
             url=data.get("url", ""),
             title=data.get("title", ""),
@@ -212,6 +224,8 @@ class PlaywrightProvider:
             controls=data.get("controls", []),
             validation_messages=data.get("errors", []),
             untrusted_text=data.get("text", ""),
+            screenshot_ref=shot_ref,
+            captured_at=datetime.now(timezone.utc),
         )
 
     def screenshot(self) -> str:

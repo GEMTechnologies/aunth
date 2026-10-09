@@ -140,6 +140,23 @@ class PageState:
     controls: list[str] = field(default_factory=list)
     #: Text from the page that must NEVER be interpreted as an instruction to Granada.
     untrusted_text: str = ""
+    #: A reference to the rendered page, when one was captured.
+    #:
+    #: WITHOUT THIS the real worker could never escalate to vision: `perception.needs_vision` is true
+    #: when a picture exists and the tree does not answer the question, and a PageState carrying only
+    #: structure always looked like a page with no picture at all. The visual path was built and
+    #: unreachable from the browser.
+    #:
+    #: A reference, not bytes - the same rule as everywhere else here, so a checkpoint or a log
+    #: cannot carry an organisation's page contents.
+    screenshot_ref: str = ""
+    #: When the capture was taken. Needed because a screenshot is an observation with a timestamp, not
+    #: a permanent truth about a page, and §7 forbids acting on coordinates from a stale one.
+    captured_at: Optional[datetime] = None
+
+    @property
+    def has_picture(self) -> bool:
+        return bool(self.screenshot_ref)
 
 
 @dataclass

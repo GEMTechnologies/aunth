@@ -293,6 +293,48 @@ def document_from_vision(
     )
 
 
+def from_page_state(
+    state: Any,
+    *,
+    now: Optional[datetime] = None,
+    image: Optional[ImageRef] = None,
+    label: str = "page",
+) -> Observation:
+    """Adapt a browser observation into a perception Observation.
+
+    THE LINK THAT WAS MISSING. `browser_runtime` observes a page structurally, and `perception`
+    reasons about one that may carry a picture - but nothing connected them, so
+    `needs_vision` could never fire for a REAL browser. The visual path was built and unreachable.
+
+    The screenshot arrives as an `ImageRef` built by the CALLER, because only the caller knows the
+    viewport it was taken from. A ref fabricated here would have no viewport to be stale against,
+    and §7 forbids acting on coordinates from a stale screenshot.
+
+    `untrusted_text` is carried across and remains separated from every structural field, so page
+    content cannot become instruction on the way through.
+    """
+    moment = now or datetime.now(timezone.utc)
+    shot = image
+    ref = getattr(state, "screenshot_ref", "") or ""
+    if shot is None and ref:
+        shot = ImageRef(
+            ref=ref,
+            captured_at=getattr(state, "captured_at", None) or moment,
+            width=0,
+            height=0,
+            label=label,
+        )
+    return Observation(
+        url=getattr(state, "url", "") or "",
+        title=getattr(state, "title", "") or "",
+        fields=dict(getattr(state, "fields", {}) or {}),
+        controls=list(getattr(state, "controls", []) or []),
+        validation_messages=list(getattr(state, "validation_messages", []) or []),
+        screenshot=shot,
+        untrusted_text=getattr(state, "untrusted_text", "") or "",
+    )
+
+
 def describe() -> dict[str, Any]:
     """The provenance rules, stated where a reviewer will find them."""
     return {
