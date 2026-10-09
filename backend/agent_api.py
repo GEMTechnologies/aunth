@@ -239,6 +239,90 @@ class DeadlineSummary(BaseModel):
     grant_id: Optional[str] = None
 
 
+@router.get("/packages", summary="Application packages this organisation holds")
+def list_packages(
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+    limit: int = 50,
+) -> dict[str, Any]:
+    """The application packages, with readiness evaluated NOW.
+
+    READINESS IS EVALUATED AT READ TIME, not read from a stored column. A package assembled while the
+    opportunity was open can become blocked because the deadline passed, and a stored verdict would
+    keep reporting the answer that was true when the job ran.
+
+    The verdict is separate from the package status, and the difference matters to an operator:
+
+      * a package whose documents are missing is BLOCKED - the organisation uploads a certificate
+      * a package whose assembly crashed is FAILED - an engineer looks at it
+
+    Conflating them is how an NGO is told to upload something the platform was supposed to produce,
+    or an engineer is paged for a missing registration certificate.
+
+    Nothing here says SUBMITTED. A package that is READY has NOT been sent, and the message says so.
+    """
+    from agent import readiness as readiness_engine
+
+    org_id = _organisation(tenant)
+    # BINDS the tenant to the session, setting app.current_org_id for row-level security. Without it
+    # this handler resolves an organisation but the RLS policies see NULL and deny everything - so it
+    # returns an empty list and looks like an organisation that has no packages, which is
+    # indistinguishable from a correct answer. The existing contract test caught exactly that.
+    require_org_access(tenant, db, org_id)
+
+    packages = (
+        db.query(models.SubmissionPackage)
+        .filter(models.SubmissionPackage.org_id == org_id)
+        .order_by(models.SubmissionPackage.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    items = []
+    for package in packages:
+        if package.opportunity_id:
+            package._opportunity = db.query(models.Opportunity).filter(
+                models.Opportunity.id == package.opportunity_id
+            ).first()
+        verdict = readiness_engine.evaluate(package)
+        manifest = package.manifest or {}
+        items.append({
+            "package_id": str(package.id),
+            "opportunity_title": manifest.get("opportunity", {}).get("title"),
+            "opportunity_url": manifest.get("opportunity", {}).get("source_url"),
+            "deadline": manifest.get("opportunity", {}).get("deadline"),
+            "deadline_is_exact": manifest.get("opportunity", {}).get("deadline_is_exact"),
+            "status": package.status,
+            "readiness": verdict.verdict,
+            "message": verdict.message(),
+            "satisfied": verdict.satisfied,
+            "required": verdict.required,
+            "documents": [d.get("doc_type") for d in manifest.get("documents", [])],
+            "missing": manifest.get("missing_requirements", []),
+            "needs_organisation": verdict.organisation_actions,
+            "version": package.application_version,
+            "submission_mode": package.submission_mode,
+            # Never true until a receipt exists. The model refuses SUBMITTED without one.
+            "submitted": package.status == models.SubmissionPackage.SUBMITTED,
+            "created_at": package.created_at.isoformat() if package.created_at else None,
+        })
+
+    ready = sum(1 for item in items if item["readiness"] == readiness_engine.READY)
+    blocked = sum(1 for item in items if item["readiness"] == readiness_engine.BLOCKED)
+    failed = sum(1 for item in items if item["readiness"] == readiness_engine.FAILED)
+    return {
+        "packages": items,
+        "total": len(items),
+        "ready": ready,
+        "blocked": blocked,
+        # Blocked is NOT failed. Reporting a missing certificate as a technical failure is the
+        # distinction this whole surface exists to keep.
+        "failed": failed,
+        "submitted": sum(1 for item in items if item["submitted"]),
+    }
+
+
 @router.get("/grants", summary="Grants this organisation holds")
 def list_grants(
     user: Any = Depends(get_current_user),
