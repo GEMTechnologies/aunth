@@ -202,6 +202,14 @@ def plan_next(
         if spec.get("type") in ("file",):
             if name in uploads:
                 return PlannedAction(Step.UPLOAD, name, uploads[name], f"{name} is an upload")
+            if spec.get("required"):
+                # A required upload with no document held is MISSING INFORMATION, not a step to skip.
+                # `continue` used to fall through to DONE, so a form that could never be sent reported
+                # COMPLETED - found by the section 14 upload scenario.
+                return PlannedAction(
+                    Step.BLOCKED, name, None,
+                    f"the page requires {name} and Granada holds no authorised document for it",
+                )
             continue
         if spec.get("type") in ("checkbox", "radio"):
             continue

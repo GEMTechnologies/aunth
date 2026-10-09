@@ -115,7 +115,15 @@ class Diagnosis:
 
     @property
     def retryable(self) -> bool:
-        return self.response in (Response.RETRY_BOUNDED, Response.REOBSERVE, Response.CORRECT_AND_RETRY)
+        # REAUTHENTICATE belongs here: re-establishing a lapsed session is a recovery action, not a
+        # terminal state. Omitting it made a recoverable session expiry look unresolvable, so the
+        # agent would park on something it could have fixed. Found by scenario 11.
+        return self.response in (
+            Response.RETRY_BOUNDED,
+            Response.REOBSERVE,
+            Response.CORRECT_AND_RETRY,
+            Response.REAUTHENTICATE,
+        )
 
     @property
     def parks(self) -> bool:

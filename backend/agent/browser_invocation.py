@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional, Protocol
 
-from .browser_boundary import BrowserResult, BrowserTask, BrowserTaskRefused
+from .browser_boundary import BrowserResult, BrowserTask, BrowserTaskRefused, validate_task
 
 #: The capability flag. Absent or false means no browser runs, at all, by any route.
 BROWSER_EXECUTION_ENABLED = "browser_execution_enabled"
@@ -203,6 +203,7 @@ def invoke(
     settings: dict[str, Any],
     policy: Optional[InvocationPolicy] = None,
     submission_authorised: bool = False,
+    org_document_ids: Optional[set[str]] = None,
 ) -> InvocationOutcome:
     """Run the browser worker for one task, or refuse to.
 
@@ -235,6 +236,32 @@ def invoke(
             task_id=task.task_id,
             ran=False,
             problems=[{"kind": "NO_ORGANISATION", "detail": "a browser task must name an organisation"}],
+        )
+
+    # THE ISOLATION CHECK, AND IT WAS MISSING HERE.
+    #
+    # invoke() passed its task straight to the worker, on the assumption that
+    # browser_boundary.build_task had validated it. build_task DOES validate - but invoke() accepts a
+    # task directly, so any caller constructing one by hand bypassed the cross-tenant document check
+    # entirely and handed another organisation's document reference to a browser worker.
+    #
+    # Found by section 14's cross-tenant scenario, which asserted the invoker was never called and
+    # observed that it had been. validate_task is cheap and must not be optional: it is the one place
+    # that refuses a document the organisation does not own, and "later" is where a leak happens.
+    try:
+        validate_task(task, org_document_ids=org_document_ids or set())
+    except BrowserTaskRefused as exc:
+        return InvocationOutcome(
+            status="REJECTED",
+            task_id=task.task_id,
+            ran=False,
+            problems=[
+                {
+                    "kind": "TASK_REFUSED",
+                    "detail": str(exc),
+                    "note": "refused before the worker was invoked; no browser was launched",
+                }
+            ],
         )
 
     if not submission_authorised:

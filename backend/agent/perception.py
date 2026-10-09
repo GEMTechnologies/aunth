@@ -211,6 +211,13 @@ def assemble(
     for v in values or []:
         grouped.setdefault(v.name, []).append(v)
 
+    # Document readings are folded in too. Without this, a value understood from a document was
+    # recorded on the DocumentObservation and then invisible to observed() - so a scanned certificate
+    # read by a model produced evidence nobody could see. Found by scenario 8.
+    for doc in documents or []:
+        for v in doc.values:
+            grouped.setdefault(v.name, []).append(v)
+
     return Perception(
         observation=observation,
         values=grouped,
