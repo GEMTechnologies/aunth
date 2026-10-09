@@ -76,6 +76,10 @@ class FleetHealth:
     running: bool = False
     sweeps: int = 0
     dispatched: int = 0
+    #: Workflows the discovery pass created. Separate from dispatched, because "I found 25 new
+    #: things" and "I ran 25 things" are different facts and an operator watching one would be
+    #: misled by the other (ADR-0011).
+    discovered: int = 0
     duplicates: int = 0
     skipped_paused: int = 0
     deferred_fairness: int = 0
@@ -205,10 +209,42 @@ class FleetRunner:
             dispatcher = FleetDispatcher(
                 db, batch_size=self.batch_size, per_agent_limit=self.per_agent_limit
             )
+
+            # DISCOVER, THEN CLAIM. Nothing created the first workflow before this: `schedule()` was
+            # the idempotent entry point and no route, hook or sweep ever called it, so
+            # `agent_workflows` stayed empty and `dispatched=0` was read as an idle fleet rather than
+            # one that had never been given anything to do (ADR-0011).
+            #
+            # It lives in the SWEEP rather than in `dispatch_once`, because claiming what is due and
+            # deciding what is new are different jobs - and because a method named `dispatch_once`
+            # that also creates work is a method whose name lies to its callers.
+            #
+            # Contained: a discovery failure must not stop queued work from being dispatched, since
+            # those workflows are the ones a customer is waiting on.
+            #
+            # THE COUNT GOES IN A LOCAL FIRST. An earlier version wrote `result.discovered = ...`
+            # before `result` existed, because moving discovery here removed the line that created
+            # it. Every sweep then raised NameError, which the handler below swallowed and counted as
+            # an error - so `health.sweeps` never incremented, `run_forever(max_sweeps=2)` never
+            # reached its bound, and the loop span forever at one second a tick.
+            #
+            # `test_fleet_operations.py` caught it, but by HANGING rather than failing: its
+            # termination depended on the very counter the bug stopped advancing. That is why
+            # `test_fleet_credentials.py` now asserts `sweep_once()` returns at all.
+            discovered = 0
+            try:
+                discovered = dispatcher.discover_opportunity_work()
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("fleet.discovery_failed")
+
             result = dispatcher.dispatch_once()
+            result.discovered = discovered
             db.commit()
             self.health.sweeps += 1
             self.health.dispatched += result.dispatched
+            self.health.discovered += discovered
             self.health.duplicates += result.duplicates
             self.health.skipped_paused += result.skipped_paused
             self.health.last_sweep_at = datetime.now(timezone.utc)
@@ -325,14 +361,19 @@ def main() -> int:  # pragma: no cover - process entry point
     import logging as _logging
 
     from config import settings
-    from database import SessionLocal
+    # THE FLEET CREDENTIAL, not the application role. `FleetSessionLocal` resolves to the
+    # `granada_fleet` role (BYPASSRLS) when FLEET_DATABASE_URL is set, and to the ordinary factory
+    # when it is not - so tests and SQLite are unchanged. Using the application role here is what
+    # made the dispatcher blind: `due_workflows` reads `agent_workflows` unscoped, that table is
+    # FORCE ROW LEVEL SECURITY, and an unbound tenant means zero rows whatever exists (ADR-0011).
+    from database import FleetSessionLocal
     from observability import configure_logging, register_secrets_from_settings
 
     configure_logging(level=getattr(settings, "log_level", "INFO"), service="granada-fleet")
     register_secrets_from_settings(settings)
 
     runner = FleetRunner(
-        SessionLocal,
+        FleetSessionLocal,
         interval_seconds=float(getattr(settings, "fleet_dispatch_interval_seconds", DEFAULT_INTERVAL_SECONDS)),
         batch_size=int(getattr(settings, "fleet_dispatch_batch_size", 200)),
         per_agent_limit=int(getattr(settings, "fleet_per_agent_limit", 25)),

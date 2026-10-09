@@ -140,3 +140,53 @@ def test_the_ingestion_logger_call_specifically_is_safe():
             assert not (set(keys) & RESERVED)
             return
     pytest.fail("the ingest.batch logger call no longer uses the safe key names")
+
+
+# ===========================================================================
+# LOG_FORMAT: a name, not a printf expression
+# ===========================================================================
+def test_a_named_log_format_resolves_to_a_real_format_string():
+    """THE bug the deployment test surfaced.
+
+    LOG_FORMAT=json is the obvious thing to try - the setting is NAMED like a choice - and it
+    crashed the API at import with ValueError: Invalid format 'json' for '%' style, because the
+    value went straight to logging.basicConfig(format=...).
+
+    A setting whose name invites a word and whose implementation demands a printf expression is a
+    setting that will be misused, and the failure lands at startup on the one process that must come
+    up.
+    """
+    from main import _resolve_log_format
+
+    for name in ("json", "text", "plain", "minimal"):
+        resolved = _resolve_log_format(name)
+        assert "%" in resolved, f"{name!r} did not resolve to a printf format"
+        # And it must actually be usable, which is what basicConfig does with it.
+        import logging
+
+        logging.Formatter(resolved)
+
+
+def test_a_real_format_string_is_passed_through_unchanged():
+    """Nothing that works today may change."""
+    from main import _resolve_log_format
+
+    custom = "%(levelname)s|%(message)s"
+    assert _resolve_log_format(custom) == custom
+
+
+def test_an_unknown_name_falls_back_rather_than_crashing():
+    """A typo in a log format must not stop the process from starting."""
+    from main import _resolve_log_format
+
+    resolved = _resolve_log_format("not-a-style")
+    assert "%" in resolved
+    import logging
+
+    logging.Formatter(resolved)
+
+
+def test_an_empty_value_falls_back_rather_than_crashing():
+    from main import _resolve_log_format
+
+    assert "%" in _resolve_log_format("")

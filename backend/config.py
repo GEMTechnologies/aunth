@@ -153,6 +153,32 @@ class Settings(BaseSettings):
     # prerequisite as backups) or it is OMITTED and reported as unavailable. It is never
     # reported as zero.
     metrics_database_url: Optional[str] = None
+
+    # -- The fleet credential (ADR-0011) ------------------------------------
+    #
+    # THE SAME RLS PROBLEM AS `metrics_database_url` ABOVE, in the one place it actually broke the
+    # product. `FleetDispatcher.due_workflows()` reads `agent_workflows` WITHOUT binding a tenant,
+    # because it must discover work across the whole fleet. But the table is FORCE ROW LEVEL SECURITY
+    # with `org_id = app.current_org()`, and an unbound `app.current_org()` is NULL - so the query
+    # returns ZERO ROWS whatever exists.
+    #
+    # Proven on the first deployment, not inferred:
+    #
+    #     INSERTED as superuser, total rows = 1
+    #     AS granada_app, UNSCOPED (what due_workflows does) = 0
+    #
+    # The sweep reported `dispatched=0 errors=0` throughout: blind, not idle, and healthy-looking.
+    # `granada_agents`, `jobs` and `agent_activity` share the shape, so nothing could be claimed or
+    # dispatched either. Matching, qualification, the application workspace, mail, submission and
+    # grants were all unreachable.
+    #
+    # Set this to the `granada_fleet` role (LOGIN BYPASSRLS, created by sql/fleet_role.sql) for the
+    # WORKER and the RELAY only. It must NOT be set for the API: giving the request path BYPASSRLS
+    # would remove the product's central security property - that a request cannot read another
+    # tenant's data - in order to fix a worker problem.
+    #
+    # Unset means "use the application role", so SQLite and the test suite are unchanged.
+    fleet_database_url: Optional[str] = None
     redis_url: str = "redis://0.0.0.0:6379/0"
 
     # -- URLs -------------------------------------------------------------

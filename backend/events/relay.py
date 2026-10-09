@@ -454,14 +454,17 @@ def install_signal_handlers(runner: OutboxRelayRunner) -> bool:
 def main() -> int:  # pragma: no cover - process entry point
     """``python -m events.relay`` - the command the systemd unit invokes."""
     from config import settings
-    from database import SessionLocal
+    # See agent/fleet_runner.py and ADR-0011: the relay claims `outbox_events` unscoped, and that
+    # table is FORCE ROW LEVEL SECURITY, so the application role reads zero rows and the relay
+    # silently publishes nothing. Same credential, same reason.
+    from database import FleetSessionLocal
     from observability import configure_logging, register_secrets_from_settings
 
     configure_logging(level=getattr(settings, "log_level", "INFO"), service="granada-outbox-relay")
     register_secrets_from_settings(settings)
 
     runner = OutboxRelayRunner(
-        SessionLocal,
+        FleetSessionLocal,
         interval_seconds=float(getattr(settings, "outbox_relay_interval_seconds", DEFAULT_RELAY_INTERVAL_SECONDS)),
         batch_size=int(getattr(settings, "outbox_relay_batch_size", 100)),
     )

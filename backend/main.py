@@ -18,12 +18,44 @@ from agent_api import router as agent_router
 from ingestion_api import router as ingestion_router
 from config import settings
 
+#: Named log formats, so `LOG_FORMAT` can be a word rather than a printf expression.
+#:
+#: THE BUG THIS FIXES. `LOG_FORMAT=json` is the obvious thing to try - the setting is NAMED like a
+#: choice - and it crashed the API at import:
+#:
+#:     ValueError: Invalid format 'json' for '%' style
+#:
+#: because the value went straight to `logging.basicConfig(format=...)`, which wants a printf string.
+#: A setting whose name invites `json` and whose implementation demands `%(asctime)s` is a setting
+#: that will be misused, and the failure lands at startup on the one process that must come up.
+#:
+#: A value containing `%` is still treated as a format string, so nothing that works today changes.
+_NAMED_LOG_FORMATS = {
+    "json": (
+        '{"time": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", '
+        '"message": "%(message)s"}'
+    ),
+    "text": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    "plain": "%(levelname)s %(name)s %(message)s",
+    "minimal": "%(message)s",
+}
+
+
+def _resolve_log_format(value: str) -> str:
+    """A printf format string, from either a printf format string or a named style."""
+    if not value:
+        return _NAMED_LOG_FORMATS["text"]
+    if "%" in value:
+        return value
+    return _NAMED_LOG_FORMATS.get(value.strip().lower(), _NAMED_LOG_FORMATS["text"])
+
+
 # Configure logging
 # The previous expression was getattr(settings.log_level.upper()), which calls
 # a two-argument builtin with one argument and raises TypeError at import.
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
-    format=settings.log_format
+    format=_resolve_log_format(settings.log_format),
 )
 logger = logging.getLogger(__name__)
 

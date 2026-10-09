@@ -115,6 +115,58 @@ engine = create_engine(settings.database_url, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
+# ===========================================================================
+# The fleet credential (ADR-0011).
+# ===========================================================================
+def _fleet_engine_url() -> str:
+    """The URL the worker and the relay connect with, falling back to the application role.
+
+    Unset means the application role, so SQLite and the whole test suite are unchanged: they have no
+    row-level security to bypass, and the dispatcher's tests exercise the same engine as everything
+    else.
+    """
+    return (settings.fleet_database_url or "").strip() or settings.database_url
+
+
+def _build_session_factory(url: str):
+    """Build a session factory with the SAME bounds the request path gets.
+
+    Bounds are not copied by sharing a URL. A fleet connection that can wait forever on a wedged
+    database is the unbounded-wait defect this project has already fixed twice, and a second engine
+    is exactly where it would quietly come back.
+    """
+    kwargs = dict(engine_kwargs)
+    if not url.startswith("sqlite"):
+        kwargs["connect_args"] = {
+            "connect_timeout": settings.database_connect_timeout,
+            "options": _startup_options(url),
+        }
+    fleet_engine = create_engine(url, **kwargs)
+    return fleet_engine, sessionmaker(autocommit=False, autoflush=False, bind=fleet_engine)
+
+
+if _fleet_engine_url() == settings.database_url:
+    # The common case, including every test. Sharing the factory keeps the fleet path on exactly the
+    # engine the rest of the process uses, so a divergence cannot hide here.
+    fleet_engine = engine
+    FleetSessionLocal = SessionLocal
+else:
+    fleet_engine, FleetSessionLocal = _build_session_factory(_fleet_engine_url())
+
+
+def get_fleet_db():
+    """A session for work that legitimately spans every tenant.
+
+    Only the dispatcher and the relay should use this. Everything serving a request uses `get_db`,
+    which is bound to one tenant and cannot read another's data.
+    """
+    db = FleetSessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 @event.listens_for(Engine, "checkout")
 def blank_tenant_on_checkout(dbapi_connection, connection_record, connection_proxy):
     """Refuse to hand out a pooled connection that still carries a tenant.

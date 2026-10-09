@@ -144,6 +144,10 @@ class DispatchResult:
     duplicates: int = 0
     skipped_paused: int = 0
     skipped_unhandled: int = 0
+    #: Workflows the discovery pass created this sweep. Reported separately from dispatched,
+    #: because "I found 25 new things to do" and "I ran 25 things" are different facts, and an
+    #: operator watching one would be misled by the other.
+    discovered: int = 0
     per_agent: dict[str, int] = field(default_factory=dict)
 
     @property
@@ -260,6 +264,86 @@ class FleetDispatcher:
         )
         return list(self.db.execute(stmt).scalars())
 
+    #: How many unevaluated opportunities one agent may pick up per sweep. Bounded for the same
+    #: reason everything else here is: a catalogue of 100,000 opportunities must not turn one sweep
+    #: into 100,000 workflow rows, and an agent should work steadily rather than in one avalanche.
+    DISCOVERY_LIMIT_PER_AGENT = 25
+
+    def discover_opportunity_work(self, *, now: Optional[datetime] = None) -> int:
+        """Schedule a match workflow for catalogue opportunities this agent has not yet evaluated.
+
+        WHY THIS EXISTS
+        ---------------
+        Nothing created the FIRST workflow. ``GranadaAgentService.schedule()`` is the idempotent
+        entry point, ``dispatch_once`` claims what is already due, and **no route, hook or sweep ever
+        called it**. So `agent_workflows` stayed empty, `due_workflows` returned nothing, and
+        `dispatched=0` was read as "the fleet is idle" rather than "the fleet has never been given
+        anything to do".
+
+        Found on the VPS alongside the RLS blindness in ADR-0011. The two are separate defects and
+        both had to be fixed: with only the credential, the dispatcher sees an empty table; with only
+        discovery, it still cannot see what discovery wrote.
+
+        WHAT IT DOES NOT DO
+        -------------------
+        It does not match anything. It schedules the work and records who owns it, so the matching
+        stays in the handler where `matcher.evaluate()` and its gates live. A dispatcher that
+        decided eligibility would be a dispatcher with an opinion about funding.
+        """
+        moment = now or datetime.now(timezone.utc)
+        scheduled = 0
+
+        agents = self.db.execute(
+            select(models.GranadaAgent).where(models.GranadaAgent.status == models.GranadaAgent.ACTIVE)
+        ).scalars().all()
+        if not agents:
+            return 0
+
+        for agent in agents:
+            # Opportunities this organisation has already evaluated. A match row means the work is
+            # done; a workflow row means it is already queued, and re-scheduling would wake a
+            # completed one or churn a queued one every sweep.
+            evaluated = select(models.OpportunityMatch.opportunity_id).where(
+                models.OpportunityMatch.org_id == agent.org_id
+            )
+            queued = select(models.AgentWorkflow.subject_id).where(
+                models.AgentWorkflow.agent_id == agent.id,
+                models.AgentWorkflow.workflow_type == WORKFLOW_MATCH,
+                models.AgentWorkflow.subject_type == models.AgentWorkflow.SUBJECT_OPPORTUNITY,
+            )
+
+            candidates = self.db.execute(
+                select(models.Opportunity)
+                .where(
+                    models.Opportunity.id.notin_(evaluated),
+                    models.Opportunity.id.notin_(queued),
+                    models.Opportunity.is_active.is_(True),
+                )
+                .order_by(models.Opportunity.created_at.desc())
+                .limit(self.DISCOVERY_LIMIT_PER_AGENT)
+            ).scalars().all()
+
+            if not candidates:
+                continue
+
+            # Imported here rather than at module scope: granada_agent imports this module, so a
+            # top-level import would be circular.
+            from agent.granada_agent import GranadaAgentService
+
+            service = GranadaAgentService(self.db, agent.org_id)
+            for opportunity in candidates:
+                service.schedule(
+                    workflow_type=WORKFLOW_MATCH,
+                    subject_type=models.AgentWorkflow.SUBJECT_OPPORTUNITY,
+                    subject_id=str(opportunity.id),
+                    run_at=moment,
+                )
+                scheduled += 1
+
+        if scheduled:
+            metrics.inc("fleet.discovered_opportunity_work", scheduled)
+        return scheduled
+
     def dispatch_once(
         self, *, now: Optional[datetime] = None, limit: Optional[int] = None
     ) -> DispatchResult:
@@ -272,6 +356,11 @@ class FleetDispatcher:
         moment = now or datetime.now(timezone.utc)
         result = DispatchResult()
 
+        # DISCOVERY IS NOT HERE. This method dispatches work that is already due; discovering work is
+        # a different job and it lives in `FleetRunner.sweep_once`, which sweeps. Putting it here
+        # silently redefined what `dispatch_once` does - 36 tests that set up exactly the work they
+        # wanted dispatched started finding extra rows. A method called `dispatch_once` should
+        # dispatch (ADR-0011).
         try:
             candidates = self.due_workflows(now=moment, limit=limit)
         except Exception:
