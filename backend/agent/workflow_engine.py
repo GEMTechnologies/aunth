@@ -1216,8 +1216,20 @@ def _handle_donor_research(db: Session, context: dict[str, Any]) -> dict[str, An
                 "opportunity_version": result.opportunity_version,
             },
         }],
-        # STOP HERE for this phase. The proposal is not generated and nothing is
-        # submitted: Phase 6c proves autonomous INTERNAL work.
+        # NO LONGER THE END OF THE CHAIN.
+        #
+        # This used to stop here, and the comment said so: "the proposal is not generated and nothing
+        # is submitted". That was honest while no Document Agent existed. One does now, and research
+        # has just established `required_documents` above - so the next step is to prepare them, and
+        # the pipeline can continue without a human scheduling it.
+        #
+        # The chain is now: match -> qualify -> research -> documents, each step enqueuing the next.
+        # Submission is still deliberately absent: it stays behind the approval gate.
+        "enqueue": {
+            "workflow_type": WORKFLOW_DOCUMENT,
+            "specialist_key": "DOCUMENT",
+            "correlation_id": context.get("correlation_id"),
+        },
         "next_state": models.AgentWorkflow.COMPLETED,
     }
 
