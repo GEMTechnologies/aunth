@@ -39,6 +39,7 @@ from pathlib import Path
 import pytest
 
 BACKEND = Path(__file__).resolve().parent.parent
+REPO_ROOT = BACKEND.parent.parent
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
@@ -47,12 +48,25 @@ RESERVED = frozenset(logging.LogRecord("n", 1, "p", 1, "m", None, None).__dict__
 
 #: Modules to scan. Excludes the test suite itself: a guard that inspects its own source finds its
 #: own docstring, which is a mistake this repository has made before.
+#: Paths relative to the BACKEND, plus whole packages outside it.
 SCANNED = (
     "agent/fleet_runner.py",
+    "agent/executor.py",
     "events/relay.py",
     "ingestion_api.py",
     "agent_api.py",
     "main.py",
+)
+
+#: Other trees, resolved from the repository root. The producer is unattended and its collisions are
+#: worse than the API's: an exception there is a crawl that silently delivers nothing, whereas the API
+#: at least returns 500 to a caller who is watching.
+OTHER_TREES = (
+    "producers/run.py",
+    "producers/sources/base.py",
+    "producers/sources/rss.py",
+    "producers/sources/nigeria.py",
+    "producers/sources/intl.py",
 )
 
 
@@ -84,14 +98,21 @@ def _logger_calls(tree: ast.AST):
             yield node
 
 
-@pytest.mark.parametrize("relative", SCANNED)
+@pytest.mark.parametrize("relative", SCANNED + OTHER_TREES)
 def test_no_logger_extra_key_collides_with_a_LogRecord_attribute(relative):
-    """THE guard.
+    """THE guard, extended beyond the backend.
 
-    A collision is not a warning: `makeRecord` raises, the exception propagates out of the request
-    handler, and a 500 is returned for work that had already succeeded.
+    A collision is not a warning: `makeRecord` raises. In the API that is a 500 returned for work that
+    had already succeeded. In the PRODUCER it is worse - the crawl succeeds, the parse succeeds, and
+    the deliveries are never sent, with no caller watching.
+
+    The producer was originally outside this scan, and the defect reappeared there within the same
+    session that fixed it in the API.
     """
     path = BACKEND / relative
+    if not path.exists():
+        # Producer paths are relative to the repository root, not the backend.
+        path = REPO_ROOT / relative
     if not path.exists():
         pytest.skip(f"{relative} is not present")
 
