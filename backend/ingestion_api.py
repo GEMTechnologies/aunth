@@ -160,7 +160,10 @@ class BatchOut(BaseModel):
     created: int
     updated: int
     unchanged: int
+    #: Malformed deliveries. A problem.
     rejected: int
+    #: Deliveries the dedupe identity already knew. Not a problem - the reason a crawl is re-runnable.
+    duplicate: int = 0
     outcomes: list[OutcomeOut]
 
 
@@ -225,7 +228,16 @@ def ingest_opportunities(
             )
         )
 
-    rejected = counted["REJECTED"] + counted["DUPLICATE_DELIVERY"]
+    # TWO OPPOSITE FACTS, REPORTED SEPARATELY.
+    #
+    #   REJECTED           - a malformed delivery. A real problem somebody must fix.
+    #   DUPLICATE_DELIVERY - the dedupe identity working. A SUCCESS, and the reason a producer can
+    #                        re-run a crawl without fear.
+    #
+    # Summed into one `rejected` field they read as "forty-nine things broke" when forty-nine things
+    # were in fact recognised as already-delivered. `rejected` now means only the first.
+    rejected = counted["REJECTED"]
+    duplicate = counted["DUPLICATE_DELIVERY"]
     # THE KEYS ARE NOT `created` / `updated`, and that is not a style choice.
     #
     # `LogRecord` already has a `created` attribute (the timestamp), and `Logger.makeRecord` raises
@@ -245,6 +257,7 @@ def ingest_opportunities(
             "created_count": counted["CREATED"],
             "updated_count": counted["UPDATED"],
             "rejected_count": rejected,
+            "duplicate_count": duplicate,
         },
     )
     try:  # pragma: no cover - metrics are best-effort by design
@@ -258,6 +271,7 @@ def ingest_opportunities(
         updated=counted["UPDATED"],
         unchanged=counted["UNCHANGED"],
         rejected=rejected,
+        duplicate=duplicate,
         outcomes=response,
     )
 

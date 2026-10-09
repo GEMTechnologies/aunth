@@ -434,3 +434,49 @@ def test_the_endpoint_documents_that_its_write_is_UNSCOPED():
         "the ingestion endpoint checks organisation access, but a producer has no organisation - it "
         "feeds a catalogue that every organisation reads"
     )
+
+
+def test_a_re_delivery_is_reported_as_DUPLICATE_not_as_rejected(client):
+    """TWO OPPOSITE FACTS, kept apart.
+
+    
+ejected used to be REJECTED + DUPLICATE_DELIVERY, so a second crawl of fifty listings
+    reported 
+ejected=49 - which reads as forty-nine failures. It was forty-nine SUCCESSES: the
+    dedupe recognising what it had already stored, which is what makes a crawl safe to re-run.
+
+    I made that misreading myself and wrote it into a commit message before checking the code.
+    An operator would have gone looking for a bug that does not exist.
+    """
+    headers = {"X-Bot-Key": KEY}
+    payload = {"deliveries": [delivery()]}
+
+    first = client.post("/api/v1/ingest/opportunities", json=payload, headers=headers).json()
+    second = client.post("/api/v1/ingest/opportunities", json=payload, headers=headers).json()
+
+    assert first["created"] == 1
+    assert first["rejected"] == 0
+    assert first["duplicate"] == 0
+
+    # The re-delivery is recognised, and reported as recognition rather than as failure.
+    assert second["created"] == 0
+    assert second["duplicate"] == 1, (
+        "a re-delivery was not reported as a duplicate, so a routine re-crawl would look like it had "
+        "failed"
+    )
+    assert second["rejected"] == 0, (
+        "a duplicate was counted as rejected; the two are opposite facts and reporting them as one "
+        "number is how a healthy crawl looks broken"
+    )
+
+
+def test_a_genuinely_bad_delivery_IS_rejected_not_duplicated(client):
+    """The inverse, so the split is not satisfied by calling everything a duplicate."""
+    response = client.post(
+        "/api/v1/ingest/opportunities",
+        json={"deliveries": [delivery(title="")]},
+        headers={"X-Bot-Key": KEY},
+    )
+    body = response.json()
+    assert body["rejected"] >= 1
+    assert body["duplicate"] == 0
