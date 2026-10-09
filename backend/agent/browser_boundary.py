@@ -116,6 +116,12 @@ class ActionScope:
     #: Form paths within the portal the worker may visit. Empty means the portal root only.
     allowed_path_prefixes: tuple[str, ...] = ()
     max_steps: int = 200
+    #: Whether loopback targets are permitted for THIS task.
+    #:
+    #: False by default and deliberately so. The controlled test portal runs on 127.0.0.1 and has to
+    #: be testable, but a production task must never inherit that permission by being constructed the
+    #: same way - so it is an explicit opt-in on the scope rather than a global switch or a default.
+    allow_loopback: bool = False
 
     def permits(self, host: str, path: str) -> bool:
         if host not in self.allowed_hosts:
@@ -266,6 +272,30 @@ def validate_task(task: BrowserTask, *, org_document_ids: set[str]) -> None:
             # Suffix matching lets `notfunder.example` match. Exact hosts only.
             raise BrowserTaskRefused(
                 f"wildcard host {host!r} is not permitted; allowed hosts must be exact"
+            )
+
+    # SSRF AND INTERNAL-NETWORK PROTECTION (§8). Exact-match is not enough on its own: the allow-list
+    # is CONFIGURATION, and the controlled test portal genuinely needs `127.0.0.1` to be testable. So
+    # the hosts are screened on what they RESOLVE to, here at BUILD time - when the reason can still
+    # reach whoever wrote the configuration - and again by the runtime.
+    from .target_guard import screen_hosts, check_target
+
+    allow_loopback = bool(getattr(task.action_scope, "allow_loopback", False))
+    refused = screen_hosts(
+        task.action_scope.allowed_hosts, allow_loopback=allow_loopback
+    )
+    if refused:
+        host, why = refused[0]
+        raise BrowserTaskRefused(
+            f"allowed host {host!r} is not a permitted target: {why}"
+        )
+
+    target = getattr(task, "target_url", "") or ""
+    if target:
+        decision = check_target(target, allow_loopback=allow_loopback, resolve=False)
+        if not decision.permitted:
+            raise BrowserTaskRefused(
+                f"target_url is not a permitted target: {decision.because}"
             )
 
 
