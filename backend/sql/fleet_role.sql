@@ -111,6 +111,31 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO granada_fleet;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO granada_fleet;
 
 -- ---------------------------------------------------------------------------
+-- THE HANDLERS' REACH: role membership, not a second hand-written grant list.
+--
+-- The first version of this file granted only the fleet bookkeeping tables, and every match job died
+-- with:
+--
+--     psycopg2.errors.InsufficientPrivilege: permission denied for table org_facts
+--
+-- _handle_match reads the organisation memory through organisation_memory.current_facts(), and a
+-- specialist touches far more than the queue: opportunities, matches, workspaces, applications,
+-- documents, activity. The executor is not only a queue consumer - it is the AGENT, running on a
+-- tenant behalf.
+--
+-- Membership inherits grant_runtime_role.sql exactly, so the fleet cannot drift out of step with
+-- the application role and a table added there is picked up here automatically. The hand-written list
+-- is what fell behind, and it will again.
+--
+-- WHAT KEEPS THIS SAFE is not the grant list. It is that BYPASSRLS lives on granada_fleet while
+-- granada_app keeps none: the API, which serves untrusted requests, remains bound to one tenant.
+-- The executor resolves its organisation FROM THE JOB ROW and works inside it, and the BYPASSRLS
+-- attribute is what lets it CLAIM work across tenants - the one thing the fleet must do that a
+-- request must not.
+-- ---------------------------------------------------------------------------
+GRANT granada_app TO granada_fleet;
+
+-- ---------------------------------------------------------------------------
 -- VERIFY THE POSTURE, in the same file that grants it.
 --
 -- `grant_runtime_role.sql` is ADDITIVE and has silently re-granted a privilege nine times in this
