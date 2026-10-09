@@ -1,8 +1,67 @@
 # ADR-0011 narrowing: rollout and rollback
 
-**Status:** plan approved; not yet applied
-**Date:** 2026-10-09
+**Status:** plan approved; **narrow function applied additively; equivalence now PROVEN over a
+non-empty set; cutover and `BYPASSRLS` revoke deliberately NOT done**
+**Date:** 2026-10-09 (equivalence evidence added same day)
 **Scope:** the `granada_fleet` database role's `BYPASSRLS`, and the browser worker's credentials
+
+## Where this now stands (added 2026-10-09)
+
+Three states matter, and they are different:
+
+| Step | State |
+|---|---|
+| Narrow function `fleet_due_job_ids(batch_size)` applied | ✅ additive, production |
+| Dispatcher cut over to call it | ⬜ not done |
+| `BYPASSRLS` revoked from `granada_fleet` | ⬜ not done |
+| **Browser worker forbidden the wide role** | ✅ **enforced in code and verified live** |
+
+### The equivalence check is now conclusive
+
+It was reported `IDENTICAL` twice before **over an empty set** — 0 due, next due `none`. Two empty sets
+are always equal, so those results proved nothing. That was flagged rather than counted as done, and
+this round made it real: a due job **and** a future job inserted inside a transaction, compared, then
+**rolled back** so production was untouched.
+
+```
+PROBE: function = 1
+PROBE: direct   = 1
+PROBE EQUIVALENCE = IDENTICAL
+PROBE: both contain it     = YES    <- set comparison, not two zeros
+PROBE: future job excluded = YES    <- the function does not hand out work early
+AFTER ROLLBACK: jobs = 1273, due = 0, probe rows = 0
+```
+
+The `future job excluded` case is a correctness property, not a privilege one: a narrow function that
+released work early would break the dispatcher's contract in a way a privilege review would not catch.
+
+### Why the cutover is not done
+
+It touches the dispatcher's claim path in production. Doing it correctly needs the code change, the
+full regression, the rollback rehearsal and a deployment — and the evidence for it had to be honest
+before any of that started. The evidence is now in place; the change is unstarted rather than
+half-finished, which is the state a security migration should be left in when it is not completed.
+
+### The restriction already enforced before any worker gets credentials
+
+§12 asks for the exact restrictions required before a live browser worker receives tenant
+credentials. One of them is no longer documentation — it is a startup refusal
+(`agent/worker_privileges.py`):
+
+    granada_fleet  bypassrls = TRUE    the widest role in the system
+    granada_app    bypassrls = FALSE   already exists
+
+The browser opens a live portal, reads an organisation's documents, holds their credentials and types
+their data into a form. It needs **no** cross-tenant visibility: everything arrives in its task
+payload. A worker connecting as `granada_fleet` would be a privilege escalation by **configuration**,
+and it now refuses to open a page:
+
+```
+$ FLEET_DATABASE_URL=postgresql://granada_fleet:pw@db/granada_auth browser_worker.py < {}
+{"status": "REJECTED", ..., "problems": [{"kind": "PRIVILEGE_REFUSED", ...}]}
+```
+
+Its limit is recorded rather than implied away: it cannot detect a role granted **after** startup.
 
 ## The problem, measured
 
