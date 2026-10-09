@@ -350,6 +350,7 @@ class BrowserRuntime:
         declaration_authorised: bool = False,
         org_document_ids: Optional[set[str]] = None,
         submission_authorised: bool = False,
+        skip_launch: bool = False,
     ) -> RunReport:
         """Execute the task, or refuse to start.
 
@@ -376,7 +377,11 @@ class BrowserRuntime:
         declaration_accepted = False
         self._started = self._now()
 
-        self.provider.launch(profile_dir=f"/tmp/granada-browser/{task.org_id}", headless=True)
+        # skip_launch lets a caller that already opened the browser (and navigated to the target)
+        # hand over a ready session. Without it, the runtime would launch a second browser on
+        # about:blank and every plan would be derived from an empty page.
+        if not skip_launch:
+            self.provider.launch(profile_dir=f"/tmp/granada-browser/{task.org_id}", headless=True)
         try:
             while True:
                 if self._expired():

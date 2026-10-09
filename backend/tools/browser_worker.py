@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""The host-side browser worker. One task in, one outcome out.
+
+WHY THIS RUNS ON THE HOST AND NOT IN THE EXECUTOR CONTAINER
+-----------------------------------------------------------
+Measured, not assumed:
+
+    executor container   CapEff 0000000000000000, Docker seccomp profile
+    unshare --user       "unshare failed: Operation not permitted"
+
+Chromium's sandbox is built on that syscall, so a SANDBOXED browser cannot start in the container.
+The alternatives were `--no-sandbox` (the directive forbids it) or unconfining the container's seccomp,
+which would strip syscall filtering from every job the executor runs rather than only browser jobs.
+
+On the host it works: exit 0, real DOM, sandbox on, with an AppArmor profile granting user namespaces
+to two binary paths only. That is a narrower change than either alternative.
+
+WHAT IT IS NOT
+--------------
+It is not an agent. It does not plan, decide authority, verify outcomes or reconcile - those are
+`browser_runtime`, `action_grounding`, `submission_authority`, `verification` and
+`submission_lifecycle`, and duplicating any of them here would put decisions outside the tested
+modules. This process is a PROVIDER: it observes a page and performs actions, and reports what
+happened.
+
+It also never decides it has submitted. A receipt is passed through if the page yielded one; the
+outcome is `SUBMISSION_PENDING` otherwise, because a click is not a confirmation.
+
+USAGE
+-----
+    echo '<BrowserTask json>' | browser_worker.py
+
+Reads the task from stdin and writes one JSON object to stdout. Nothing tenant-identifying is passed
+on the command line, where it would appear in the process table.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+# The worker imports the same runtime the tests exercise. It is deliberately NOT a second
+# implementation: everything it does is expressed through the Agent* contracts.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from agent.browser_runtime import (  # noqa: E402
+    BrowserRuntime,
+    BrowserError,
+    Failure,
+    PageState,
+    RetryPolicy,
+    Step,
+    ActionResult,
+)
+
+
+@dataclass
+class Perception:
+    """What was seen on one page, in the shape browser_runtime plans from.
+
+    Structural only. Vision, when a model is configured, would ADD to this rather than replace it -
+    the runtime already knows how to escalate when structure is silent.
+    """
+
+    url: str = ""
+    title: str = ""
+    fields: dict[str, dict[str, Any]] = field(default_factory=dict)
+    controls: list[str] = field(default_factory=list)
+    validation_messages: list[str] = field(default_factory=list)
+    untrusted_text: str = ""
+
+
+class PlaywrightProvider:
+    """A BrowserProvider backed by Playwright's Chromium, with the sandbox ON.
+
+    One browser per task, closed in a finally block by the runtime. No session is retained between
+    tasks, because the directive forbids a permanent browser process per organisation and because
+    retaining one would be the easiest way to leak state across tenants.
+    """
+
+    name = "playwright-chromium"
+
+    def __init__(self, *, headless: bool = True, timeout_ms: int = 20000) -> None:
+        self.headless = headless
+        self.timeout_ms = timeout_ms
+        self._pw = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._profile: Optional[str] = None
+
+    # -- lifecycle -----------------------------------------------------------
+    def launch(self, *, profile_dir: str, headless: bool = True) -> None:
+        from playwright.sync_api import sync_playwright
+
+        # A per-tenant profile directory, created under a private temp root. `profile_dir` is derived
+        # from the task's org_id by the runtime, so two organisations never share a cookie jar.
+        os.makedirs(profile_dir, exist_ok=True)
+        self._profile = tempfile.mkdtemp(prefix="granada-browser-")
+        self._pw = sync_playwright().start()
+        # NOTE: no `args=["--no-sandbox"]`. The AppArmor profile is what makes this work.
+        #
+        # launch_persistent_context, NOT new_context: `user_data_dir` is a persistent-context
+        # parameter, and passing it to new_context raises TypeError. The persistent form is also the
+        # correct one here - it is what gives each organisation its own profile directory on disk, so
+        # cookies and local storage cannot cross between tenants.
+        self._context = self._pw.chromium.launch_persistent_context(
+            user_data_dir=self._profile,
+            headless=headless and self.headless,
+            args=["--disable-dev-shm-usage"],
+            viewport={"width": 1280, "height": 900},
+        )
+        self._browser = self._context.browser
+        self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
+        self._page.set_default_timeout(self.timeout_ms)
+
+    def goto(self, url: str) -> None:
+        """Navigate to the task target. WITHOUT THIS the worker plans against about:blank.
+
+        The first end-to-end run reported status=COMPLETED having completed zero steps, because
+        nothing had been loaded, nothing was required, and "nothing to do" was indistinguishable from
+        "done". That is precisely the false completion claim the directive forbids: a successful
+        browser command is not proof of task completion.
+        """
+        self._page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+
+    def close(self) -> None:
+        for closer in (getattr(self, "_context", None), self._browser, self._pw):
+            try:
+                if closer is not None:
+                    closer.close() if hasattr(closer, "close") else closer.stop()
+            except Exception:
+                pass
+        self._context = self._browser = self._pw = self._page = None
+        if self._profile and os.path.isdir(self._profile):
+            shutil.rmtree(self._profile, ignore_errors=True)
+
+    # -- perception ----------------------------------------------------------
+    def observe(self) -> PageState:
+        """Read the page's structure. Deterministic, no model, no inference.
+
+        Fields carry their label as well as their name, which is what lets the planner work on a
+        relabelled page - the `?variant=b` case the whole comparison rests on.
+        """
+        page = self._page
+        data = page.evaluate(
+            """() => {
+                const els = Array.from(document.querySelectorAll('input,select,textarea'));
+                const fields = {};
+                for (const el of els) {
+                    if (!el.name) continue;
+                    let label = '';
+                    if (el.labels && el.labels.length) label = el.labels[0].innerText.trim();
+                    if (!label && el.getAttribute('aria-label')) label = el.getAttribute('aria-label');
+                    fields[el.name] = {
+                        label: label,
+                        type: (el.type || el.tagName).toLowerCase(),
+                        required: !!(el.required || el.getAttribute('aria-required') === 'true'),
+                        value: el.value || '',
+                    };
+                }
+                const controls = Array.from(document.querySelectorAll('button,input[type=submit],a[role=button]'))
+                    .map(b => (b.innerText || b.value || '').trim()).filter(Boolean);
+                const errors = Array.from(document.querySelectorAll(
+                    '.field-error,[role=alert],.error,.invalid-feedback'
+                )).map(e => e.innerText.trim()).filter(Boolean);
+                return {
+                    url: location.href, title: document.title,
+                    fields: fields, controls: controls, errors: errors,
+                    text: document.body ? document.body.innerText.slice(0, 4000) : '',
+                };
+            }"""
+        )
+        return PageState(
+            url=data.get("url", ""),
+            title=data.get("title", ""),
+            fields=data.get("fields", {}),
+            controls=data.get("controls", []),
+            validation_messages=data.get("errors", []),
+            untrusted_text=data.get("text", ""),
+        )
+
+    def screenshot(self) -> str:
+        """Save a screenshot by reference and return the path. Never the bytes."""
+        path = os.path.join(self._profile or tempfile.gettempdir(), f"shot-{int(__import__('time').time())}.png")
+        try:
+            self._page.screenshot(path=path, full_page=True)
+        except Exception:
+            return ""
+        return path
+
+    # -- action --------------------------------------------------------------
+    def act(self, step: Step, target: str, value: Optional[str] = None) -> ActionResult:
+        """Perform one action, grounded in the current page.
+
+        Failures are CLASSIFIED rather than merely caught, because the runtime's recovery policy
+        depends on the class: a transient network error is retryable, an intercepted click is not.
+        """
+        page = self._page
+        try:
+            if step is Step.FILL:
+                page.fill(f"[name='{target}']", value or "")
+            elif step is Step.UPLOAD:
+                page.set_input_files(f"[name='{target}']", value)
+            elif step is Step.DECLARE:
+                # A declaration control is a checkbox in the fixture and a button elsewhere; try both.
+                try:
+                    page.check(f"text={target}")
+                except Exception:
+                    page.click(f"text={target}")
+            elif step is Step.CLICK:
+                page.click(f"text={target}")
+            elif step is Step.SUBMIT:
+                # NO retry wrapper here. An ambiguous submit is the runtime's UNCERTAIN case, and
+                # retrying inside the provider would file twice before the runtime ever saw it.
+                page.click(f"text={target}")
+            else:
+                return ActionResult(ok=False, failure=Failure.UNKNOWN, detail=f"unsupported step {step}")
+            page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
+            return ActionResult(ok=True, page=self.observe())
+        except Exception as exc:
+            return ActionResult(ok=False, failure=_classify(exc), detail=str(exc)[:300])
+
+
+def _classify(exc: Exception) -> Failure:
+    """Map a Playwright error to the runtime's failure vocabulary.
+
+    Ordered from most specific to least: a timeout during submit must not be mistaken for a timeout
+    while reading the page, because only one of those could have had an external effect.
+    """
+    text = str(exc).lower()
+    if "captcha" in text or "recaptcha" in text:
+        return Failure.HUMAN_VERIFICATION
+    if "403" in text or "forbidden" in text:
+        return Failure.ACCESS_DENIED
+    if "strict mode violation" in text or "not attached" in text or "detached" in text:
+        return Failure.ELEMENT_CHANGED
+    if "timeout" in text:
+        return Failure.TRANSIENT_NETWORK
+    if "net::" in text:
+        return Failure.TRANSIENT_NETWORK
+    if "invalid" in text or "validation" in text:
+        return Failure.VALIDATION_REJECTED
+    return Failure.UNKNOWN
+
+
+def main() -> int:
+    """Read a task, run it, print one JSON outcome.
+
+    A malformed input is reported as an outcome rather than a traceback, because the caller parses
+    stdout and a stack trace on stderr with exit 0 would look like success.
+    """
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        print(json.dumps({"status": "FAILED", "problems": [{"kind": "BAD_TASK_JSON"}]}))
+        return 0
+
+    # The worker trusts NOTHING in the payload beyond what it needs, and never treats page text as
+    # instruction. The runtime re-validates the task; this is a second gate, not the only one.
+    from agent.browser_boundary import ActionScope, BrowserTask
+
+    # ActionScope must be CONSTRUCTED, not passed through as a dict. Sending the raw JSON made
+    # validate_task fail with "'dict' object has no attribute 'allowed_hosts'" - and the worker's own
+    # crash handler caught it and reported UNCERTAIN rather than a false success, which is the safety
+    # design doing its job on its own author's bug.
+    scope_payload = payload.get("action_scope") or {}
+    try:
+        scope = ActionScope(
+            portal_name=str(scope_payload.get("portal_name", "")),
+            allowed_hosts=tuple(scope_payload.get("allowed_hosts") or ()),
+            allowed_path_prefixes=tuple(scope_payload.get("allowed_path_prefixes") or ()),
+            max_steps=int(scope_payload.get("max_steps", 200)),
+        )
+    except Exception as exc:
+        print(json.dumps({"status": "FAILED", "problems": [{"kind": "BAD_ACTION_SCOPE", "detail": str(exc)[:200]}]}))
+        return 0
+
+    try:
+        task = BrowserTask(
+            task_id=payload.get("task_id", ""),
+            org_id=payload.get("org_id", ""),
+            package_id=payload.get("package_id", ""),
+            workflow_id=None,
+            job_id=None,
+            package_fingerprint=payload.get("package_fingerprint", ""),
+            action_scope=scope,
+            credentials=[],
+            form_data=payload.get("form_data") or {},
+            documents=payload.get("documents") or [],
+        )
+    except Exception as exc:
+        print(json.dumps({"status": "FAILED", "problems": [{"kind": "TASK_CONSTRUCTION", "detail": str(exc)[:200]}]}))
+        return 0
+
+    values = {k: str(v) for k, v in (payload.get("form_data") or {}).items() if v not in (None, "")}
+    uploads = {
+        d.get("field") or d.get("doc_type") or "file": d.get("path", "")
+        for d in (payload.get("documents") or [])
+        if d.get("path")
+    }
+
+    provider = PlaywrightProvider()
+    runtime = BrowserRuntime(provider, policy=RetryPolicy())
+    target_url = payload.get("target_url") or ""
+    try:
+        # Navigate FIRST. The runtime plans from what the page shows, so an unloaded page is not an
+        # empty task - it is an unasked question.
+        provider.launch(profile_dir=f"/tmp/granada-browser/{task.org_id}", headless=True)
+        if not target_url:
+            print(json.dumps({
+                "status": "BLOCKED",
+                "outcome_certain": True,
+                "problems": [{
+                    "kind": "NO_TARGET_URL",
+                    "detail": "the task named no target_url, so there was nothing to open; refusing to report completion without having visited a page",
+                }],
+            }))
+            return 0
+        provider.goto(target_url)
+        report = runtime.run(
+            task, skip_launch=True,
+            values=values,
+            uploads=uploads,
+            declaration_authorised=False,
+            org_document_ids=set(payload.get("org_document_ids") or []),
+            submission_authorised=False,   # never granted by the worker; authority is the caller's
+        )
+        out = report.to_dict()
+
+        # FALSE-COMPLETION GUARD. "COMPLETED" with no completed steps and no uploads means the run
+        # finished without doing anything - which is a blocked or unloaded page, not a success. The
+        # directive is explicit that a successful browser command is not proof of task completion.
+        if out.get("status") == "COMPLETED" and not out.get("completed_steps") and not out.get("uploaded"):
+            out["status"] = "BLOCKED"
+            out.setdefault("problems", []).append({
+                "kind": "NOTHING_ACHIEVED",
+                "detail": "the run reported completion having performed no steps; treating that as blocked rather than done",
+            })
+    except BrowserError as exc:
+        out = {"status": "FAILED", "problems": [{"kind": "RUNTIME_BOUND", "detail": str(exc)[:300]}]}
+    except Exception as exc:
+        # A crash is reported as an uncertain outcome, NOT as success and not as a plain failure: if
+        # it happened after a submit attempt, the runtime's own UNCERTAIN rule applies and the caller
+        # must reconcile.
+        out = {
+            "status": "UNCERTAIN",
+            "outcome_certain": False,
+            "problems": [{"kind": "WORKER_CRASH", "detail": f"{type(exc).__name__}: {str(exc)[:200]}"}],
+        }
+
+    out["provider"] = provider.name
+    out["sandbox"] = "enabled"
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
