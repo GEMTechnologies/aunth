@@ -200,6 +200,20 @@ class Settings(BaseSettings):
     # and revocation, which needs a migration - so this is the honest v1, not the finished shape.
     ingest_bot_key: str = ""
 
+    # -- API documentation --------------------------------------------------
+    #
+    # The interactive docs (/docs, /redoc) used to be gated on debug alone:
+    #
+    #     docs_url="/docs" if settings.debug else None
+    #
+    # which made them all-or-nothing with a flag that ALSO changes error verbosity, CORS and cookie
+    # behaviour. Wanting the API reference available is not the same as wanting production to run in
+    # debug mode, and tying them together meant the only way to see the docs was to weaken everything
+    # else.
+    #
+    # Default False: the schema describes every endpoint and is not something to publish by accident.
+    api_docs_enabled: bool = False
+
     api_url: str = "http://localhost:8000"
     frontend_url: str = "http://localhost:3001"
     web_url: str = "http://0.0.0.0:3001"

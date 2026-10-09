@@ -124,8 +124,10 @@ app = FastAPI(
     title=settings.api_title,
     version=settings.api_version,
     description="Comprehensive authentication and user management service for the Granada platform",
-    docs_url="/docs" if settings.debug else None,
-    redoc_url="/redoc" if settings.debug else None,
+    # debug still enables them, so nothing that works today changes; pi_docs_enabled is the
+    # deliberate switch that does not also weaken error verbosity, CORS and cookies.
+    docs_url="/docs" if (settings.debug or settings.api_docs_enabled) else None,
+    redoc_url="/redoc" if (settings.debug or settings.api_docs_enabled) else None,
     lifespan=lifespan
 )
 
