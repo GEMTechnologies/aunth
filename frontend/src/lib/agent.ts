@@ -147,10 +147,46 @@ export interface NotificationFeed {
   notifications: Notification[];
 }
 
+export interface ApplicationPackage {
+  package_id: string;
+  opportunity_title?: string | null;
+  opportunity_url?: string | null;
+  deadline?: string | null;
+  deadline_is_exact?: boolean | null;
+  status: string;
+  //: The readiness verdict, evaluated by the server at read time.
+  readiness: 'READY' | 'BLOCKED' | 'ASSEMBLING' | 'FAILED';
+  //: The operator sentence. Names the blocker; never says "failed" for a missing upload.
+  message: string;
+  satisfied: number;
+  required: number;
+  documents: string[];
+  missing: string[];
+  //: What the ORGANISATION must supply. Distinct from anything the platform still owes, because
+  //: asking an NGO for a document the system generates is the failure this field prevents.
+  needs_organisation: string[];
+  version?: number | null;
+  submission_mode: string;
+  //: True only once an external receipt exists.
+  submitted: boolean;
+  created_at?: string | null;
+}
+
+export interface PackageSummary {
+  packages: ApplicationPackage[];
+  total: number;
+  ready: number;
+  blocked: number;
+  failed: number;
+  submitted: number;
+}
+
 // ---------------------------------------------------------------------------
 // Calls
 // ---------------------------------------------------------------------------
 export const fetchAgentStatus = () => load<AgentStatus>('/agent');
+
+export const fetchPackages = () => load<PackageSummary>('/agent/packages');
 
 export const fetchGrants = () => load<{ count: number; grants: Grant[] }>('/agent/grants');
 

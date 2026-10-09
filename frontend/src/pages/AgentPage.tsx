@@ -6,9 +6,11 @@ import {
   Grant,
   Notification,
   NotificationFeed,
+  PackageSummary,
   fetchCompliance,
   fetchDeadlines,
   fetchGrants,
+  fetchPackages,
   fetchNotifications,
   markNotification,
 } from '../lib/agent';
@@ -155,21 +157,24 @@ const AgentPage: React.FC<AgentPageProps> = ({ organisationName }) => {
   const [compliance, setCompliance] = useState<AgentResult<ComplianceSummary> | null>(null);
   const [deadlines, setDeadlines] = useState<AgentResult<{ count: number; deadlines: Deadline[] }> | null>(null);
   const [grants, setGrants] = useState<AgentResult<{ count: number; grants: Grant[] }> | null>(null);
+  const [packages, setPackages] = useState<AgentResult<PackageSummary> | null>(null);
   const [notifications, setNotifications] = useState<AgentResult<NotificationFeed> | null>(null);
 
   const reload = useCallback(async () => {
     // Kicked off together and awaited together: four independent reads, and one being slow
     // should not hold up the other three.
-    const [c, d, g, n] = await Promise.all([
+    const [c, d, g, n, p] = await Promise.all([
       fetchCompliance(),
       fetchDeadlines(30),
       fetchGrants(),
       fetchNotifications(),
+      fetchPackages(),
     ]);
     setCompliance(c);
     setDeadlines(d);
     setGrants(g);
     setNotifications(n);
+    setPackages(p);
   }, []);
 
   useEffect(() => {
@@ -402,6 +407,75 @@ const AgentPage: React.FC<AgentPageProps> = ({ organisationName }) => {
             </ul>
           )}
         </Card>
+
+        {/* -- APPLICATION PACKAGES -------------------------------------- */}
+        <div className="lg:col-span-2">
+          <Card
+            title="Application packages"
+            subtitle="What each funder still needs, and what is already assembled."
+            state={stateOf(packages)}
+            emptyMessage="No application packages yet."
+            isEmpty={(p: PackageSummary) => p.packages.length === 0}
+            onRetry={reload}
+          >
+            {(p: PackageSummary) => (
+              <div>
+                {/* Counts derived from the server's persisted state, and BLOCKED is not FAILED:
+                    a missing upload is the organisation's action, not a technical failure. */}
+                <p className="text-xs text-gray-500 mb-3">
+                  {p.ready} ready · {p.blocked} blocked · {p.failed} failed
+                  {p.submitted > 0 ? ` · ${p.submitted} submitted` : ''}
+                </p>
+                <ul className="space-y-3">
+                  {p.packages.map((pkg) => (
+                    <li key={pkg.package_id} className="border-b last:border-0 pb-3" data-testid="package-row">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <span className="font-medium text-gray-900 block truncate">
+                            {pkg.opportunity_title || 'Untitled opportunity'}
+                          </span>
+                          <span className="block text-xs text-gray-500">
+                            {pkg.message}
+                          </span>
+                        </div>
+                        <span
+                          className={
+                            'shrink-0 text-xs px-2 py-1 rounded ' +
+                            (pkg.readiness === 'READY'
+                              ? 'bg-green-100 text-green-800'
+                              : pkg.readiness === 'FAILED'
+                              ? 'bg-red-100 text-red-800'
+                              : 'bg-amber-100 text-amber-800')
+                          }
+                        >
+                          {pkg.readiness}
+                        </span>
+                      </div>
+                      {pkg.missing.length > 0 && (
+                        <p className="text-xs text-gray-500 mt-1">
+                          Missing: {pkg.missing.join(', ')}
+                        </p>
+                      )}
+                      {pkg.needs_organisation.length > 0 && (
+                        // Said separately, and in the organisation's own terms, because these are
+                        // uploads it must make. The rest is the platform's remaining work.
+                        <p className="text-xs text-amber-700 mt-1">
+                          Your organisation must provide: {pkg.needs_organisation.join(', ')}
+                        </p>
+                      )}
+                      {pkg.deadline && (
+                        <p className="text-xs text-gray-400 mt-1">
+                          Deadline {new Date(pkg.deadline).toLocaleDateString()}
+                          {pkg.deadline_is_exact === false ? ' (time not stated by the funder)' : ''}
+                        </p>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </Card>
+        </div>
 
         {/* -- GRANTS ---------------------------------------------------- */}
         <div className="lg:col-span-2">
