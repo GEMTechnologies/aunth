@@ -252,11 +252,17 @@ def plan_next(
     # "Next".
     for control in page.controls:
         low = control.lower()
-        if any(w in low for w in ("continue", "next", "proceed", "go on", "save and continue")):
+        if not any(w in low for w in ("continue", "next", "proceed", "go on", "save and continue")):
+            continue
+        if control in already_done:
             return PlannedAction(
-                Step.CLICK, control, None,
-                "the visible fields are satisfied, so the page advances rather than being finished",
+                Step.BLOCKED, control, None,
+                f"{control!r} was already clicked and the page has not changed; refusing to click it again",
             )
+        return PlannedAction(
+            Step.CLICK, control, None,
+            "the visible fields are satisfied, so the page advances rather than being finished",
+        )
 
     # 5. Submit only when the page is offering it and nothing is outstanding.
     for control in page.controls:
@@ -502,6 +508,11 @@ class BrowserRuntime:
                     done.add(action.target)
                 elif action.step == Step.FILL:
                     report.field_outcomes[action.target] = "FILLED"
+                    done.add(action.target)
+                elif action.step == Step.CLICK:
+                    # Marked done so a page that has not moved cannot be clicked again. Without this
+                    # the runtime re-planned the same advance until the action budget stopped it -
+                    # sixty clicks on a page that never changed.
                     done.add(action.target)
                 report.completed_steps.append(f"{action.step.value}:{action.target}")
 

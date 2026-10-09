@@ -152,6 +152,9 @@ def test_01_unfamiliar_form_is_planned_from_the_page_not_a_script():
     r = BrowserRuntime(provider).run(btask(), values={"legal_name": "Fictional NGO"}, uploads={})
     assert provider.launched and provider.closed
     assert any(a[0] is Step.FILL and a[1] == "legal_name" for a in provider.actions)
+    # The page also offers Continue, so the run advances afterwards. Filling is what this test is
+    # about; the CLICK is the advance branch doing its job.
+    assert any(a[0] is Step.CLICK for a in provider.actions)
 
 
 # ===========================================================================
@@ -167,7 +170,13 @@ def test_02_a_changed_layout_does_not_change_the_plan():
     )
     ra = BrowserRuntime(FakeProvider([a])).run(btask(), values={"organisation_name": "N"}, uploads={})
     rb = BrowserRuntime(FakeProvider([b])).run(btask(), values={"organisation_name": "N"}, uploads={})
-    assert ra.completed_steps == rb.completed_steps
+    fills_a = [s for s in ra.completed_steps if s.startswith("FILL")]
+    fills_b = [s for s in rb.completed_steps if s.startswith("FILL")]
+    assert fills_a == fills_b, "relabelling changed which fields are filled"
+    # Variant b also ADVANCES, because it offers a progress control; variant a offers none, so it
+    # does not. The assertion is about the relabelling, not about the advance - asserting a CLICK for
+    # a page with no controls was my error, not the runtime's.
+    assert any(s.startswith("CLICK") for s in rb.completed_steps)
 
 
 # ===========================================================================
@@ -181,6 +190,10 @@ def test_03_multi_page_progression_is_planned_and_checkpointed():
     provider = FakeProvider(pages)
     report = BrowserRuntime(provider).run(btask(), values={"a": "1", "b": "2"}, uploads={})
     assert report.checkpoints, "progress was not checkpointed"
+    # Both sections are now filled, because the run advances between them instead of stopping after
+    # the first. This is the behaviour the test always described.
+    fills = [s for s in report.completed_steps if s.startswith("FILL")]
+    assert "FILL:a" in fills and "FILL:b" in fills, report.completed_steps
 
 
 # ===========================================================================
@@ -288,6 +301,8 @@ def test_10_a_modal_that_changes_the_page_causes_a_reobserve_not_a_repeat():
     report = BrowserRuntime(provider).run(btask(), values={"a": "1"}, uploads={})
     assert report.recovery_attempts, "an ELEMENT_CHANGED failure was not recovered"
     assert report.recovery_attempts[0]["failure"] == Failure.ELEMENT_CHANGED.value
+    # Recovery re-observed and continued rather than repeating the failed action blindly.
+    assert report.completed_steps, "recovery produced no progress at all"
 
 
 @pytest.mark.skip(reason=NOT_EXECUTED)
