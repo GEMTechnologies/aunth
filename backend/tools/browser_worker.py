@@ -104,9 +104,21 @@ class PlaywrightProvider:
     def launch(self, *, profile_dir: str, headless: bool = True) -> None:
         from playwright.sync_api import sync_playwright
 
-        # A per-tenant profile directory, created under a private temp root. `profile_dir` is derived
-        # from the task's org_id by the runtime, so two organisations never share a cookie jar.
-        os.makedirs(profile_dir, exist_ok=True)
+        # THE TENANT PROFILE IS THE mkdtemp DIRECTORY, NOT `profile_dir`.
+        #
+        # `os.makedirs(profile_dir)` used to run here and create /tmp/granada-browser/<org_id>/ - and
+        # NOTHING REMOVED IT. `close()` removes `self._profile`, which is the mkdtemp directory, so
+        # every organisation that ever ran left a directory named after itself, forever. On a host
+        # serving thousands of NGOs that is both an unbounded leak and a directory listing of which
+        # organisations have been active.
+        #
+        # The real Chromium profile is `self._profile`: launch_persistent_context uses it as
+        # `user_data_dir`, which is what actually gives each organisation its own cookie jar. The
+        # `profile_dir` argument was created and then never used - dead code that leaked.
+        #
+        # `profile_dir` is kept in the signature because the runtime supplies it and a caller may
+        # want it for diagnostics, but it is NOT created. A directory that exists only to be
+        # abandoned is worse than no directory.
         self._profile = tempfile.mkdtemp(prefix="granada-browser-")
         self._pw = sync_playwright().start()
         # NOTE: no `args=["--no-sandbox"]`. The AppArmor profile is what makes this work.
@@ -173,6 +185,13 @@ class PlaywrightProvider:
         self._context = self._browser = self._pw = self._page = None
         if self._profile and os.path.isdir(self._profile):
             shutil.rmtree(self._profile, ignore_errors=True)
+        self._profile = None
+
+        # A CRASH LEAVES THE mkdtemp DIRECTORY BEHIND, because close() never runs. The runtime calls
+        # close() in a finally, but a SIGKILL does not reach finally. Sweep any sibling profile from a
+        # previous run of THIS process, bounded and best-effort: a leak that only appears on crashes
+        # is the one nobody notices until the disk is full.
+        _sweep_stale_profiles(keep=None)
 
     # -- perception ----------------------------------------------------------
     def observe(self) -> PageState:
@@ -302,6 +321,37 @@ class PlaywrightProvider:
             return ActionResult(ok=True, page=self.observe())
         except Exception as exc:
             return ActionResult(ok=False, failure=_classify(exc), detail=str(exc)[:300])
+
+
+#: Profiles older than this are assumed abandoned. Generous, because a slow portal is still a live
+#: run, and sweeping a running session's cookies would break it in a way that looks like a site bug.
+STALE_PROFILE_SECONDS = 6 * 60 * 60
+
+
+def _sweep_stale_profiles(*, keep: str | None, now: float | None = None) -> list[str]:
+    """Remove abandoned profile directories. Best-effort, bounded, and never fatal.
+
+    Bounded by AGE rather than by name, because a profile belonging to a concurrent run must survive:
+    sweeping a live session's cookies would corrupt an in-flight submission and look like a site bug.
+
+    Returns what it removed, so a caller can report it rather than silently tidying.
+    """
+    import glob
+    import time
+
+    moment = now if now is not None else time.time()
+    removed: list[str] = []
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), "granada-browser-*")):
+        if keep and os.path.abspath(path) == os.path.abspath(keep):
+            continue
+        try:
+            if moment - os.path.getmtime(path) < STALE_PROFILE_SECONDS:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(path)
+        except OSError:
+            continue
+    return removed
 
 
 def _classify(exc: Exception) -> Failure:
