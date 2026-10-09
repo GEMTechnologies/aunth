@@ -89,6 +89,36 @@ class ModelRequest:
     # Ask the provider for a JSON object when a schema is required. This is a
     # hint that improves reliability, never the validation step itself.
     json_mode: bool = False
+    #: Images to send alongside the prompt, as data URLs or https URLs.
+    #:
+    #: WHY THIS FIELD HAD TO EXIST. A model that cannot see receiving an image-dependent task does
+    #: not raise - it answers, fluently and wrongly, and nothing downstream can tell that no pixels
+    #: were examined. `agent.multimodal_routing` refuses that ROUTING; this field is how a capable
+    #: model actually receives the pixels.
+    #:
+    #: A tuple, not a list: a frozen request must not be mutable, and an append after the capability
+    #: check would mean the request that was checked is not the request that is sent.
+    images: tuple[str, ...] = ()
+
+
+def _user_content(request: ModelRequest) -> Any:
+    """Build the user turn, as a string or as multimodal parts.
+
+    A TEXT-ONLY REQUEST KEEPS THE PLAIN-STRING SHAPE. One code path that always emits a parts array
+    would change the wire format for every existing caller, and providers differ in how they tolerate
+    `content: [{"type":"text",...}]` when there is no image - so the simple case stays simple and
+    only an actual image switches the shape.
+
+    The OpenAI-compatible vision format is used, which DeepSeek follows. An image is passed as a URL
+    or data URL and referenced, never altered here: this function does not read, decode or resize
+    anything, so it cannot become a place where an image is quietly rewritten.
+    """
+    if not request.images:
+        return request.prompt
+    parts: list[dict[str, Any]] = [{"type": "text", "text": request.prompt}]
+    for image in request.images:
+        parts.append({"type": "image_url", "image_url": {"url": image}})
+    return parts
 
 
 @dataclass(frozen=True)
@@ -182,7 +212,7 @@ class OpenAICompatibleProvider:
             "model": request.model,
             "messages": [
                 {"role": "system", "content": request.system},
-                {"role": "user", "content": request.prompt},
+                {"role": "user", "content": _user_content(request)},
             ],
             "max_tokens": request.max_output_tokens,
             "temperature": request.temperature,
