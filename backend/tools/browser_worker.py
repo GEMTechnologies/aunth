@@ -121,8 +121,20 @@ class PlaywrightProvider:
         # abandoned is worse than no directory.
         self._profile = tempfile.mkdtemp(prefix="granada-browser-")
         self._pw = sync_playwright().start()
-        # NOTE: no `args=["--no-sandbox"]`. The AppArmor profile is what makes this work.
+
+        # THE LAUNCH ARGUMENTS ARE CHECKED, NOT TRUSTED.
         #
+        # Note there is no `args=["--no-sandbox"]`: the AppArmor profile at
+        # /etc/apparmor.d/granada-chromium grants `userns` to the two Playwright binary paths, and that
+        # is the supported route. Both properties here - sandbox ON, and no debugging endpoint - were
+        # true only by ABSENCE from this list: one edit adding a debugging flag, or a --no-sandbox to
+        # make a container start, would have silently undone a security property no test was watching.
+        # So the list is now validated before it is used.
+        from agent.launch_guard import assert_launch_args
+
+        launch_args = ["--disable-dev-shm-usage"]
+        assert_launch_args(launch_args)
+
         # launch_persistent_context, NOT new_context: `user_data_dir` is a persistent-context
         # parameter, and passing it to new_context raises TypeError. The persistent form is also the
         # correct one here - it is what gives each organisation its own profile directory on disk, so
@@ -130,7 +142,7 @@ class PlaywrightProvider:
         self._context = self._pw.chromium.launch_persistent_context(
             user_data_dir=self._profile,
             headless=headless and self.headless,
-            args=["--disable-dev-shm-usage"],
+            args=launch_args,
             viewport={"width": 1280, "height": 900},
         )
         self._browser = self._context.browser
