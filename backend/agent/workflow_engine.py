@@ -110,6 +110,13 @@ class AgentMismatch(FleetError):
     """
 
 
+#: How long a workflow waits after parking on missing INFORMATION rather than on a transient fault.
+#:
+#: Six hours, matching the unhandled-specialist path, because the blocker is a human action - an
+#: organisation supplying its country or registration date - and retrying every few seconds cannot
+#: make that happen any sooner.
+WAITING_RETRY_BACKOFF = timedelta(hours=6)
+
 #: Workflow types this phase can actually execute.
 WORKFLOW_MATCH = "opportunity_match"
 WORKFLOW_QUALIFY = "opportunity_qualify"
@@ -682,6 +689,23 @@ class AgentWorker:
                 workflow.next_run_at = activity["next_run_at"]
             elif activity["next_state"] == models.AgentWorkflow.RUNNING:
                 workflow.next_run_at = datetime.now(timezone.utc)
+            elif activity["next_state"] == models.AgentWorkflow.WAITING:
+                # WAITING HAD NO BRANCH HERE, and that made a parked workflow immortal.
+                #
+                # `due_workflows` selects `state IN (PENDING, WAITING) AND next_run_at <= now`. A
+                # handler that parks on missing information - an organisation that has not supplied
+                # its country or registration date - left `next_run_at` at the value it already had,
+                # which is in the past the instant the row is written. So the very next sweep found
+                # it due, dispatched another job, the handler parked it again, and the loop repeated
+                # for as long as the platform ran.
+                #
+                # Measured on the VPS: 1,146 jobs from 2 workflows, all SUCCEEDED, all attempt=1 -
+                # not retries, NEW jobs - accruing at roughly eight a minute, indefinitely. No error
+                # was ever logged, because nothing failed. The only symptom was a table growing.
+                #
+                # The backoff is for the information, not for the failure: the gate is correct to
+                # refuse, and a human has to supply the facts.
+                workflow.next_run_at = datetime.now(timezone.utc) + WAITING_RETRY_BACKOFF
 
         if activity.get("enqueue"):
             self._enqueue_next(workflow, agent, activity["enqueue"])
