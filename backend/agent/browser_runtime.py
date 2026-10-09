@@ -35,7 +35,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Optional, Protocol
+from typing import Any, Optional, Protocol, runtime_checkable
 
 from .browser_boundary import (
     ActionScope,
@@ -167,6 +167,7 @@ class ActionResult:
     page: Optional[PageState] = None
 
 
+@runtime_checkable
 class BrowserProvider(Protocol):
     """What an adapter must implement. Small on purpose: everything provider-specific lives behind
     these five calls, so swapping Stagehand for Browser Use is a new class and not a rewrite."""
