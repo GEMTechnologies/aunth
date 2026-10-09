@@ -95,6 +95,10 @@ class PlaywrightProvider:
         self._context = None
         self._page = None
         self._profile: Optional[str] = None
+        #: Where captured artefacts go so they outlive the run. None means scratch-only.
+        self._evidence: Any = None
+        #: Whether the last reference returned by screenshot() survives close().
+        self.evidence_durable: bool = False
 
     # -- lifecycle -----------------------------------------------------------
     def launch(self, *, profile_dir: str, headless: bool = True) -> None:
@@ -229,13 +233,43 @@ class PlaywrightProvider:
         )
 
     def screenshot(self) -> str:
-        """Save a screenshot by reference and return the path. Never the bytes."""
-        path = os.path.join(self._profile or tempfile.gettempdir(), f"shot-{int(__import__('time').time())}.png")
+        """Capture a screenshot into the EVIDENCE area, and return its durable reference.
+
+        IT USED TO WRITE INTO THE PROFILE DIRECTORY, WHICH close() DELETES. A live run captured
+        16,982-byte PNGs, referenced them in its outcome, and left zero files on disk - so every
+        evidence reference in every report pointed at something that no longer existed. That is worse
+        than having no reference, because it LOOKS like evidence.
+
+        The capture goes to scratch first (Playwright writes a file; it does not hand back bytes),
+        and is then copied into the evidence store, whose lifetime is the report's rather than the
+        run's. If no store is configured the path is returned unchanged and the reference will be
+        short-lived - named in `evidence_durable` so a reader can tell which they received.
+        """
+        import time
+
+        scratch = os.path.join(self._profile or tempfile.gettempdir(), f"shot-{int(time.time() * 1000)}.png")
         try:
-            self._page.screenshot(path=path, full_page=True)
+            self._page.screenshot(path=scratch, full_page=True)
         except Exception:
+            # Best-effort: the structural observation is still valid, and a missing picture must not
+            # turn a cosmetic problem into a blocked workflow.
             return ""
-        return path
+
+        if self._evidence is None:
+            self.evidence_durable = False
+            return scratch
+
+        try:
+            record = self._evidence.store(kind="screenshot", source=Path(scratch), name=os.path.basename(scratch))
+        except Exception:
+            # The store's own bounds or a missing source. The capture still happened, so the scratch
+            # path is returned - with the durability flag false, so nobody is told it is evidence
+            # when it is about to be deleted.
+            self.evidence_durable = False
+            return scratch
+
+        self.evidence_durable = True
+        return record.ref
 
     # -- action --------------------------------------------------------------
     def act(self, step: Step, target: str, value: Optional[str] = None) -> ActionResult:
@@ -366,7 +400,19 @@ def main() -> int:
         if d.get("path")
     }
 
+    # THE EVIDENCE STORE, opened for this run. Its lifetime is the REPORT's, not the run's - the
+    # profile directory is deleted by close() and used to take every screenshot with it.
+    from agent.evidence_store import EvidenceStore, open_store
+
+    try:
+        evidence = open_store(org_id=task.org_id, run_id=task.task_id)
+    except Exception:
+        # A store that cannot be opened must not stop the run: the browser work is still valid, and
+        # the references are simply marked non-durable rather than presented as evidence.
+        evidence = None
+
     provider = PlaywrightProvider()
+    provider._evidence = evidence
     runtime = BrowserRuntime(provider, policy=RetryPolicy())
     target_url = payload.get("target_url") or ""
     try:
@@ -412,6 +458,15 @@ def main() -> int:
         # FALSE-COMPLETION GUARD. "COMPLETED" with no completed steps and no uploads means the run
         # finished without doing anything - which is a blocked or unloaded page, not a success. The
         # directive is explicit that a successful browser command is not proof of task completion.
+        # WHETHER THE REFERENCES SURVIVE. A report that lists evidence which is about to be deleted is
+        # the defect this whole path exists to prevent, so the reader is told which they received.
+        out["evidence_durable"] = bool(getattr(provider, "evidence_durable", False))
+        if evidence is not None:
+            missing = evidence.verify()
+            out["evidence_files"] = len(evidence.stored)
+            if missing:
+                out["evidence_missing"] = missing
+
         if out.get("status") == "COMPLETED" and not out.get("completed_steps") and not out.get("uploaded"):
             out["status"] = "BLOCKED"
             out.setdefault("problems", []).append({
