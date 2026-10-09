@@ -388,6 +388,40 @@ def _classify(exc: Exception) -> Failure:
     return Failure.UNKNOWN
 
 
+def _emit(outcome: dict) -> None:
+    """The ONE place the worker writes its outcome.
+
+    WHY THIS EXISTS RATHER THAN A SCRUB CALL PER PRINT
+
+    The first version put the credential scrubber on the final `print(json.dumps(out))`. Verified
+    live, a run reported `scrub block present: False` - because `AUTHENTICATION_FAILED` and three
+    other outcomes print directly and RETURN before reaching that line.
+
+    Worse, the unguarded path was the AUTHENTICATION FAILURE path: the one where a portal is most
+    likely to echo back what was submitted. The guard was real and the exit it guarded was the least
+    likely to carry a credential.
+
+    So the scrub lives HERE, and every outcome is routed through it. A new early return cannot forget
+    to scrub, because there is no other way to emit.
+
+    Failure to scrub is REPORTED, never silent: an unverified outcome must not look like a verified one.
+    """
+    try:
+        from agent.output_scrub import OutputScrubber
+
+        scrubber = OutputScrubber(
+            [os.environ.get("GRANADA_PORTAL_PASSWORD", ""), os.environ.get("GRANADA_PORTAL_USER", "")]
+        )
+        out = dict(scrubber.scrub(outcome))
+        out["scrub"] = scrubber.report()
+    except Exception:
+        out = dict(outcome)
+        out["scrub"] = {"error": "scrubber unavailable; output not verified free of credentials"}
+    # THE ONLY print IN THIS MODULE. A blind replace once turned this into `_emit(out)`, which called
+    # itself until RecursionError - the same habit of editing text without reading what it matches.
+    print(json.dumps(out))
+
+
 def main() -> int:
     """Read a task, run it, print one JSON outcome.
 
@@ -404,18 +438,18 @@ def main() -> int:
     try:
         assert_worker_privileges()
     except WorkerPrivilegeError as exc:
-        print(json.dumps({
+        _emit({
             "status": "REJECTED",
             "outcome_certain": True,
             "problems": [{"kind": "PRIVILEGE_REFUSED", "detail": str(exc)}],
-        }))
+        })
         return 0
 
     raw = sys.stdin.read()
     try:
         payload = json.loads(raw)
     except ValueError:
-        print(json.dumps({"status": "FAILED", "problems": [{"kind": "BAD_TASK_JSON"}]}))
+        _emit({"status": "FAILED", "problems": [{"kind": "BAD_TASK_JSON"}]})
         return 0
 
     # The worker trusts NOTHING in the payload beyond what it needs, and never treats page text as
@@ -435,7 +469,7 @@ def main() -> int:
             max_steps=int(scope_payload.get("max_steps", 200)),
         )
     except Exception as exc:
-        print(json.dumps({"status": "FAILED", "problems": [{"kind": "BAD_ACTION_SCOPE", "detail": str(exc)[:200]}]}))
+        _emit({"status": "FAILED", "problems": [{"kind": "BAD_ACTION_SCOPE", "detail": str(exc)[:200]}]})
         return 0
 
     try:
@@ -452,7 +486,7 @@ def main() -> int:
             documents=payload.get("documents") or [],
         )
     except Exception as exc:
-        print(json.dumps({"status": "FAILED", "problems": [{"kind": "TASK_CONSTRUCTION", "detail": str(exc)[:200]}]}))
+        _emit({"status": "FAILED", "problems": [{"kind": "TASK_CONSTRUCTION", "detail": str(exc)[:200]}]})
         return 0
 
     values = {k: str(v) for k, v in (payload.get("form_data") or {}).items() if v not in (None, "")}
@@ -488,23 +522,23 @@ def main() -> int:
             provider.goto(root)
             signed_in = provider.authenticate(username=creds_user, password=creds_pass)
             if not signed_in:
-                print(json.dumps({
+                _emit({
                     "status": "BLOCKED",
                     "outcome_certain": True,
                     "problems": [{"kind": "AUTHENTICATION_FAILED",
                                   "detail": "the supplied credentials did not produce an authenticated session"}],
-                }))
+                })
                 return 0
 
         if not target_url:
-            print(json.dumps({
+            _emit({
                 "status": "BLOCKED",
                 "outcome_certain": True,
                 "problems": [{
                     "kind": "NO_TARGET_URL",
                     "detail": "the task named no target_url, so there was nothing to open; refusing to report completion without having visited a page",
                 }],
-            }))
+            })
             return 0
         provider.goto(target_url)
         report = runtime.run(
@@ -571,7 +605,7 @@ def main() -> int:
         out = dict(out)
         out["scrub"] = {"error": "scrubber unavailable; output not verified free of credentials"}
 
-    print(json.dumps(out))
+    _emit(out)
     return 0
 
 
