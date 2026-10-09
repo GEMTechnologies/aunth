@@ -669,15 +669,16 @@ def test_the_implemented_specialists_are_exactly_the_phase_6c_and_7a_set(db):
     requires, from the organisation's verified facts, at DRAFT_ONLY authority because a generated
     document is a proposal to a human rather than a fact.
     """
-    assert EXECUTABLE == {"MATCHER", "DONOR_RESEARCHER", "EMAIL", "DOCUMENT"}
-    assert len(EXECUTABLE) == 4
+    assert EXECUTABLE == {"MATCHER", "DONOR_RESEARCHER", "EMAIL", "DOCUMENT", "COMPLIANCE"}
+    assert len(EXECUTABLE) == 5
     # Seven executable work types across those four specialists.
     from agent.specialists import REGISTRY
 
     work_types = sorted(wt for spec in REGISTRY.values() for wt in spec.handlers)
     assert work_types == [
-        "document_generate", "donor_research", "mail_process", "mail_reconcile", "mail_send",
-        "mail_sync", "opportunity_match", "opportunity_qualify",
+        "application_assemble", "document_generate", "donor_research", "mail_process",
+        "mail_reconcile", "mail_send", "mail_sync", "opportunity_match",
+        "opportunity_qualify",
     ]
 
     # THE CEILING, asserted where the roster is checked: `email_send` is a
@@ -710,8 +711,8 @@ def test_the_inventory_reports_the_truth(db):
     data = inventory()
     assert data["total"] == 10, "the roster is the brief's ten, not eleven"
     # Four executable: the Email Agent's inbound capability, and the Document Agent's generation.
-    assert len(data["executable"]) == 4
-    assert len(data["registered_not_implemented"]) == 6
+    assert len(data["executable"]) == 5
+    assert len(data["registered_not_implemented"]) == 5
     assert "EMAIL" in data["executable"]
     assert "DOCUMENT" in data["executable"], (
         "the Document Agent has a handler now, so the inventory must stop reporting it as "

@@ -158,8 +158,15 @@ REGISTRY: dict[str, SpecialistSpec] = {
               registered_work_types=("proposal_draft",)),
         _spec("BUDGET", "Budget Agent", {}, Autonomy.DRAFT_ONLY,
               registered_work_types=("budget_prepare",)),
-        _spec("COMPLIANCE", "Compliance Agent", {}, Autonomy.MONITOR_ONLY,
-              registered_work_types=("compliance_check",)),
+        # Assembly is a compliance act: it checks that what the funder requires is present and
+        # frozen before anything reaches them. MONITOR_ONLY suffices because this handler produces a
+        # package for a human to authorise and performs no external action.
+        _spec(
+            "COMPLIANCE", "Compliance Agent",
+            {"application_assemble": "_handle_package_assemble"},
+            Autonomy.MONITOR_ONLY,
+            registered_work_types=("compliance_check",),
+        ),
         # Implemented now: the handler existed nowhere before, so the roster showed a Document
         # Agent that could not produce a document.
         #

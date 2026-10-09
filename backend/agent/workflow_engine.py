@@ -123,6 +123,8 @@ WORKFLOW_QUALIFY = "opportunity_qualify"
 WORKFLOW_RESEARCH = "donor_research"
 # Generates the documents a listing requires from the organisation's VERIFIED facts.
 WORKFLOW_DOCUMENT = "document_generate"
+# Assembles the prepared documents into the frozen package a human authorises.
+WORKFLOW_ASSEMBLE = "application_assemble"
 #: Phase 7a. Email is one more wake condition for the same shared fleet — there is
 #: no per-mailbox worker and no mail daemon. Note the absence of a send work type:
 #: `email_send` is registered on the roster and owns no handler, so it cannot be
@@ -1234,6 +1236,160 @@ def _handle_donor_research(db: Session, context: dict[str, Any]) -> dict[str, An
     }
 
 
+def _handle_package_assemble(db: Session, context: dict[str, Any]) -> dict[str, Any]:
+    """Assemble the submission package for an application, or report what it still needs.
+
+    WHAT THIS IS. `SubmissionPackage` has existed since Phase 8 with `package_fingerprint`,
+    `manifest`, `idempotency_key` and `handoff_ready_at`, and nothing ever created one - the table
+    describing the thing a funder receives sat empty while the pipeline reached prepared documents
+    and stopped. This is the assembler, and it reuses that table rather than adding another.
+
+    MODE_HANDOFF. Everything is prepared for a person to submit in the funder's own portal. No
+    external action is taken here, and nothing may claim otherwise.
+
+    A MISSING CERTIFICATE IS NOT A CRASH. When the organisation has not supplied evidence, the
+    package is NEEDS_DATA and the message names the documents. That is an outstanding action for a
+    human, not an infrastructure failure, and the two must never be reported as one.
+
+    IDEMPOTENT BY FINGERPRINT. Re-running with unchanged inputs reuses the existing package; a
+    changed document produces a different fingerprint and therefore a new revision, because the
+    authorisation a human gave applied to the previous set and does not transfer.
+    """
+    from agent import packaging
+    from agent.document_types import required_types_for
+    from agent.organisation_memory import DocumentVault
+    from agent.workspace import ApplicationWorkspace
+
+    workflow = context["workflow"]
+    agent = context["agent"]
+    if workflow is None or agent is None:
+        raise FleetError("package assembly requires a workflow and an agent")
+
+    opportunity = db.execute(
+        select(models.Opportunity).where(models.Opportunity.id == workflow.subject_id)
+    ).scalars().first()
+    if opportunity is None:
+        return {
+            "summary": "the opportunity no longer exists",
+            "summary_key": "package.opportunity_missing",
+            "next_state": models.AgentWorkflow.CANCELLED,
+            "meaningful": False,
+        }
+
+    organisation = db.execute(
+        select(models.Organisation).where(models.Organisation.id == agent.org_id)
+    ).scalars().first()
+    if organisation is None:
+        raise FleetError("package assembly requires the organisation row")
+
+    workspace = ApplicationWorkspace(db, agent.org_id)
+    application = workspace.get(str(opportunity.id))
+    if application is None:
+        # No application means matching never produced one for this opportunity. That is a pipeline
+        # ordering problem, not a package problem, and it should say so rather than assemble an
+        # empty package.
+        return {
+            "summary": "no application exists for this opportunity yet",
+            "summary_key": "package.no_application",
+            "next_state": models.AgentWorkflow.CANCELLED,
+            "meaningful": False,
+        }
+
+    # Which documents does THIS listing ask for? The same canonicaliser the readiness gate uses, so
+    # the assembler and the gate cannot disagree about what is required.
+    listing_text = " ".join(
+        str(part or "")
+        for part in (opportunity.title, opportunity.description, opportunity.eligibility_criteria)
+    )
+    required = required_types_for(listing_text)
+    for always in ("cover_letter", "organisation_profile"):
+        if always not in required:
+            required.append(always)
+
+    # ONLY USABLE DOCUMENTS. `usable()` returns current, APPROVED, unexpired versions - the gap
+    # between uploading and approving is where the wrong document gets attached to a real
+    # application, and it is already enforced there rather than here.
+    vault = DocumentVault(db, agent.org_id)
+    documents = vault.usable(scope_ref=str(opportunity.id))
+    if not documents:
+        documents = vault.usable()
+
+    result = packaging.assemble(
+        db,
+        org_id=agent.org_id,
+        agent_id=str(agent.id),
+        application=application,
+        opportunity=opportunity,
+        organisation=organisation,
+        documents=documents,
+        required_types=required,
+    )
+
+    message = packaging.operator_message(result)
+
+    # Advance the application workspace. A package that needs data moves the application to
+    # WAITING_FOR_DATA, so a human surface can show why it is stopped without reading job tables.
+    try:
+        if result.status == models.SubmissionPackage.NEEDS_DATA:
+            workspace.transition(
+                application, WAITING_FOR_DATA, reason=message[:500],
+                actor_type=models.ApplicationTransition.ACTOR_AGENT, job_id=context["job"].id,
+            )
+        elif result.status in (models.SubmissionPackage.DRAFT,
+                               models.SubmissionPackage.AWAITING_AUTHORISATION):
+            workspace.transition(
+                application, PREPARING, reason=message[:500],
+                actor_type=models.ApplicationTransition.ACTOR_AGENT, job_id=context["job"].id,
+            )
+    except Exception:  # noqa: BLE001 - a transition refusal must not lose the package
+        logger.warning("package.transition_refused", extra={"opportunity_id": str(opportunity.id)})
+
+    structured = {
+        "opportunity_id": str(opportunity.id),
+        "package_fingerprint": result.fingerprint,
+        "status": result.status,
+        "included": len(result.included),
+        "missing": result.missing,
+        "needs_data": result.needs_data,
+        "reused": result.reused,
+    }
+
+    if result.status == models.SubmissionPackage.NEEDS_DATA:
+        return {
+            "summary": message[:1000],
+            "summary_key": "package.needs_data",
+            # PARK on the organisation, with the backoff the WAITING branch applies. This is the
+            # defect fixed earlier in this project: a workflow waiting on a human must not be
+            # re-dispatched on every sweep.
+            "next_state": models.AgentWorkflow.WAITING,
+            "waiting_on": message[:255],
+            "meaningful": True,
+            "activity_type": "package",
+            "activity": "could not complete the application package",
+            "structured_data": structured,
+        }
+
+    return {
+        "summary": message[:1000],
+        "summary_key": "package.assembled",
+        "next_state": models.AgentWorkflow.COMPLETED,
+        "meaningful": True,
+        "activity_type": "package",
+        "activity": "assembled an application package for review",
+        "structured_data": structured,
+        "events": [{
+            "event_type": "package.assembled",
+            "stream": "granada:v1:workflow:package",
+            "payload": {
+                "opportunity_id": str(opportunity.id),
+                "package_fingerprint": result.fingerprint,
+                "status": result.status,
+                "included": len(result.included),
+            },
+        }],
+    }
+
+
 def _handle_document_generate(db: Session, context: dict[str, Any]) -> dict[str, Any]:
     """Render the documents a listing asks for, and file them as PENDING drafts.
 
@@ -1368,6 +1524,12 @@ def _handle_document_generate(db: Session, context: dict[str, Any]) -> dict[str,
             "generated": generated,
             "skipped": skipped,
             "must_be_uploaded": sorted(set(skipped) & set(documents.EVIDENCE_TYPES)),
+        },
+        # The package is assembled from what is now in the vault, so the next step is assembly.
+        "enqueue": {
+            "workflow_type": WORKFLOW_ASSEMBLE,
+            "specialist_key": "COMPLIANCE",
+            "correlation_id": context.get("correlation_id"),
         },
     }
 
