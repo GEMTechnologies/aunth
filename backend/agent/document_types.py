@@ -145,3 +145,26 @@ def known_types() -> frozenset[str]:
     """Every canonical type, for validation and for a test that asserts the gate's
     requirements are all producible."""
     return frozenset(DOCUMENT_TYPES)
+
+
+#: Documents EVERY application needs whatever the listing says. A funder rarely states them because
+#: they are assumed, but a submission without a covering letter or an organisation profile is
+#: incomplete whichever portal receives it.
+#:
+#: This lives HERE, and not in the assembler, because the assembler and the drift detector disagreed
+#: about it: the connector added these unconditionally while drift derived requirements from the
+#: listing text alone. Their sets could never match, so every package reported drift. That is the same
+#: failure as the gate/generator vocabulary split earlier in this project.
+BASELINE_TYPES = ('cover_letter', 'organisation_profile')
+
+
+def required_types_for_application(listing_text: str) -> list:
+    """What an application for this listing must contain: the listing's asks plus the baseline.
+
+    The single function the assembler and the drift detector both call, so they cannot diverge.
+    """
+    required = list(required_types_for(listing_text))
+    for always in BASELINE_TYPES:
+        if always not in required:
+            required.append(always)
+    return required

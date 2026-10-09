@@ -1256,7 +1256,7 @@ def _handle_package_assemble(db: Session, context: dict[str, Any]) -> dict[str, 
     authorisation a human gave applied to the previous set and does not transfer.
     """
     from agent import packaging
-    from agent.document_types import required_types_for
+    from agent.document_types import required_types_for_application
     from agent.organisation_memory import DocumentVault
     from agent.workspace import ApplicationWorkspace
 
@@ -1301,10 +1301,9 @@ def _handle_package_assemble(db: Session, context: dict[str, Any]) -> dict[str, 
         str(part or "")
         for part in (opportunity.title, opportunity.description, opportunity.eligibility_criteria)
     )
-    required = required_types_for(listing_text)
-    for always in ("cover_letter", "organisation_profile"):
-        if always not in required:
-            required.append(always)
+    # ONE vocabulary: the same function the drift detector calls. They previously disagreed, and
+    # every package reported drift as a result.
+    required = required_types_for_application(listing_text)
 
     # ONLY USABLE DOCUMENTS. `usable()` returns current, APPROVED, unexpired versions - the gap
     # between uploading and approving is where the wrong document gets attached to a real
