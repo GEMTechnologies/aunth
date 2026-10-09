@@ -125,6 +125,11 @@ WORKFLOW_RESEARCH = "donor_research"
 WORKFLOW_DOCUMENT = "document_generate"
 # Assembles the prepared documents into the frozen package a human authorises.
 WORKFLOW_ASSEMBLE = "application_assemble"
+
+#: Section 6 of the multimodal directive: run the browser against an assembled package as a LEASED
+#: capability. Disabled by default - the handler refuses unless the flag is on, so registering the
+#: workflow does not enable it.
+WORKFLOW_BROWSER_TASK = "browser_task"
 #: Phase 7a. Email is one more wake condition for the same shared fleet — there is
 #: no per-mailbox worker and no mail daemon. Note the absence of a send work type:
 #: `email_send` is registered on the roster and owns no handler, so it cannot be
@@ -1909,3 +1914,161 @@ def _settings() -> Any:
         return settings
     except Exception:  # pragma: no cover - configuration unavailable
         return None
+
+def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]:
+    """Run the browser worker for a package, as a leased capability. Off by default.
+
+    SECTION 6. The worker is invoked through the existing job system - agent_workflows -> jobs ->
+    job_attempts - rather than by a daemon or a process per organisation. One invocation, one
+    browser, released in a finally block by the runtime.
+
+    THE FLAG IS CHECKED FIRST AND THE HANDLER PARKS WHEN IT IS OFF. A registered workflow must not
+    imply an enabled capability, and "the feature is switched off" is not a failure of the package -
+    so the workflow WAITS rather than being marked complete or failed. That keeps the earlier
+    runaway-loop defect fixed: a parking state must not be rescheduled with no new information.
+
+    A MISSING MODEL IS NOT A MISSING DOCUMENT. If vision is required and no multimodal model is
+    configured, that is a routing refusal (NoCapableModel) and the workflow parks. It is never
+    reported as the organisation failing to supply something.
+    """
+    from agent import browser_invocation
+    from agent.browser_boundary import build_task
+
+    workflow = context["workflow"]
+    agent = context["agent"]
+    if workflow is None or agent is None:
+        raise FleetError("browser execution requires a workflow and an agent")
+
+    # SETTINGS COME FROM THE CONTEXT, NOT FROM A DB ACCESSOR I ASSUMED.
+    #
+    # The first version of this handler imported `agent.settings_store.get_settings`, which does not
+    # exist - I wrote the call before checking, the same mistake this project keeps recording. There
+    # is no Setting model in models.py and admin.py is not at the path I assumed either, so rather
+    # than guess at a mechanism, the caller supplies the mapping. That is honest about where the
+    # values come from, and it makes the handler testable with a plain dict.
+    #
+    # Defaults to EMPTY, which means the flag reads as off - so an unwired caller cannot accidentally
+    # enable browser execution.
+    settings = dict(context.get("settings") or {})
+    if not browser_invocation.enabled(settings):
+        return {
+            "summary": (
+                "browser execution is disabled; the package is prepared and waiting, and nothing was "
+                "opened"
+            ),
+            "summary_key": "browser.disabled",
+            "next_state": models.AgentWorkflow.WAITING,
+            "meaningful": False,
+        }
+
+    # THE APPLICATION IS FOUND BY (org, opportunity), NOT BY workflow_id.
+    #
+    # `models.Application` has no `workflow_id` column - it carries org_id and opportunity_id, and the
+    # workflow carries the opportunity as its subject. The regression guard
+    # (test_no_module_references_a_missing_model_attribute) caught the invented column, which is
+    # exactly what it is for: a nonexistent attribute would be an AttributeError at runtime on a live
+    # workflow, not at import.
+    application = db.execute(
+        select(models.Application).where(
+            models.Application.org_id == agent.org_id,
+            models.Application.opportunity_id == workflow.subject_id,
+        )
+    ).scalars().first()
+    if application is None:
+        return {
+            "summary": "no application is attached to this workflow",
+            "summary_key": "browser.no_application",
+            "next_state": models.AgentWorkflow.WAITING,
+            "meaningful": False,
+        }
+
+    package = db.execute(
+        select(models.SubmissionPackage).where(
+            models.SubmissionPackage.application_id == application.id
+        )
+    ).scalars().first()
+    if package is None:
+        # Nothing to open. PARK rather than fail: the package is assembled by another step, and
+        # treating its absence as an error would make an ordering problem look like a crash.
+        return {
+            "summary": "no assembled package yet for this application",
+            "summary_key": "browser.no_package",
+            "next_state": models.AgentWorkflow.WAITING,
+            "meaningful": False,
+        }
+
+    try:
+        task = build_task(
+            db,
+            package,
+            action_scope=_browser_scope_for(package, settings),
+        )
+    except Exception as exc:
+        # build_task refuses an unready package. That refusal is the readiness engine doing its job,
+        # and it is a WAIT - the package is not wrong, it is not finished.
+        return {
+            "summary": f"the package is not ready to be opened: {exc}",
+            "summary_key": "browser.package_not_ready",
+            "next_state": models.AgentWorkflow.WAITING,
+            "meaningful": False,
+        }
+
+    invoker = browser_invocation.SubprocessInvoker(settings.get(browser_invocation.BROWSER_WORKER_COMMAND, ""))
+    outcome = browser_invocation.invoke(
+        task,
+        invoker=invoker,
+        settings=settings,
+        submission_authorised=False,   # never granted here; submission_authority owns that decision
+    )
+
+    return {
+        "summary": _browser_summary(outcome),
+        "summary_key": f"browser.{outcome.status.lower()}",
+        # COMPLETED only when the run actually completed. BLOCKED, UNCERTAIN and UNAVAILABLE all
+        # park, because none of them is a finished task and rescheduling them with no new
+        # information is the runaway loop this codebase already had to fix once.
+        "next_state": (
+            models.AgentWorkflow.COMPLETED
+            if outcome.status == "COMPLETED"
+            else models.AgentWorkflow.WAITING
+        ),
+        "meaningful": outcome.status == "COMPLETED",
+        "outcome": outcome.to_dict(),
+    }
+
+
+def _browser_summary(outcome: Any) -> str:
+    """Operator-facing text. Names what happened, never reports a submission that did not occur."""
+    if outcome.status == "COMPLETED":
+        return (
+            f"the browser completed {len(outcome.completed_steps)} step(s) and attached "
+            f"{len(outcome.uploaded)} document(s); no submission was made"
+        )
+    if outcome.status == "BLOCKED":
+        detail = next((p.get("detail", "") for p in outcome.problems), "the page could not be completed")
+        return f"the browser stopped and needs attention: {detail}"
+    if outcome.status == "UNCERTAIN":
+        return (
+            "the browser could not confirm the outcome; this must be reconciled rather than retried"
+        )
+    if outcome.status == "DISABLED":
+        return "browser execution is disabled"
+    if outcome.status == "UNAVAILABLE":
+        return "the browser worker is not available on this host"
+    return f"the browser reported {outcome.status}"
+
+
+def _browser_scope_for(package: Any, settings: dict[str, Any]) -> Any:
+    """The host allowlist for one package, from configuration.
+
+    EXACT HOSTS ONLY. browser_boundary.validate_task refuses a wildcard, because suffix matching
+    lets `notfunder.example` match `funder.example`, and this builds the value it checks.
+    """
+    from agent.browser_boundary import ActionScope
+
+    raw = settings.get("browser_allowed_hosts") or []
+    hosts = tuple(str(h).strip() for h in raw if str(h).strip())
+    return ActionScope(
+        portal_name=str(settings.get("browser_portal_name") or "unknown"),
+        allowed_hosts=hosts,
+    )

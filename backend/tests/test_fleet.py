@@ -676,7 +676,7 @@ def test_the_implemented_specialists_are_exactly_the_phase_6c_and_7a_set(db):
 
     work_types = sorted(wt for spec in REGISTRY.values() for wt in spec.handlers)
     assert work_types == [
-        "application_assemble", "document_generate", "donor_research", "mail_process",
+        "application_assemble", "browser_task", "document_generate", "donor_research", "mail_process",
         "mail_reconcile", "mail_send", "mail_sync", "opportunity_match",
         "opportunity_qualify",
     ]

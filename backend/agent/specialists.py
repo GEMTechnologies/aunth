@@ -163,7 +163,13 @@ REGISTRY: dict[str, SpecialistSpec] = {
         # package for a human to authorise and performs no external action.
         _spec(
             "COMPLIANCE", "Compliance Agent",
-            {"application_assemble": "_handle_package_assemble"},
+            {
+            "application_assemble": "_handle_package_assemble",
+            # Section 6: the browser runs as a leased capability through the same job system. The
+            # handler PARKS when the flag is off, so registering it does not enable it - and an NGO
+            # whose package is merely unfinished is not an infrastructure failure.
+            "browser_task": "_handle_browser_task",
+        },
             Autonomy.MONITOR_ONLY,
             registered_work_types=("compliance_check",),
         ),
