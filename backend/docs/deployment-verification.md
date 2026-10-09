@@ -5,6 +5,63 @@
 **Scope:** how to deploy the browser execution milestone, and how the check that said it was
 already deployed reported success while testing nothing.
 
+## CORRECTION (2026-10-10): the working tree is NOT dirty, and my first reading of it was wrong
+
+An earlier version of this document warned that 108 files were "modified in the production checkout"
+and that the deployed system might be running code no commit describes. **That was wrong, and the
+correction matters more than the original claim.**
+
+Checked one file three ways:
+
+```
+worktree sha256                   bd4c1646116bb9f0
+HEAD blob sha256                  4c7abaea099cffa0
+HEAD blob, CR stripped            4c7abaea099cffa0
+worktree,  CR stripped            4c7abaea099cffa0     <- IDENTICAL to HEAD
+CRLF count                        370 of 370 lines
+```
+
+Then every file:
+
+```
+line-endings-only:   106
+real content diffs:    0
+```
+
+**All 106 files differ only by CRLF versus LF. ZERO real content differences.**
+
+So production IS running the committed code. The checkout has CRLF where the committed blobs have LF,
+which `git status` reports as 108 modified files and `git diff --shortstat` reports as
+`58359 insertions(+), 58359 deletions(-)` - the identical counts were the tell, and I noted them, but
+I then reported the alarming reading as the likely one.
+
+**What I got wrong, precisely.** I wrote that "production's working tree is dirty" and that
+"Granada's production code is not fully in version control". Neither was established. The honest
+statement at the time was: *108 files report as modified, I could not characterise the difference, and
+therefore I will not deploy over it.* That is what I said in the round report - and it was the right
+call - but the document overstated the cause.
+
+**Why this is recorded rather than quietly fixed.** The failure mode is the same one this whole
+document is about: reporting a plausible conclusion from an incomplete check. A false alarm about
+production integrity is its own kind of damage - it wastes attention and, if believed, invites
+"fixing" a tree that was never broken.
+
+## What this unblocks
+
+The tree is safe to update: the content is the committed content. The deployment path becomes:
+
+```bash
+cd ~/granada/Auth
+git diff > ~/deploy-backup/pre-deploy-$(date +%Y%m%d-%H%M%S).patch   # belt and braces
+git fetch origin agentic-v2
+git checkout -f agentic-v2 && git reset --hard origin/agentic-v2
+```
+
+`-f` is needed precisely BECAUSE of the line endings: a plain checkout refuses to overwrite files it
+considers modified, and every one of them is a CRLF-only difference. Normalising the checkout
+(`git config core.autocrlf false` plus a re-checkout) would remove the noise permanently and is worth
+doing while there.
+
 ## What is actually deployed, verified
 
 ```
