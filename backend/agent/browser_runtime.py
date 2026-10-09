@@ -241,6 +241,23 @@ def plan_next(
             Step.BLOCKED, "", None, f"the page rejected the submission: {'; '.join(page.validation_messages[:3])}"
         )
 
+    # 4b. ADVANCE. A multi-page form is not finished when its fields are filled - the section has to
+    # be submitted before the next one appears. Omitting this branch made the runtime stop after
+    # page one and report COMPLETED, the same false completion as the unevaluated about:blank: the
+    # agent had done all it could see and called that the end of the task.
+    #
+    # The control is chosen by what it DOES, not by its text: `Continue` on the last section is a
+    # submission, and action_grounding is what decides which. Navigation controls are only eligible
+    # while fields remain outstanding, so a final "Continue" is never clicked as if it were a
+    # "Next".
+    for control in page.controls:
+        low = control.lower()
+        if any(w in low for w in ("continue", "next", "proceed", "go on", "save and continue")):
+            return PlannedAction(
+                Step.CLICK, control, None,
+                "the visible fields are satisfied, so the page advances rather than being finished",
+            )
+
     # 5. Submit only when the page is offering it and nothing is outstanding.
     for control in page.controls:
         if "submit" in control.lower() or "send application" in control.lower():
