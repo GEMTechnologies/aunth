@@ -121,6 +121,8 @@ WAITING_RETRY_BACKOFF = timedelta(hours=6)
 WORKFLOW_MATCH = "opportunity_match"
 WORKFLOW_QUALIFY = "opportunity_qualify"
 WORKFLOW_RESEARCH = "donor_research"
+# Generates the documents a listing requires from the organisation's VERIFIED facts.
+WORKFLOW_DOCUMENT = "document_generate"
 #: Phase 7a. Email is one more wake condition for the same shared fleet — there is
 #: no per-mailbox worker and no mail daemon. Note the absence of a send work type:
 #: `email_send` is registered on the roster and owns no handler, so it cannot be
@@ -1217,6 +1219,144 @@ def _handle_donor_research(db: Session, context: dict[str, Any]) -> dict[str, An
         # STOP HERE for this phase. The proposal is not generated and nothing is
         # submitted: Phase 6c proves autonomous INTERNAL work.
         "next_state": models.AgentWorkflow.COMPLETED,
+    }
+
+
+def _handle_document_generate(db: Session, context: dict[str, Any]) -> dict[str, Any]:
+    """Render the documents a listing asks for, and file them as PENDING drafts.
+
+    WHY THIS EXISTS. The pipeline ended at MATCHED: an agent could find an opportunity and prove the
+    organisation eligible, and then stop, because nothing could produce the document the funder
+    actually asks for. `DocumentVault.add_version()` has always required a `storage_key` - a file that
+    already exists.
+
+    WHAT IT DOES NOT DO. It does not approve, and it does not submit. Drafts go in PENDING and the
+    vault enforces that, because an agent approving its own output into a submission is the exact
+    failure the approval gate exists to prevent.
+
+    IT REFUSES RATHER THAN INVENTING. A template placeholder with no verified fact behind it raises,
+    and the workflow parks with the missing names in `waiting_on`. Putting a plausible-looking
+    registration number in front of a donor in the organisation's name would be worse than producing
+    nothing, and it is the one thing a generator like this must never do.
+
+    IDEMPOTENT. Content is deterministic from facts and the listing, so a re-run produces the same
+    checksum and the vault records the same version rather than a new one. A generator that emitted a
+    timestamp would append a version on every attempt and leave a funder's "which draft did you send"
+    unanswerable.
+    """
+    from agent import documents
+    from agent.organisation_memory import DocumentVault, OrganisationMemory
+
+    workflow = context["workflow"]
+    agent = context["agent"]
+    if workflow is None or agent is None:
+        raise FleetError("document generation requires a workflow and an agent")
+
+    opportunity = db.execute(
+        select(models.Opportunity).where(models.Opportunity.id == workflow.subject_id)
+    ).scalars().first()
+    if opportunity is None:
+        return {
+            "summary": "the opportunity no longer exists",
+            "summary_key": "documents.opportunity_missing",
+            "next_state": models.AgentWorkflow.CANCELLED,
+            "meaningful": False,
+        }
+
+    memory = OrganisationMemory(db, agent.org_id)
+    vault = DocumentVault(db, agent.org_id)
+
+    # `submission_facts()` returns only facts in a SUBMISSION-SAFE state. A document is a submission
+    # artefact, so an unverified value must not reach a funder through one.
+    facts = documents.facts_from_organisation(memory)
+
+    # Which documents does THIS listing ask for? The same canonicaliser the readiness gate uses, so
+    # the generator and the gate cannot disagree about what is required.
+    from agent.document_types import required_types_for
+
+    listing_text = " ".join(
+        str(part or "")
+        for part in (opportunity.title, opportunity.description, opportunity.eligibility_criteria)
+    )
+    wanted = required_types_for(listing_text)
+
+    # Every application needs a cover letter, whether or not the listing spells it out.
+    if "cover_letter" not in wanted:
+        wanted.append("cover_letter")
+
+    # The listing and the donor are not ORGANISATION facts; they come from the opportunity.
+    facts = dict(facts)
+    facts.setdefault("opportunity_title", opportunity.title or "")
+    facts.setdefault("donor_name", opportunity.source_name or "")
+    facts.setdefault("currency", opportunity.currency or "")
+    facts.setdefault(
+        "amount_requested", f"{opportunity.amount_max:,}" if opportunity.amount_max else ""
+    )
+    facts.setdefault("today", documents.today())
+
+    store = documents.TemplateStore()
+    generated: list[str] = []
+    skipped: list[str] = []
+    missing: dict[str, list[str]] = {}
+
+    for doc_type in wanted:
+        template = store.get(doc_type)
+        if template is None:
+            # Two different answers, and the difference matters to whoever reads the readiness report.
+            # An EVIDENCE type is something the organisation must UPLOAD - no software can generate a
+            # registration certificate. Anything else is simply a template we have not written yet.
+            skipped.append(doc_type)
+            continue
+        try:
+            document = documents.render(
+                template, facts, filename_stem=str(opportunity.id)[:8]
+            )
+        except documents.MissingFact as exc:
+            missing[doc_type] = [
+                name for name in template.placeholders() if not str(facts.get(name, "") or "").strip()
+            ]
+            continue
+
+        vault.add_version(
+            title=document.title,
+            doc_type=document.doc_type,
+            storage_key=f"generated/{agent.org_id}/{opportunity.id}/{document.filename}",
+            checksum_sha256=document.checksum_sha256,
+            mime_type=document.mime_type,
+            size_bytes=document.size_bytes,
+            scope_ref=str(opportunity.id),
+            uploaded_by=f"agent:{agent.id}",
+        )
+        generated.append(document.doc_type)
+
+    if missing:
+        # Park, naming exactly what the organisation must supply. The workflow engine gives this a
+        # six-hour backoff, because the blocker is a person, not a transient fault.
+        detail = "; ".join(f"{doc}: {', '.join(names)}" for doc, names in sorted(missing.items()))
+        return {
+            "summary": f"cannot generate {len(missing)} document(s) without: {detail}"[:1000],
+            "summary_key": "documents.missing_facts",
+            "next_state": models.AgentWorkflow.WAITING,
+            "waiting_on": f"organisation information: {detail}"[:255],
+            "meaningful": True,
+            "activity_type": "document",
+            "activity": "needs verified facts before documents can be prepared",
+            "structured_data": {"generated": generated, "missing": missing, "skipped": skipped},
+        }
+
+    return {
+        "summary": f"prepared {len(generated)} document(s) as drafts"
+        + (f"; no template for {len(skipped)}" if skipped else ""),
+        "summary_key": "documents.generated",
+        "next_state": models.AgentWorkflow.COMPLETED,
+        "meaningful": bool(generated),
+        "activity_type": "document",
+        "activity": f"prepared {len(generated)} application document(s) as drafts",
+        "structured_data": {
+            "generated": generated,
+            "skipped": skipped,
+            "must_be_uploaded": sorted(set(skipped) & set(documents.EVIDENCE_TYPES)),
+        },
     }
 
 

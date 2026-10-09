@@ -664,16 +664,20 @@ def test_the_implemented_specialists_are_exactly_the_phase_6c_and_7a_set(db):
     decision, because the roster has ten specialists and an eleventh existing only
     to hold one function would be roster noise the customer has to read.
     Phase 7a adds the Email Agent for `mail_process` - and **only** for that.
+    Later: the Document Agent, which was registered with NO handlers - a capability the roster showed
+    a customer and the code made impossible. It now generates the application documents a listing
+    requires, from the organisation's verified facts, at DRAFT_ONLY authority because a generated
+    document is a proposal to a human rather than a fact.
     """
-    assert EXECUTABLE == {"MATCHER", "DONOR_RESEARCHER", "EMAIL"}
-    assert len(EXECUTABLE) == 3
-    # Four executable work types across those three specialists.
+    assert EXECUTABLE == {"MATCHER", "DONOR_RESEARCHER", "EMAIL", "DOCUMENT"}
+    assert len(EXECUTABLE) == 4
+    # Seven executable work types across those four specialists.
     from agent.specialists import REGISTRY
 
     work_types = sorted(wt for spec in REGISTRY.values() for wt in spec.handlers)
     assert work_types == [
-        "donor_research", "mail_process", "mail_reconcile", "mail_send", "mail_sync",
-        "opportunity_match", "opportunity_qualify",
+        "document_generate", "donor_research", "mail_process", "mail_reconcile", "mail_send",
+        "mail_sync", "opportunity_match", "opportunity_qualify",
     ]
 
     # THE CEILING, asserted where the roster is checked: `email_send` is a
@@ -705,10 +709,14 @@ def test_a_specialist_refuses_work_it_does_not_do(db):
 def test_the_inventory_reports_the_truth(db):
     data = inventory()
     assert data["total"] == 10, "the roster is the brief's ten, not eleven"
-    # Three executable after Phase 7a added the Email Agent's inbound capability.
-    assert len(data["executable"]) == 3
-    assert len(data["registered_not_implemented"]) == 7
+    # Four executable: the Email Agent's inbound capability, and the Document Agent's generation.
+    assert len(data["executable"]) == 4
+    assert len(data["registered_not_implemented"]) == 6
     assert "EMAIL" in data["executable"]
+    assert "DOCUMENT" in data["executable"], (
+        "the Document Agent has a handler now, so the inventory must stop reporting it as "
+        "registered-not-implemented - an inventory that lags the registry is worse than none"
+    )
     for entry in data["specialists"]:
         assert entry["required_authority"] in Autonomy.ORDER
 

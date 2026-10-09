@@ -160,8 +160,19 @@ REGISTRY: dict[str, SpecialistSpec] = {
               registered_work_types=("budget_prepare",)),
         _spec("COMPLIANCE", "Compliance Agent", {}, Autonomy.MONITOR_ONLY,
               registered_work_types=("compliance_check",)),
-        _spec("DOCUMENT", "Document Agent", {}, Autonomy.MONITOR_ONLY,
-              registered_work_types=("document_request",)),
+        # Implemented now: the handler existed nowhere before, so the roster showed a Document
+        # Agent that could not produce a document.
+        #
+        # DRAFT_ONLY, not MONITOR_ONLY. The output of this specialist is a draft a human must
+        # approve - it writes documents to the vault in a PENDING state and cannot advance them.
+        # Granting it more authority than the artefact deserves is how an agent ends up submitting
+        # its own unreviewed work under an organisation's name.
+        _spec(
+            "DOCUMENT", "Document Agent",
+            {"document_generate": "_handle_document_generate"},
+            Autonomy.DRAFT_ONLY,
+            registered_work_types=("document_request",),
+        ),
         # Implemented in Phase 7a — EARS ONLY.
         #
         # `mail_process` has a handler. `email_send` is listed as a REGISTERED work
