@@ -120,6 +120,34 @@ class PlaywrightProvider:
         self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
         self._page.set_default_timeout(self.timeout_ms)
 
+    def authenticate(self, *, username: str, password: str) -> bool:
+        """Sign in before the application form is reached.
+
+        CREDENTIALS COME FROM THE ENVIRONMENT, NEVER FROM THE TASK PAYLOAD. The payload travels
+        through the job system and is persisted; a password belongs in neither. BrowserTask carries
+        CredentialRef (a name, not a secret) for exactly this reason.
+
+        A login form is a form. Granada fills it only because the values are SUPPLIED, not inferred -
+        the same rule that stops it inventing a registration number.
+        """
+        try:
+            self._page.fill("[name='email']", username)
+            self._page.fill("[name='password']", password)
+            # The button's ID, not its text. `text=Sign in` matched the page's <h1>Sign in</h1>
+            # heading first and clicked that, so the form was never submitted - which is the same
+            # lesson as the grounding module one layer down: a label is not a control.
+            self._page.click("#sign-in")
+            self._page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
+            # Verified by the page, not by the click: a click that did not sign in is not a session.
+            #
+            # A POSITIVE check. The first version asked whether the title lacked the substring
+            # "sign" - but the success page is titled "Signed in", so it always answered "not signed
+            # in" and every authenticated run reported AUTHENTICATION_FAILED. A negative assertion
+            # against ambiguous text is not a check; the portal's own marker is.
+            return self._page.query_selector("a[href='/apply/start']") is not None
+        except Exception:
+            return False
+
     def goto(self, url: str) -> None:
         """Navigate to the task target. WITHOUT THIS the worker plans against about:blank.
 
@@ -314,6 +342,21 @@ def main() -> int:
         # Navigate FIRST. The runtime plans from what the page shows, so an unloaded page is not an
         # empty task - it is an unasked question.
         provider.launch(profile_dir=f"/tmp/granada-browser/{task.org_id}", headless=True)
+        creds_user = os.environ.get("GRANADA_PORTAL_USER", "")
+        creds_pass = os.environ.get("GRANADA_PORTAL_PASSWORD", "")
+        if creds_user and creds_pass:
+            root = payload.get("login_url") or (target_url.rsplit("/", 2)[0] + "/login")
+            provider.goto(root)
+            signed_in = provider.authenticate(username=creds_user, password=creds_pass)
+            if not signed_in:
+                print(json.dumps({
+                    "status": "BLOCKED",
+                    "outcome_certain": True,
+                    "problems": [{"kind": "AUTHENTICATION_FAILED",
+                                  "detail": "the supplied credentials did not produce an authenticated session"}],
+                }))
+                return 0
+
         if not target_url:
             print(json.dumps({
                 "status": "BLOCKED",
