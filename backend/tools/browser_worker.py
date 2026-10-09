@@ -284,6 +284,23 @@ def main() -> int:
     A malformed input is reported as an outcome rather than a traceback, because the caller parses
     stdout and a stack trace on stderr with exit 0 would look like success.
     """
+    # THE PRIVILEGE GUARD, BEFORE ANYTHING ELSE. ADR-0011 in its applied form: this process opens a
+    # live portal, reads an organisation's documents and holds their credentials, so it must not
+    # connect as `granada_fleet` - the BYPASSRLS role that sees every organisation. It needs no
+    # cross-tenant visibility at all, and a worker that cannot prove it is narrow does not open a
+    # page.
+    from agent.worker_privileges import assert_worker_privileges, WorkerPrivilegeError
+
+    try:
+        assert_worker_privileges()
+    except WorkerPrivilegeError as exc:
+        print(json.dumps({
+            "status": "REJECTED",
+            "outcome_certain": True,
+            "problems": [{"kind": "PRIVILEGE_REFUSED", "detail": str(exc)}],
+        }))
+        return 0
+
     raw = sys.stdin.read()
     try:
         payload = json.loads(raw)
