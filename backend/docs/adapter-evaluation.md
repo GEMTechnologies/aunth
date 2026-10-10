@@ -110,9 +110,51 @@ errors in history: 0
 Correct, complete, and 0 errors in the history. The agent navigated, ran a DOM query for the title and
 every `input` with its label, and returned the answer.
 
+## Resource consumption, measured
+
+Same machine, same Chromium, one session at a time. RSS is summed across every `chrome` process from
+`/proc/<pid>/status`, because that is the number the kernel reports and `ps` rounds.
+
+```
+machine:  MemTotal 8,131,772 kB (7.75 GB) · MemAvailable 6,922,256 kB (6.6 GB) · 4 cores
+```
+
+| | Stagehand | Browser Use |
+|---|---|---|
+| browser launch | **5.1 s** | **5.6 s** |
+| RSS, blank page | **1,200.7 MB** | **1,485.0 MB** |
+| RSS after `close()` | 0 MB leaked | 0 MB leaked |
+
+**Both release everything.** A leaked browser is the resource failure that compounds across a fleet, and
+neither has it.
+
+**Stagehand is ~284 MB lighter** on a blank page. That is a real advantage and it did **not** change the
+selection: 284 MB does not buy back the inability to make a model call.
+
+### Safe concurrency, and why the number is 1
+
+Available memory is 6,922 MB. Keeping ~1 GB spare for the database, API and workers leaves ~5,900 MB.
+At the measured 1,485 MB per session that is **3 concurrent sessions** — four would leave 144 MB of
+headroom, which is not headroom.
+
+**The directive's one-session cap is nevertheless the operating limit**, and the reason is not memory:
+the ceiling is **credential blast radius**, not RAM. One session means one organisation's credentials in
+one browser at a time, which is a bound a memory figure cannot express.
+
+### What this measurement does NOT cover
+
+* **A loaded page.** The figures above are a blank page. The run that loaded the real portal **did not
+  complete** — the first adapter hung and the harness was killed at 200 s. A real grant portal with
+  scripts and images will use more, and by an unmeasured amount.
+* **Peak** memory during a multi-step interaction.
+* **CPU** — not instrumented; wall-clock timings are reported instead.
+* **Tokens or cost per task.** Browser Use's completed run is one data point at 44.9 s; Stagehand has
+  none.
+
 ## Selection
 
 **Primary adapter: Browser Use Python.**
+
 
 On measured results, and for one reason that dominates the others: **it is the only one of the two that
 can run at all on the credential this deployment owns.** Stagehand launched a browser slightly faster in
