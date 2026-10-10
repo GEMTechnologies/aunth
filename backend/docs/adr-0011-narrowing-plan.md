@@ -1,9 +1,69 @@
 # ADR-0011 narrowing: rollout and rollback
 
-**Status:** plan approved; **narrow function applied additively; equivalence now PROVEN over a
-non-empty set; cutover and `BYPASSRLS` revoke deliberately NOT done**
-**Date:** 2026-10-09 (equivalence evidence added same day)
+**Status:** ⚠️ **THE PLAN BELOW TARGETS THE WRONG TABLE — see the correction at the top**
+**Date:** 2026-10-09 (corrected 2026-10-10)
 **Scope:** the `granada_fleet` database role's `BYPASSRLS`, and the browser worker's credentials
+
+## ⚠️ CORRECTION (2026-10-10): this plan narrows `jobs`, and the dispatcher does not read `jobs`
+
+**Read the code before cutting over, and it does not match this document.**
+
+```
+workflow_engine.py:381   candidates = self.due_workflows(now=moment, limit=limit)
+workflow_engine.py:225   def due_workflows(...) -> list[models.AgentWorkflow]
+                         → reads `agent_workflows`, NOT `jobs`
+```
+
+So `fleet_due_job_ids()` — the function this plan is built around — **is not a function the
+dispatcher's privileged read would ever call.** Cutting over as written would have left the real
+cross-tenant read (`agent_workflows`) running under `BYPASSRLS` while appearing to close §12.
+
+**That is the same failure shape this directive produced five times: a control that appears to cover a
+path it does not touch.** It was caught by reading `dispatch_once` before applying anything.
+
+### The corrected work
+
+`docs/adr-0011-workflows-narrowing.sql` — `fleet_due_workflow_ids(batch_size, per_agent_limit)`,
+`SECURITY DEFINER`, `STABLE`, **ids only**, over **`agent_workflows`**.
+
+**The hard part was never the row filter — it was the fairness guarantee**, which lives in SQL:
+
+```sql
+row_number() OVER (PARTITION BY agent_id ORDER BY priority, next_run_at, id)
+```
+
+The method's own comment explains why: *"an organisation with thousands of high-priority due workflows
+fills the entire window, and a smaller organisation's work is never even fetched."* A narrow function
+that merely returns due rows would **regress fairness** — starving small organisations, a correctness
+bug a privilege review would not catch.
+
+**Applied and verified 2026-10-10:**
+
+```
+applied:  BEGIN · CREATE FUNCTION · REVOKE · DO · COMMIT      (additive; BYPASSRLS untouched)
+
+PROBE: function = 1
+PROBE: direct   = 1
+PROBE EQUIVALENCE = IDENTICAL
+PROBE: function contains the forced row = YES
+AFTER ROLLBACK: probe rows = 0
+```
+
+Equivalence forced through a **non-empty** set inside a rolled-back transaction — because two empty
+sets are always equal, which this directive already got wrong once.
+
+**Still NOT done:** the dispatcher cutover, and the `BYPASSRLS` revoke.
+
+### What this document is still good for
+
+The role measurements, the RLS inventory, the `granada_app`/`granada_fleet` distinction and the
+rollback procedure below remain accurate and useful. **Only the target table was wrong.** Read this
+section first.
+
+---
+
+## The original plan (target table now known to be wrong; retained for the measurements)
+
 
 ## Where this now stands (added 2026-10-09)
 
