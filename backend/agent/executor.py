@@ -64,12 +64,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 import models
 from agent import heartbeat
-from agent.workflow_engine import AgentWorker, ExecutionResult
+from agent.workflow_engine import AgentWorker, ExecutionResult, _truthy
 from observability import metrics
 
 logger = logging.getLogger(__name__)
@@ -156,6 +156,15 @@ class PassResult:
 class JobExecutor:
     """Polls for claimable jobs and runs each through `AgentWorker`."""
 
+    #: ADR-0011 step 2, the executor's half. When on, this process learns which organisations
+    #: exist from the narrow `fleet_active_agent_ids()` function and then claims and runs every
+    #: job BOUND to one organisation, instead of relying on `granada_fleet` holding BYPASSRLS.
+    #:
+    #: FALSE BY DEFAULT, mirroring `FleetDispatcher.USE_TENANT_BINDING`. On SQLite there is no
+    #: `set_config`, so the default path must remain byte-for-byte the behaviour the existing
+    #: suite exercises. Production sets `FLEET_TENANT_BINDING=1`.
+    USE_TENANT_BINDING = False
+
     def __init__(
         self,
         session_factory: Callable[[], Session],
@@ -164,8 +173,14 @@ class JobExecutor:
         batch_size: int = DEFAULT_BATCH_SIZE,
         interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
         on_pass: Optional[Callable[[PassResult], None]] = None,
+        use_tenant_binding: Optional[bool] = None,
     ) -> None:
         self.session_factory = session_factory
+        if use_tenant_binding is None:
+            use_tenant_binding = _truthy(
+                os.environ.get("FLEET_TENANT_BINDING"), default=type(self).USE_TENANT_BINDING
+            )
+        self.use_tenant_binding = use_tenant_binding
         self.batch_size = batch_size
         self.interval_seconds = interval_seconds
         self.worker_id = worker_id or worker_identity()
@@ -174,7 +189,46 @@ class JobExecutor:
         self._stop = threading.Event()
 
     # ------------------------------------------------------------------
-    def claimable_jobs(self, db: Session, *, now: Optional[datetime] = None) -> list[str]:
+    def _bind_tenant(self, db: Session, org_id: Optional[str]) -> None:
+        """Bind this connection to one organisation, or clear the binding with ``None``.
+
+        ADR-0011. `set_config(..., false)` is session-scoped rather than transaction-local, so it
+        survives a COMMIT - but it does NOT survive the connection going back to the pool, and
+        SQLAlchemy's pool runs `ResetStyle.reset_rollback` on return, which reverts it. MEASURED on
+        the production database: bound to one organisation `jobs` reads 1443 rows; after a `commit()`
+        the same session reads 0; re-binding returns 1443.
+
+        That measurement is why this process RE-BINDS BEFORE EVERY CLAIM AND EVERY JOB rather than
+        binding once per organisation. `run_once` commits after each attempt, so a binding
+        established once would be silently gone by the second job of the same organisation - and the
+        symptom would be an absence (jobs that are never claimed), not an error. The dispatcher gets
+        away with binding once because it only ever `flush()`es and commits at the end of the sweep;
+        the executor commits per job and cannot rely on that.
+
+        Cleared with the empty string rather than `RESET`, matching `tenant_context.ORG_SETTING`:
+        `app.current_org()` is `NULLIF(current_setting(..., true), '')`, so empty reads as "no
+        organisation" and matches no policy.
+        """
+        db.execute(
+            text("SELECT set_config('app.current_org_id', :org, false)"),
+            {"org": org_id or ""},
+        )
+
+    def _roster(self, db: Session) -> list[str]:
+        """The organisations this executor may work for, from the narrow SECURITY DEFINER function.
+
+        THE ONE LEGITIMATE CROSS-TENANT READ. "Which organisations exist" cannot be answered from
+        inside any single tenant, so it comes from `fleet_active_agent_ids()` - which returns ids and
+        grants the privilege to one reviewed query rather than to every statement this connection
+        runs. Called BEFORE any binding, because it is itself the thing that makes binding possible.
+        """
+        rows = db.execute(text("SELECT DISTINCT org_id FROM fleet_active_agent_ids()")).all()
+        return [str(row[0]) for row in rows if row[0]]
+
+    # ------------------------------------------------------------------
+    def claimable_jobs(
+        self, db: Session, *, now: Optional[datetime] = None, org_id: Optional[str] = None
+    ) -> list[str]:
         """Job ids the ledger might let us claim.
 
         A FILTER, NOT A RESERVATION. `JobLedger.claim` inside `execute` is what actually takes the
@@ -185,7 +239,15 @@ class JobExecutor:
         The lease clauses matter: a job whose lease has not expired is somebody else's, and a job in
         backoff has `available_at` in the future. Attempting either wastes a round trip and, worse,
         would make a busy fleet look like a racing one.
+
+        ADR-0011: when `org_id` is given, the reading connection is BOUND to that organisation first.
+        Without it this query returns rows only while `granada_fleet` holds BYPASSRLS - and once that
+        privilege is gone an unbound `jobs` read returns ZERO, so the executor idles while every
+        health check passes. That is not hypothetical: it is the exact state this method was changed
+        to end.
         """
+        if self.use_tenant_binding:
+            self._bind_tenant(db, org_id)
         moment = now or datetime.now(timezone.utc)
         rows = db.execute(
             select(models.Job.id)
@@ -210,35 +272,19 @@ class JobExecutor:
         db: Optional[Session] = None
         try:
             db = self.session_factory()
-            job_ids = self.claimable_jobs(db, now=now)
 
-            for job_id in job_ids:
-                result.attempted += 1
-                try:
-                    outcome = AgentWorker(db, worker_id=self.worker_id).execute(job_id)
-                    db.commit()
-                except Exception as exc:  # noqa: BLE001 - one bad job must not stop the pass
-                    # `execute` handles its own failures and returns FAILED; reaching here means
-                    # something outside that contract broke - a commit, a connection. Roll back and
-                    # carry on, because the remaining jobs are other organisations' work.
-                    db.rollback()
-                    result.errors.append(f"{job_id}: {type(exc).__name__}: {exc}")
-                    self.health.errors += 1
-                    self.health.last_error = f"{type(exc).__name__}: {exc}"
-                    logger.exception("executor.job_crashed", extra={"job_id": job_id})
-                    continue
-
-                status = getattr(outcome, "outcome", None)
-                if status == ExecutionResult.SUCCEEDED:
-                    result.succeeded += 1
-                elif status == ExecutionResult.FAILED:
-                    result.failed += 1
-                elif status == ExecutionResult.PARKED:
-                    result.parked += 1
-                else:
-                    # SKIPPED: already claimed, already done, or in backoff. A normal outcome when
-                    # two executors overlap, and not an error.
-                    result.skipped += 1
+            # THE BOUND PATH WALKS THE ROSTER. `fleet_active_agent_ids()` is the only cross-tenant
+            # read this process is allowed, and it is called BEFORE any binding because it is what
+            # makes binding possible. Each organisation's work is then claimed and run under that
+            # organisation's own context, so the executor never needs - and must never be given -
+            # BYPASSRLS (ADR-0011).
+            if self.use_tenant_binding:
+                for org_id in self._roster(db):
+                    for job_id in self.claimable_jobs(db, now=now, org_id=org_id):
+                        self._attempt(db, job_id, result, org_id=org_id)
+            else:
+                for job_id in self.claimable_jobs(db, now=now):
+                    self._attempt(db, job_id, result)
 
             self.health.sweeps += 1
             self.health.claimed += result.attempted
@@ -261,6 +307,52 @@ class JobExecutor:
         finally:
             if db is not None:
                 db.close()
+
+    # ------------------------------------------------------------------
+    def _attempt(
+        self,
+        db: Session,
+        job_id: str,
+        result: PassResult,
+        *,
+        org_id: Optional[str] = None,
+    ) -> None:
+        """Run one job and fold its outcome into ``result``.
+
+        RE-BINDS FIRST, ALWAYS. The previous attempt ended in a `commit()` (or a `rollback()` on
+        failure), and both return the connection to the pool, where `ResetStyle.reset_rollback`
+        reverts the session-level `set_config`. Without this line the SECOND job of every
+        organisation would run unbound and see nothing - an absence, not an exception.
+        """
+        if self.use_tenant_binding:
+            self._bind_tenant(db, org_id)
+
+        result.attempted += 1
+        try:
+            outcome = AgentWorker(db, worker_id=self.worker_id).execute(job_id)
+            db.commit()
+        except Exception as exc:  # noqa: BLE001 - one bad job must not stop the pass
+            # `execute` handles its own failures and returns FAILED; reaching here means
+            # something outside that contract broke - a commit, a connection. Roll back and
+            # carry on, because the remaining jobs are other organisations' work.
+            db.rollback()
+            result.errors.append(f"{job_id}: {type(exc).__name__}: {exc}")
+            self.health.errors += 1
+            self.health.last_error = f"{type(exc).__name__}: {exc}"
+            logger.exception("executor.job_crashed", extra={"job_id": job_id})
+            return
+
+        status = getattr(outcome, "outcome", None)
+        if status == ExecutionResult.SUCCEEDED:
+            result.succeeded += 1
+        elif status == ExecutionResult.FAILED:
+            result.failed += 1
+        elif status == ExecutionResult.PARKED:
+            result.parked += 1
+        else:
+            # SKIPPED: already claimed, already done, or in backoff. A normal outcome when
+            # two executors overlap, and not an error.
+            result.skipped += 1
 
     # ------------------------------------------------------------------
     def run_forever(self, *, max_passes: Optional[int] = None) -> ExecutorHealth:
@@ -350,9 +442,21 @@ def main() -> int:  # pragma: no cover - process entry point
     configure_logging(level=getattr(settings, "log_level", "INFO"), service="granada-executor")
     register_secrets_from_settings(settings)
 
-    # THE FLEET CREDENTIAL. Like the dispatcher and the relay, this reads jobs across every tenant,
-    # and `jobs` is FORCE ROW LEVEL SECURITY - under the application role the claim query would
-    # return zero rows and the executor would idle while claiming to be healthy (ADR-0011).
+    # THE FLEET CREDENTIAL, BUT NOT FOR THE REASON FIRST WRITTEN HERE.
+    #
+    # This comment used to say the fleet credential was what stopped the executor going blind: "the
+    # claim query would return zero rows [under the application role] and the executor would idle
+    # while claiming to be healthy". That was true only while `granada_fleet` ALSO held BYPASSRLS.
+    # ADR-0011 revoked it, and the fleet credential became exactly as blind as the application role -
+    # the comment described a protection that had already been removed, which is how the executor sat
+    # healthy and claimed nothing at all, with 55 queued jobs and 1,443 rows it could not see.
+    #
+    # MEASURED before the fix: as `granada_fleet`, `app.current_org()` NULL, `select count(*) from
+    # jobs` = 0, while the same query bound to the one organisation returned 1443.
+    #
+    # So the credential alone is no longer sufficient, and `FLEET_TENANT_BINDING=1` is what makes the
+    # fleet role able to work at all: the roster comes from the narrow `fleet_active_agent_ids()`
+    # function and every claim and job runs bound to one organisation.
     runner = JobExecutor(
         FleetSessionLocal,
         batch_size=int(getattr(settings, "executor_batch_size", DEFAULT_BATCH_SIZE)),
