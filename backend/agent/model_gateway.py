@@ -352,6 +352,96 @@ def build_provider(name: str, *, api_key: str = "", base_url: str = "") -> Model
     raise NoRouteAvailable(f"unknown model provider {name!r}")
 
 
+#: Models known to accept images. Deliberately a short, explicit list rather than a prefix rule: a
+#: wrong `True` sends a screenshot to a model that will answer about nothing, and the API will not say
+#: so - it returns 200 and drops the image. A wrong `False` merely refuses a request that could have
+#: worked, which is the cheaper mistake to make.
+VISION_CAPABLE_MODELS: frozenset[str] = frozenset(
+    {
+        # V4.1-Flash: "native multimodal visual understanding" (changelog 2026-09-10), and the Vision
+        # guide opens "The `deepseek-flash` model accepts images alongside text".
+        "deepseek-flash",
+        # Retired, but still routed to Flash for compatibility.
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+    }
+)
+
+
+def _model_can_see(model: str) -> bool:
+    """Whether this exact model name is known to accept images."""
+    return (model or "").strip().lower() in VISION_CAPABLE_MODELS
+
+
+def build_routes_from_settings(settings: Any) -> dict[str, list[ModelRoute]]:
+    """Build the tier -> route table from configuration.
+
+    WHY THIS EXISTS
+
+    Nothing in production constructed a `ModelRoute`. `MODEL_CLASSIFICATION_MODEL` and
+    `MODEL_SYNTHESIS_MODEL` were set in the environment, read by `Settings`, and used by NO route table
+    - so `ModelGateway` was instantiated only in tests, and setting those variables changed nothing
+    about what ran. The same "reachable from a test and nowhere else" shape as the mail transports and
+    the fleet's outbound provider.
+
+    TWO TIERS, matching the two settings: `CLASSIFICATION` for small, cheap decisions and `SYNTHESIS`
+    for the work that produces text a person reads. Paying synthesis prices to decide whether an email
+    is an acknowledgement is the most common way an agent platform becomes uneconomic.
+
+    THE IMAGE CAPABILITY IS A FACT ABOUT THE MODEL, NOT A SETTING
+
+    `deepseek-flash` is the multimodal name; `deepseek-v4-pro` is text-only. Marking the Flash route
+    `supports_images=True` is what lets `route_for(..., needs_images=True)` choose it - and what makes a
+    text-only route unreachable for a screenshot rather than merely unsuitable.
+    """
+    provider_name = (getattr(settings, "model_provider", "") or "null").strip().lower()
+    classification = (getattr(settings, "model_classification_model", "") or "").strip()
+    synthesis = (getattr(settings, "model_synthesis_model", "") or "").strip()
+
+    routes: dict[str, list[ModelRoute]] = {}
+    if classification:
+        routes["CLASSIFICATION"] = [
+            ModelRoute(
+                provider=provider_name,
+                model=classification,
+                tier="CLASSIFICATION",
+                supports_images=_model_can_see(classification),
+            )
+        ]
+    if synthesis:
+        routes["SYNTHESIS"] = [
+            ModelRoute(
+                provider=provider_name,
+                model=synthesis,
+                tier="SYNTHESIS",
+                supports_images=_model_can_see(synthesis),
+            )
+        ]
+    return routes
+
+
+def build_gateway_from_settings(db: Session, settings: Any) -> ModelGateway:
+    """A gateway wired from configuration, with the provider built and the routes resolved.
+
+    Not cached: the gateway carries a `db` session and a per-call budget context, and a process-wide
+    singleton holding a session is how a long-lived transaction appears.
+    """
+    provider = build_provider(
+        getattr(settings, "model_provider", "null") or "null",
+        api_key=getattr(settings, "model_api_key", "") or "",
+        base_url=getattr(settings, "model_base_url", "") or "",
+    )
+    return ModelGateway(
+        db,
+        provider,
+        routes=build_routes_from_settings(settings),
+        per_call_ceiling_micros=int(getattr(settings, "model_max_cost_micros_per_call", 0) or 0),
+        daily_ceiling_micros=int(getattr(settings, "model_max_cost_micros_per_day", 0) or 0),
+        store_prompts=bool(getattr(settings, "model_store_prompts", False)),
+        timeout_seconds=int(getattr(settings, "model_timeout_seconds", 60) or 60),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routing and pricing
 # ---------------------------------------------------------------------------

@@ -535,3 +535,75 @@ def test_complete_refuses_an_image_when_no_route_can_see():
             prompt_version="v1",
             images=("data:image/png;base64,AAAA",),
         )
+
+
+# ===========================================================================
+# THE ROUTES MUST COME FROM SETTINGS, OR THE SETTINGS DO NOTHING
+# ===========================================================================
+class _Settings:
+    """The model settings as the deployment actually declares them."""
+
+    model_provider = "openai_compatible"
+    model_base_url = "https://api.deepseek.com"
+    model_api_key = "k"
+    model_classification_model = "deepseek-flash"
+    model_synthesis_model = "deepseek-v4-pro"
+    model_max_cost_micros_per_call = 5_000_000
+    model_max_cost_micros_per_day = 50_000_000
+    model_store_prompts = False
+    model_timeout_seconds = 60
+
+
+def test_routes_are_built_from_settings():
+    """`MODEL_CLASSIFICATION_MODEL` and `MODEL_SYNTHESIS_MODEL` were read by Settings and used by NO
+    route table, so the gateway was constructible only in tests and setting those variables changed
+    nothing about what ran."""
+    import agent.model_gateway as gw
+
+    routes = gw.build_routes_from_settings(_Settings())
+    assert routes["CLASSIFICATION"][0].model == "deepseek-flash"
+    assert routes["SYNTHESIS"][0].model == "deepseek-v4-pro"
+
+
+def test_the_flash_route_is_marked_image_capable_and_pro_is_not():
+    """The fact that makes the whole routing guard work. `deepseek-flash` is V4.1-Flash with native
+    multimodal understanding; `deepseek-v4-pro` is text-only."""
+    import agent.model_gateway as gw
+
+    routes = gw.build_routes_from_settings(_Settings())
+    assert routes["CLASSIFICATION"][0].supports_images is True
+    assert routes["SYNTHESIS"][0].supports_images is False
+
+
+def test_an_unknown_model_is_assumed_unable_to_see():
+    """The safe direction to be wrong in: an unknown name must not be sent a screenshot on the
+    assumption it can handle one."""
+    import agent.model_gateway as gw
+
+    class S(_Settings):
+        model_classification_model = "some-model-nobody-has-heard-of"
+
+    assert gw.build_routes_from_settings(S())["CLASSIFICATION"][0].supports_images is False
+
+
+def test_a_gateway_built_from_settings_reaches_the_flash_model_for_an_image():
+    """End to end: settings -> routes -> routing decision."""
+    import agent.model_gateway as gw
+
+    gateway = gw.build_gateway_from_settings(_session(), _Settings())
+    assert gateway.route_for("CLASSIFICATION", needs_images=True).model == "deepseek-flash"
+    with pytest.raises(gw.NoRouteAvailable):
+        gateway.route_for("SYNTHESIS", needs_images=True)
+
+
+def test_an_unset_model_leaves_its_tier_absent_rather_than_guessed():
+    """A blank setting must produce NO route, so `NoRouteAvailable` names the gap instead of a
+    plausible-looking default being invented and acted on."""
+    import agent.model_gateway as gw
+
+    class S(_Settings):
+        model_synthesis_model = ""
+
+    routes = gw.build_routes_from_settings(S())
+    assert "SYNTHESIS" not in routes
+    assert "CLASSIFICATION" in routes
