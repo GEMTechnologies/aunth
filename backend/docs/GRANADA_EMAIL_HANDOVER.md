@@ -125,8 +125,30 @@ bounce/delivery events, queues, retries, isolation tests, PARJ unaffected.
 
 ## 6. Blockers needing the operator
 
-1. **`mail.approve_send` holder** to approve send intents legitimately (or confirm the existing
-   member's role should have it).
+0. **THE RBAC SURFACE IS UNPOPULATED — this is the blocker for outbound mail.**
+
+   Measured on production:
+
+   ```
+   select count(*) from permissions;        -- 0
+   select count(*) from role_permissions;   -- 0
+   ```
+
+   The only member (`6b95cf23-…`) holds the `owner` role, and **no role grants any `mail%`
+   permission, because no permissions exist at all**. The permission `mail.approve_send` — which the
+   approve route requires — is therefore unheld by everyone.
+
+   Consequence: `create_send_intent` succeeds, `execute_send` refuses with
+   `refusal_code=NOT_APPROVED`, and **no one can approve an intent through the application** until
+   permissions are seeded and granted. This is the same "built, tested, unreachable" shape seen
+   repeatedly in this codebase: the RBAC tables and checks exist and are correct; nothing ever
+   populated them.
+
+   Fix: seed `permissions` with the mail (and other) keys, grant them to the roles, and confirm the
+   `owner` role is intended to hold `mail.approve_send`. Then re-run the P1 test. **This is a
+   decision about who may authorise outbound mail — do not seed it silently.**
+
+1. **`mail.approve_send` holder** to approve send intents legitimately (see 0).
 2. **`MAIL_INGEST_KEY`** placed in `~/granada/.env` by the operator, so it never transits chat:
    `ssh granada-vps 'printf "\nMAIL_INGEST_KEY=%s\n" "VALUE" >> ~/granada/.env && chmod 600 ~/granada/.env'`
 3. **AWS IAM access** to apply and verify the `ses:FromAddress` deny.
