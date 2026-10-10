@@ -140,8 +140,11 @@ package (AWAITING_AUTHORISATION, target_url=http://127.0.0.1:8099/)
    interruption, final review, duplicate-submission protection.
 5. **§11 lifecycle** is not connected to the submission contracts; no `FORM_VALIDATED` /
    `SUBMISSION_PENDING` transitions exist.
-6. **ADR-0011** still needs a documented statement of the exact restrictions required before a live
-   browser worker receives tenant credentials.
+6. **ADR-0011** — the exact restrictions required before a live browser worker receives tenant
+   credentials are documented in `docs/adr-0011-credential-restrictions.md`. The credential path is
+   not merely unwired but **undecided**: the task carries a `CredentialRef`, the worker needs a
+   value, and the choice of where the plaintext lives is a security decision with a transport
+   consequence that must be accepted in writing first.
 
 ## I. Production status
 
