@@ -50,6 +50,40 @@ So the runner as committed **cannot run in this deployment**, and this document 
 leaving a component that looks deployed. Its bounds — one session, never submits, lease required — are
 tested and remain the right bounds; only its channel is wrong.
 
+## 2b. THE BRIDGE IS BUILT AND PROVEN — the chain runs
+
+The corrected design below was implemented as `tools/browser_execute_server.py` (host) and
+`tools/browser_execute_client.py` (container), and the full chain now runs:
+
+```
+container -> client -> host service -> real Chromium -> real portal
+  client exit: 0   elapsed: 7.9s
+  status: BLOCKED   outcome_certain: True
+  provider: playwright-chromium   sandbox: enabled   receipt: None
+  "the page requires email and Granada holds no verified value"
+```
+
+**Read the last line carefully.** The executor reached the sign-in page and **refused to fill it in**,
+because Granada holds no *verified* email for that organisation. It did not invent one. That is
+`perception.FACT_CHANNELS` doing its job at the far end of a chain that crosses a container boundary, a
+network hop and a subprocess — and it is the single most reassuring result in this document.
+
+Obstacles cleared to get there, each measured rather than assumed:
+
+| obstacle | what it was | resolution |
+|---|---|---|
+| Chromium not found | host service needed the interpreter that has Playwright | `--interpreter /tmp/browser-eval/bin/python3` |
+| UFW `INPUT policy DROP` | the container could not reach the host on 8765 | `ufw allow in on br-d10cf7c8838c to any port 8765` — **bridge interface only**, never the public one |
+| SSRF guard fired | loopback target refused, correctly | the controlled fixture sets `allow_loopback: true` |
+| **the opt-in was discarded in transit** | `browser_worker.py` built `ActionScope` without passing `allow_loopback`, so the refusal named a switch the transport dropped | now passed through; still defaulting to `False` |
+
+That fourth row is worth keeping: **the error message told the operator to opt in, and the code made
+opting in impossible.** A refusal that names an unavailable remedy is worse than a refusal that names
+none, because it sends someone to look for a configuration that does not exist.
+
+`browser_invocation.py` needed **no change at all** — `browser_worker_command` points at the client,
+which satisfies the invoker's stdin/stdout contract while forwarding the work to the host.
+
 ## 3. The corrected design
 
 **Invert it: the host runner should be a stateless execution service with NO database credentials.**

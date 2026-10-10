@@ -467,6 +467,22 @@ def main() -> int:
             allowed_hosts=tuple(scope_payload.get("allowed_hosts") or ()),
             allowed_path_prefixes=tuple(scope_payload.get("allowed_path_prefixes") or ()),
             max_steps=int(scope_payload.get("max_steps", 200)),
+            # THE OPT-IN WAS BEING SILENTLY DISCARDED, and that made a refusal unactionable.
+            #
+            # `validate_task` refuses a loopback target with "loopback is refused unless the task
+            # explicitly opts in". The opt-in is `ActionScope.allow_loopback`, and it defaults to
+            # False. This constructor did not pass it, so EVERY task arriving over the wire had it
+            # False - the refusal named a switch that the transport dropped on the floor.
+            #
+            # Found by driving the real chain at the controlled fixture: adding `allow_loopback: true`
+            # to the payload changed nothing, because the field never left the JSON.
+            #
+            # It also matters beyond the fixture. A portal Granada hosts on a private address is
+            # reachable only through this opt-in, and through this path there was no way to give it.
+            #
+            # Still defaulting to False: strict truthiness, so a string "false" from a JSON payload
+            # does not open a network position nobody asked for.
+            allow_loopback=scope_payload.get("allow_loopback") is True,
         )
     except Exception as exc:
         _emit({"status": "FAILED", "problems": [{"kind": "BAD_ACTION_SCOPE", "detail": str(exc)[:200]}]})
