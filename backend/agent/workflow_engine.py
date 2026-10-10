@@ -41,9 +41,10 @@ the stream entry only says where to look.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
@@ -230,6 +231,7 @@ class FleetDispatcher:
         batch_size: int = DEFAULT_BATCH_SIZE,
         per_agent_limit: int = DEFAULT_PER_AGENT_LIMIT,
         use_narrow_claim: Optional[bool] = None,
+        use_tenant_binding: Optional[bool] = None,
     ) -> None:
         """`use_narrow_claim` defaults to the class attribute, which is False, and to the environment
         when one is set.
@@ -251,6 +253,88 @@ class FleetDispatcher:
                 os.environ.get("FLEET_NARROW_CLAIM"), default=type(self).USE_NARROW_CLAIM
             )
         self.use_narrow_claim = use_narrow_claim
+        if use_tenant_binding is None:
+            import os
+
+            use_tenant_binding = _truthy(
+                os.environ.get("FLEET_TENANT_BINDING"), default=type(self).USE_TENANT_BINDING
+            )
+        self.use_tenant_binding = use_tenant_binding
+
+    #: Whether to bind the connection to ONE organisation at a time instead of relying on
+    #: `granada_fleet`'s BYPASSRLS (ADR-0011 step 2).
+    #:
+    #: FALSE BY DEFAULT and deliberately additive, for the same reason `USE_NARROW_CLAIM` is: the
+    #: dispatcher is serving production, and switching a default in the commit that introduces the
+    #: option makes a regression indistinguishable from the intended change.
+    #:
+    #: WHEN BOTH ARE ON the dispatcher stops needing BYPASSRLS at all:
+    #:
+    #:   * candidate selection comes from `fleet_due_workflow_refs` (SECURITY DEFINER, ids + org only)
+    #:   * every tenant-scoped statement runs bound to `app.current_org_id`
+    #:
+    #: Turning this on is a prerequisite for revoking the privilege, never a substitute for testing it.
+    USE_TENANT_BINDING = False
+
+    def _bind_tenant(self, org_id: Optional[str]) -> None:
+        """Bind this connection to one organisation, or clear the binding with ``None``.
+
+        `set_config(..., false)` is SESSION-level, not transaction-local, and that is deliberate. The
+        dispatcher commits inside a sweep, and a transaction-local setting is discarded at COMMIT -
+        so the second half of a sweep would run unbound and return zero rows while looking like a
+        quiet fleet. Session scope plus an explicit clear in `tenant_scope`'s `finally` is the
+        predictable option here.
+        """
+        self.db.execute(
+            text("SELECT set_config('app.current_org_id', :org, false)"),
+            {"org": org_id or ""},
+        )
+
+    @contextmanager
+    def tenant_scope(self, org_id: Optional[str]) -> Iterator[None]:
+        """Run tenant-scoped work bound to one organisation, then clear the binding.
+
+        A NO-OP WHEN BINDING IS OFF, and that is not an optimisation. The dispatcher wraps its loop
+        body unconditionally, so without this guard the default path would issue a `set_config` per
+        workflow - which fails outright on SQLite, where the function does not exist. The suite is
+        SQLite; the fleet is PostgreSQL. A guard here keeps the default path byte-for-byte the
+        behaviour every existing test already exercises.
+
+        The `finally` matters more than the bind. A dispatcher that binds and then raises would leave
+        the NEXT organisation's work running under the previous organisation's context - which is the
+        one failure mode in this design that could cross tenants rather than merely return nothing.
+        """
+        if not self.use_tenant_binding:
+            yield
+            return
+
+        self._bind_tenant(org_id)
+        try:
+            yield
+        finally:
+            self._bind_tenant(None)
+
+    def due_workflow_refs(self, *, limit: Optional[int] = None) -> list[tuple[str, Optional[str]]]:
+        """Due work as ``(workflow_id, org_id)`` pairs, from the narrow SECURITY DEFINER function.
+
+        WHY REFS RATHER THAN ROWS
+
+        The ids this returns belong to many organisations. There is no single value of
+        `app.current_org_id` that lets a follow-up `WHERE id IN (...)` re-select them once
+        `granada_fleet` has no BYPASSRLS - bound to one organisation it returns that organisation's
+        rows only and the fleet dispatches one tenant per sweep; bound to none it returns zero.
+
+        So the dispatcher does not re-select across tenants at all. It takes the refs and processes
+        ONE WORKFLOW AT A TIME, each bound to its own organisation - which is why the refs must carry
+        `org_id`. That is ADR-0011 step 2 in one sentence.
+        """
+        rows = self.db.execute(
+            text(
+                "SELECT workflow_id, org_id FROM fleet_due_workflow_refs(:batch, :per_agent)"
+            ),
+            {"batch": limit or self.batch_size, "per_agent": self.per_agent_limit},
+        )
+        return [(row[0], row[1]) for row in rows]
 
     #: Whether to discover due work through the narrow SECURITY DEFINER function instead of reading
     #: `agent_workflows` directly under `granada_fleet`'s BYPASSRLS (ADR-0011).
@@ -386,52 +470,82 @@ class FleetDispatcher:
         moment = now or datetime.now(timezone.utc)
         scheduled = 0
 
-        agents = self.db.execute(
-            select(models.GranadaAgent).where(models.GranadaAgent.status == models.GranadaAgent.ACTIVE)
-        ).scalars().all()
-        if not agents:
+        # THE ROSTER IS THE ONE LEGITIMATE CROSS-TENANT READ. "Which organisations are active" cannot be
+        # answered from inside any single tenant, because the answer IS the list of tenants. Everything
+        # below it is tenant-scoped and must run bound.
+        #
+        # With binding off, the roster is a plain unscoped SELECT - which works only because the fleet
+        # connection carries BYPASSRLS. With binding on, it comes from `fleet_active_agent_ids()`, whose
+        # whole reason for existing is to be the smallest possible answer to that one question.
+        if self.use_tenant_binding:
+            roster = [
+                (row[0], row[1])
+                for row in self.db.execute(
+                    text("SELECT agent_id, org_id FROM fleet_active_agent_ids()")
+                )
+            ]
+        else:
+            roster = [
+                (a.id, a.org_id)
+                for a in self.db.execute(
+                    select(models.GranadaAgent).where(
+                        models.GranadaAgent.status == models.GranadaAgent.ACTIVE
+                    )
+                ).scalars().all()
+            ]
+        if not roster:
             return 0
 
-        for agent in agents:
-            # Opportunities this organisation has already evaluated. A match row means the work is
-            # done; a workflow row means it is already queued, and re-scheduling would wake a
-            # completed one or churn a queued one every sweep.
-            evaluated = select(models.OpportunityMatch.opportunity_id).where(
-                models.OpportunityMatch.org_id == agent.org_id
-            )
-            queued = select(models.AgentWorkflow.subject_id).where(
-                models.AgentWorkflow.agent_id == agent.id,
-                models.AgentWorkflow.workflow_type == WORKFLOW_MATCH,
-                models.AgentWorkflow.subject_type == models.AgentWorkflow.SUBJECT_OPPORTUNITY,
-            )
+        for agent_id, org_id in roster:
+            # EACH AGENT'S WORK RUNS UNDER ITS OWN ORGANISATION. The lookup, the `NOT IN` subqueries and
+            # `GranadaAgentService.schedule()` all touch tenant tables, so without the binding each
+            # returns nothing and discovery reports a quiet catalogue instead of a blind one.
+            with self.tenant_scope(org_id):
+                agent = self.db.execute(
+                    select(models.GranadaAgent).where(models.GranadaAgent.id == agent_id)
+                ).scalars().first()
+                if agent is None:
+                    continue
 
-            candidates = self.db.execute(
-                select(models.Opportunity)
-                .where(
-                    models.Opportunity.id.notin_(evaluated),
-                    models.Opportunity.id.notin_(queued),
-                    models.Opportunity.is_active.is_(True),
+                # Opportunities this organisation has already evaluated. A match row means the work is
+                # done; a workflow row means it is already queued, and re-scheduling would wake a
+                # completed one or churn a queued one every sweep.
+                evaluated = select(models.OpportunityMatch.opportunity_id).where(
+                    models.OpportunityMatch.org_id == agent.org_id
                 )
-                .order_by(models.Opportunity.created_at.desc())
-                .limit(self.DISCOVERY_LIMIT_PER_AGENT)
-            ).scalars().all()
-
-            if not candidates:
-                continue
-
-            # Imported here rather than at module scope: granada_agent imports this module, so a
-            # top-level import would be circular.
-            from agent.granada_agent import GranadaAgentService
-
-            service = GranadaAgentService(self.db, agent.org_id)
-            for opportunity in candidates:
-                service.schedule(
-                    workflow_type=WORKFLOW_MATCH,
-                    subject_type=models.AgentWorkflow.SUBJECT_OPPORTUNITY,
-                    subject_id=str(opportunity.id),
-                    run_at=moment,
+                queued = select(models.AgentWorkflow.subject_id).where(
+                    models.AgentWorkflow.agent_id == agent.id,
+                    models.AgentWorkflow.workflow_type == WORKFLOW_MATCH,
+                    models.AgentWorkflow.subject_type == models.AgentWorkflow.SUBJECT_OPPORTUNITY,
                 )
-                scheduled += 1
+
+                candidates = self.db.execute(
+                    select(models.Opportunity)
+                    .where(
+                        models.Opportunity.id.notin_(evaluated),
+                        models.Opportunity.id.notin_(queued),
+                        models.Opportunity.is_active.is_(True),
+                    )
+                    .order_by(models.Opportunity.created_at.desc())
+                    .limit(self.DISCOVERY_LIMIT_PER_AGENT)
+                ).scalars().all()
+
+                if not candidates:
+                    continue
+
+                # Imported here rather than at module scope: granada_agent imports this module, so a
+                # top-level import would be circular.
+                from agent.granada_agent import GranadaAgentService
+
+                service = GranadaAgentService(self.db, agent.org_id)
+                for opportunity in candidates:
+                    service.schedule(
+                        workflow_type=WORKFLOW_MATCH,
+                        subject_type=models.AgentWorkflow.SUBJECT_OPPORTUNITY,
+                        subject_id=str(opportunity.id),
+                        run_at=moment,
+                    )
+                    scheduled += 1
 
         if scheduled:
             metrics.inc("fleet.discovered_opportunity_work", scheduled)
@@ -455,70 +569,93 @@ class FleetDispatcher:
         # wanted dispatched started finding extra rows. A method called `dispatch_once` should
         # dispatch (ADR-0011).
         try:
-            candidates = self.due_workflows(now=moment, limit=limit)
+            if self.use_tenant_binding:
+                # ADR-0011 step 2. Candidate selection crosses tenants by design, so it comes from the
+                # SECURITY DEFINER function as `(workflow_id, org_id)` pairs. Everything after that runs
+                # bound to one organisation, which is what lets `granada_fleet` keep working with
+                # BYPASSRLS REVOKED.
+                refs = self.due_workflow_refs(limit=limit)
+            else:
+                refs = [
+                    (w.id, w.org_id) for w in self.due_workflows(now=moment, limit=limit)
+                ]
         except Exception:
             # A dispatcher that dies must not poison the fleet.
             self.db.rollback()
             raise
 
-        for workflow in candidates:
+        for workflow_id, org_id in refs:
             result.scanned += 1
 
-            agent = self.db.execute(
-                select(models.GranadaAgent).where(models.GranadaAgent.id == workflow.agent_id)
-            ).scalars().first()
-            if agent is None:
-                result.skipped_unhandled += 1
-                continue
-
-            if agent.status != models.GranadaAgent.ACTIVE:
-                # A paused agent receives no new work, and its workflow is parked
-                # rather than dispatched. Parked, not cancelled: pressing pause is
-                # not pressing stop.
-                workflow.state = models.AgentWorkflow.WAITING
-                workflow.waiting_on = f"agent {agent.status.lower()}"
-                workflow.next_run_at = moment + timedelta(hours=1)
-                result.skipped_paused += 1
-                metrics.inc("fleet.dispatch_skipped_paused")
-                continue
-
-            if result.per_agent.get(agent.id, 0) >= self.per_agent_limit:
-                # Fairness: give the other organisations their turn first.
-                metrics.inc("fleet.dispatch_deferred_fairness")
-                continue
-
-            if workflow.specialist_key is not None:
-                try:
-                    candidate = check_work_type(workflow.specialist_key, workflow.workflow_type)
-                    # Resolving is not enough: a registered-but-unimplemented
-                    # specialist must park rather than be dispatched into a job
-                    # that can only fail.
-                    if workflow.workflow_type not in candidate.handlers:
-                        raise SpecialistDisabled(
-                            f"{candidate.display_name} has no handler for "
-                            f"{workflow.workflow_type!r} in this phase"
-                        )
-                except SpecialistError as exc:
-                    # An unhandled or unregistered specialist parks the workflow
-                    # rather than silently completing it.
-                    workflow.state = models.AgentWorkflow.WAITING
-                    workflow.waiting_on = f"no executable specialist: {exc}"[:255]
-                    workflow.next_run_at = moment + timedelta(hours=6)
+            # THE BINDING IS PER WORKFLOW, and it wraps the row load itself. `granada_agents` and
+            # `agent_workflows` are both under FORCE ROW LEVEL SECURITY, so the lookup below returns
+            # None - read as "agent missing" and counted as `skipped_unhandled` - unless the tenant is
+            # bound first. A silent skip is exactly how a blind dispatcher looks healthy.
+            with self.tenant_scope(org_id):
+                workflow = self.db.execute(
+                    select(models.AgentWorkflow).where(models.AgentWorkflow.id == workflow_id)
+                ).scalars().first()
+                if workflow is None:
+                    # Bound to its own organisation and still not visible: the row moved or was
+                    # deleted since selection. Counted, not swallowed.
                     result.skipped_unhandled += 1
                     continue
 
-            created = self._enqueue(workflow, agent, moment)
-            if created:
-                result.dispatched += 1
-                result.per_agent[agent.id] = result.per_agent.get(agent.id, 0) + 1
-            else:
-                result.duplicates += 1
+                agent = self.db.execute(
+                    select(models.GranadaAgent).where(models.GranadaAgent.id == workflow.agent_id)
+                ).scalars().first()
+                if agent is None:
+                    result.skipped_unhandled += 1
+                    continue
 
-            # The workflow leaves the dispatchable set whether or not a job was
-            # created, so a duplicate does not spin: the existing job owns it now.
-            workflow.state = models.AgentWorkflow.RUNNING
-            workflow.last_run_at = moment
-            workflow.attempts += 1
+                if agent.status != models.GranadaAgent.ACTIVE:
+                    # A paused agent receives no new work, and its workflow is parked
+                    # rather than dispatched. Parked, not cancelled: pressing pause is
+                    # not pressing stop.
+                    workflow.state = models.AgentWorkflow.WAITING
+                    workflow.waiting_on = f"agent {agent.status.lower()}"
+                    workflow.next_run_at = moment + timedelta(hours=1)
+                    result.skipped_paused += 1
+                    metrics.inc("fleet.dispatch_skipped_paused")
+                    continue
+
+                if result.per_agent.get(agent.id, 0) >= self.per_agent_limit:
+                    # Fairness: give the other organisations their turn first.
+                    metrics.inc("fleet.dispatch_deferred_fairness")
+                    continue
+
+                if workflow.specialist_key is not None:
+                    try:
+                        candidate = check_work_type(workflow.specialist_key, workflow.workflow_type)
+                        # Resolving is not enough: a registered-but-unimplemented
+                        # specialist must park rather than be dispatched into a job
+                        # that can only fail.
+                        if workflow.workflow_type not in candidate.handlers:
+                            raise SpecialistDisabled(
+                                f"{candidate.display_name} has no handler for "
+                                f"{workflow.workflow_type!r} in this phase"
+                            )
+                    except SpecialistError as exc:
+                        # An unhandled or unregistered specialist parks the workflow
+                        # rather than silently completing it.
+                        workflow.state = models.AgentWorkflow.WAITING
+                        workflow.waiting_on = f"no executable specialist: {exc}"[:255]
+                        workflow.next_run_at = moment + timedelta(hours=6)
+                        result.skipped_unhandled += 1
+                        continue
+
+                created = self._enqueue(workflow, agent, moment)
+                if created:
+                    result.dispatched += 1
+                    result.per_agent[agent.id] = result.per_agent.get(agent.id, 0) + 1
+                else:
+                    result.duplicates += 1
+
+                # The workflow leaves the dispatchable set whether or not a job was
+                # created, so a duplicate does not spin: the existing job owns it now.
+                workflow.state = models.AgentWorkflow.RUNNING
+                workflow.last_run_at = moment
+                workflow.attempts += 1
 
         self.db.flush()
         metrics.inc("fleet.dispatched", result.dispatched)
