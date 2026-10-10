@@ -331,6 +331,13 @@ class RunReport:
     receipt: Optional[str] = None
     #: Distinguishes "we know nothing was submitted" from "we do not know".
     outcome_certain: bool = True
+    #: What a vision model READ off the page, as observations.
+    #:
+    #: DELIBERATELY NOT `field_outcomes`. Every entry here is a VISION-channel observation, and
+    #: `perception.FACT_CHANNELS` excludes VISION - so a value read off a screenshot must not be
+    #: written into a form as an organisational fact. Keeping them in a separate collection makes the
+    #: rule structural: there is no key in `field_outcomes` that a vision reading could occupy.
+    vision_observations: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -344,6 +351,7 @@ class RunReport:
             "checkpoints": list(self.checkpoints),
             "receipt": self.receipt,
             "outcome_certain": self.outcome_certain,
+            "vision_observations": list(self.vision_observations),
         }
 
 
@@ -360,6 +368,7 @@ class BrowserRuntime:
         *,
         policy: Optional[RetryPolicy] = None,
         now: Optional[Any] = None,
+        vision_reader: Optional[Any] = None,
     ) -> None:
         self.provider = provider
         self.policy = policy or RetryPolicy()
@@ -368,6 +377,14 @@ class BrowserRuntime:
         self._actions = 0
         self._started: Optional[datetime] = None
         self._checkpoints: list[Checkpoint] = []
+        #: An optional callable `(PageState) -> list[PerceivedValue]` that reads the page with a model
+        #: that can SEE. Injected rather than constructed here so this module stays free of the model
+        #: gateway, the credential store and the tenant context - it drives a browser, and a runtime
+        #: that also knew how to reach a model would be a second agent platform by the back door.
+        #:
+        #: Absent by default. `browser_execution` is 0 in production, and a run must not depend on a
+        #: credential to complete work the structure already answers.
+        self.vision_reader = vision_reader
 
     # -- budget --------------------------------------------------------------
     def _expired(self) -> bool:
@@ -380,6 +397,60 @@ class BrowserRuntime:
                 f"action budget exhausted ({self.policy.max_total_actions}); stopping rather than "
                 "continuing to drive a page that keeps producing work"
             )
+
+    def _read_with_vision(self, page: PageState, report: RunReport) -> None:
+        """Ask the injected reader to look at the page, and record what it saw.
+
+        THREE RULES, EACH OF WHICH IS A DECISION.
+
+        1. **A vision failure never stops the run.** The structural path is still valid, and a model
+           that is down, out of budget or refusing an image must not turn a form-filling task into a
+           failure. It is recorded as a problem so the run is honest about having gone without.
+
+        2. **A visual reading is never a field outcome.** `PerceivedValue.channel` is VISION, and
+           `perception.FACT_CHANNELS` excludes VISION - so the values go into `vision_observations`,
+           a separate collection. There is no key in `field_outcomes` a vision reading could occupy,
+           which is §2C enforced by shape rather than by a caller remembering.
+
+        3. **An obstacle is a problem, not a value to act on.** "Session expired" or a CAPTCHA is
+           precisely what the DOM omits; recording it as a problem lets the caller park the workflow
+           with a legible reason instead of filling a form that cannot be submitted.
+        """
+        if self.vision_reader is None or not page.has_picture:
+            return
+        try:
+            values = self.vision_reader(page) or []
+        except Exception as exc:  # noqa: BLE001 - rule 1: this is an enhancement, not a dependency
+            report.problems.append(
+                {
+                    "kind": "VISION_UNAVAILABLE",
+                    "detail": (
+                        f"the page was not read visually ({type(exc).__name__}); the structural "
+                        "observation is unaffected and the run continues"
+                    ),
+                }
+            )
+            return
+
+        for value in values:
+            report.vision_observations.append(
+                {
+                    "name": getattr(value, "name", ""),
+                    "value": getattr(value, "value", None),
+                    # The CHANNEL travels with the observation, so a consumer does not have to trust
+                    # that these came from a model - and cannot mistake one for a fact.
+                    "channel": getattr(getattr(value, "channel", None), "value", None),
+                    "evidence_ref": getattr(value, "evidence_ref", ""),
+                    "confidence": getattr(value, "confidence", None),
+                }
+            )
+            if getattr(value, "name", "") == "obstacle":
+                report.problems.append(
+                    {
+                        "kind": "VISUAL_OBSTACLE",
+                        "detail": str(getattr(value, "value", ""))[:500],
+                    }
+                )
 
     # -- the cycle -----------------------------------------------------------
     def run(
@@ -434,6 +505,10 @@ class BrowserRuntime:
 
                 page = self.provider.observe()
                 self._checkpoint(OBSERVE, page, done, report)
+
+                # OBSERVE -> (look at it, when the tree does not say). The perception layer decides
+                # whether vision is NEEDED; this only decides whether a reader was supplied.
+                self._read_with_vision(page, report)
 
                 action = plan_next(
                     page,
