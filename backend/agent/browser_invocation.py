@@ -38,6 +38,8 @@ during this milestone, and a flag that defaults to False is the established Gran
 from __future__ import annotations
 
 import json
+import os
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -84,22 +86,54 @@ class SubprocessInvoker:
     A process per invocation, not a daemon: the directive requires a leased capability and forbids a
     permanent browser process per organisation. This object holds no session between calls, so
     nothing can leak from one organisation's run into the next.
+
+    THE SETTING IS A COMMAND LINE, NOT A BARE BINARY, AND IT WAS TREATED AS THE LATTER.
+
+    `subprocess.run([self.command])` takes a one-element argv with no shell, so the value had to name
+    a single EXECUTABLE FILE. The deployed container-side client is
+    `tools/browser_execute_client.py` - a plain non-executable module with no shebang and no console
+    script - so no value an operator could put in `browser_worker_command` would start it. The
+    invocation would either raise `BrowserWorkerUnavailable` or, worse, run `python` with the task
+    JSON as its stdin *program*.
+
+    A setting called `..._command` is read as a command line, so it now is one. A single absolute
+    path (`/bin/true`, which the tests use) still parses to a one-element argv and behaves exactly as
+    before.
     """
 
     def __init__(self, command: str) -> None:
         self.command = command
 
-    def run(self, task: BrowserTask, *, timeout_seconds: int) -> dict[str, Any]:
-        if not shutil.which(self.command) and not self.command.startswith("/"):
+    def _argv(self) -> list[str]:
+        """The configured command as argv, or a refusal naming why it cannot be one.
+
+        `posix=` FOLLOWS THE PLATFORM because the quoting rules do. POSIX `shlex` treats a backslash
+        as an escape, so on Windows it silently eats the separators in
+        `C:\\...\\python.exe` and produces a binary name that cannot exist. The worker runs on a
+        Linux host, so POSIX parsing is what production uses; the non-POSIX branch exists so the
+        suite can exercise this at all on the development machine.
+        """
+        argv = shlex.split(self.command, posix=(os.name != "nt")) if self.command else []
+        if not argv:
             raise BrowserWorkerUnavailable(
-                f"browser worker {self.command!r} not found on PATH; the worker runs on the host, "
+                "no browser worker command is configured; nothing was invoked"
+            )
+        # A bare name must be findable on PATH. An absolute or relative path is taken as given, which
+        # is what lets a test point at a script it just wrote.
+        if not shutil.which(argv[0]) and not (os.path.isabs(argv[0]) or argv[0].startswith(".")):
+            raise BrowserWorkerUnavailable(
+                f"browser worker {argv[0]!r} not found on PATH; the worker runs on the host, "
                 "not inside this container"
             )
+        return argv
+
+    def run(self, task: BrowserTask, *, timeout_seconds: int) -> dict[str, Any]:
+        argv = self._argv()
         # The task is passed on stdin as JSON. Nothing tenant-identifying is put on the command line,
         # where it would appear in the process table.
         try:
             completed = subprocess.run(
-                [self.command],
+                argv,
                 input=json.dumps(task.as_dict()).encode(),
                 capture_output=True,
                 timeout=timeout_seconds,

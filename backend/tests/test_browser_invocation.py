@@ -62,6 +62,51 @@ SETTINGS_ON = {BROWSER_EXECUTION_ENABLED: True, BROWSER_WORKER_COMMAND: "/usr/lo
 
 
 # ===========================================================================
+# THE COMMAND IS A COMMAND LINE
+# ===========================================================================
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="a shebang script is not executable on Windows; the worker host is Linux",
+)
+def test_a_bare_binary_still_works(tmp_path):
+    """The tests use `/bin/true`-shaped values, and that must keep working."""
+    script = tmp_path / "worker"
+    script.write_text("#!/bin/sh\ncat >/dev/null\necho '{\"status\": \"BLOCKED\"}'\n")
+    script.chmod(0o755)
+    raw = SubprocessInvoker(str(script)).run(task(), timeout_seconds=10)
+    assert raw["status"] == "BLOCKED"
+
+
+def test_a_command_LINE_with_arguments_is_accepted(tmp_path):
+    """THE DEPLOYED SHAPE. The container-side client is `tools/browser_execute_client.py` - a plain
+    non-executable module with no shebang and no console script - so while the invoker built
+    `[self.command]`, NO value an operator could configure would start it.
+
+    A setting named `browser_worker_command` is a command line, and the client is reached as
+    `python /app/backend/tools/browser_execute_client.py`.
+    """
+    script = tmp_path / "client.py"
+    script.write_text(
+        "import json, sys\n"
+        "payload = json.load(sys.stdin)\n"
+        "print(json.dumps({'status': 'BLOCKED', 'seen_task': payload.get('task_id')}))\n"
+    )
+    raw = SubprocessInvoker(f"{sys.executable} {script}").run(task(), timeout_seconds=20)
+    assert raw["status"] == "BLOCKED"
+    assert raw["seen_task"] == "task-1", "the task JSON did not reach the client on stdin"
+
+
+def test_an_empty_command_is_refused_rather_than_starting_anything():
+    with pytest.raises(BrowserWorkerUnavailable):
+        SubprocessInvoker("").run(task(), timeout_seconds=5)
+
+
+def test_a_command_line_whose_binary_is_missing_is_refused():
+    with pytest.raises(BrowserWorkerUnavailable):
+        SubprocessInvoker("definitely-not-a-real-worker --flag").run(task(), timeout_seconds=5)
+
+
+# ===========================================================================
 # THE FLAG
 # ===========================================================================
 def test_browser_execution_is_off_by_default():
