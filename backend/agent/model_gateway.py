@@ -361,6 +361,19 @@ class ModelRoute:
     model: str
     tier: str
     model_version: str | None = None
+    #: Whether this model can SEE an image. Defaults False, because that is the honest answer for an
+    #: unknown model and the safe direction to be wrong in.
+    #:
+    #: WHY THIS EXISTS. `deepseek-v4-pro` is text-only, and it does NOT reject a request containing an
+    #: image: the API returns HTTP 200 and silently drops it. The model then answers about an image it
+    #: cannot see, and the caller has no way to tell that from a genuine answer. Observed directly -
+    #: V4-Pro replied "I can't see the image you've provided because it appears as unsupported" while
+    #: `deepseek-flash` described the same image correctly.
+    #:
+    #: So a route that cannot see must be UNREACHABLE for a request that carries an image, rather than
+    #: merely unsuitable. `route_for(..., needs_images=True)` filters on this and raises when nothing
+    #: qualifies, which converts a silent wrong answer into a named failure.
+    supports_images: bool = False
 
 
 @dataclass(frozen=True)
@@ -451,8 +464,24 @@ class ModelGateway:
         self.trace_id = trace_id
 
     # -- routing -----------------------------------------------------------
-    def route_for(self, tier: str) -> ModelRoute:
+    def route_for(self, tier: str, *, needs_images: bool = False) -> ModelRoute:
+        """The route for a tier. With `needs_images`, only a model that can SEE may be chosen.
+
+        RAISING RATHER THAN FALLING BACK IS THE POINT. A text-only model given an image returns HTTP
+        200 with the image silently dropped, so a fallback would produce a confident answer about
+        something the model never saw - and the caller could not tell. A named failure is the only
+        honest outcome.
+        """
         options = self.routes.get(tier) or []
+        if needs_images:
+            options = [route for route in options if route.supports_images]
+            if not options:
+                configured = [route.model for route in (self.routes.get(tier) or [])]
+                raise NoRouteAvailable(
+                    f"tier {tier!r} has no image-capable model, and this request carries an image. "
+                    f"Configured for this tier: {configured or 'nothing'}. A text-only model would "
+                    "accept the request and answer about an image it cannot see."
+                )
         if not options:
             raise NoRouteAvailable(
                 f"no model route configured for tier {tier!r}; refusing to guess "
@@ -491,6 +520,7 @@ class ModelGateway:
         response_schema: dict[str, Any] | None = None,
         max_output_tokens: int = 2048,
         temperature: float = 0.0,
+        images: tuple[str, ...] = (),
     ) -> ModelResult:
         """Run one validated model call and record it.
 
@@ -499,8 +529,15 @@ class ModelGateway:
         call raises :class:`ModelOutputInvalid`. There is deliberately no
         "best effort" mode: partial acceptance of a fabricated field is the
         failure this whole method exists to prevent.
+
+        ``images`` ARE DATA URLS OR HTTP URLS, passed through untouched. They also change which model is
+        selected: a request carrying an image is routed only to a model that can see, and raises
+        `NoRouteAvailable` when the tier has none. Without that, a text-only model accepts the request,
+        the API drops the image, and the gateway records a confident answer about a screenshot the model
+        never received.
         """
-        route = self.route_for(tier)
+        needs_images = bool(images)
+        route = self.route_for(tier, needs_images=needs_images)
 
         redaction = redact(prompt)
         safe_prompt = minimize(prompt)
@@ -530,6 +567,9 @@ class ModelGateway:
             max_output_tokens=max_output_tokens,
             temperature=temperature,
             json_mode=response_schema is not None,
+            # Passed through untouched: the gateway does not read, decode or resize an image, so it
+            # cannot become a place where a screenshot is quietly rewritten.
+            images=tuple(images),
         )
 
         # perf_counter, not monotonic: Windows monotonic has ~15 ms granularity

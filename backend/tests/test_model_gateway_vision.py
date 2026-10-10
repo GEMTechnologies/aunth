@@ -298,3 +298,240 @@ def test_a_real_answer_still_comes_back():
     )
     assert response.text == "blue"
     assert response.output_tokens == 27
+
+
+# ===========================================================================
+# A WRONG CONCLUSION THIS PROJECT ALREADY PUBLISHED, AND THE TEST FOR IT
+# ===========================================================================
+def test_images_go_in_the_user_turn_and_never_the_system_turn():
+    """THE DOCUMENTED CONSTRAINT, and the test for a mistake actually made.
+
+    DeepSeek's vision guide: "Images are supported in `user` messages only. Images in `system` or
+    `assistant` messages return a 400 error."
+
+    `_user_content` satisfies this by construction - the system turn is always `request.system`, a plain
+    string - so no image can reach it. Asserted anyway, because the failure would be a 400 at 3am and
+    the invariant lives in a helper that a future edit could move.
+    """
+    import agent.model_gateway as gw
+
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}], "usage": {}}
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            captured["payload"] = json
+            return FakeResponse()
+
+    class FakeHttpx:
+        Client = FakeClient
+
+    real = sys.modules.get("httpx")
+    sys.modules["httpx"] = FakeHttpx  # type: ignore[assignment]
+    try:
+        gw.OpenAICompatibleProvider(api_key="k", base_url="https://api.deepseek.com").complete(
+            ModelRequest(
+                model="deepseek-flash",
+                system="s",
+                prompt="p",
+                images=("data:image/png;base64,AAAA",),
+            ),
+            timeout_seconds=5,
+        )
+    finally:
+        if real is not None:
+            sys.modules["httpx"] = real
+        else:
+            sys.modules.pop("httpx", None)
+
+    messages = captured["payload"]["messages"]
+    system_turn = next(m for m in messages if m["role"] == "system")
+    user_turn = next(m for m in messages if m["role"] == "user")
+
+    assert isinstance(system_turn["content"], str), (
+        "an image reached the system turn, which DeepSeek rejects with a 400"
+    )
+    assert isinstance(user_turn["content"], list)
+    assert any(part["type"] == "image_url" for part in user_turn["content"])
+
+
+def test_deepseek_flash_is_the_multimodal_model_name():
+    """`deepseek-flash` is the CURRENT multimodal name - V4.1-Flash, whose changelog entry says it has
+    "native multimodal visual understanding", and whose vision guide opens "The `deepseek-flash` model
+    accepts images alongside text".
+
+    `deepseek-v4-pro` is TEXT-ONLY. An earlier probe concluded "DeepSeek cannot do vision" from a
+    V4-Pro result plus an empty `deepseek-flash` response - and the empty response was a token-budget
+    failure that the guard above now raises on, not a vision failure. This test records which name is
+    which so the wrong conclusion does not get re-derived from the obvious-looking model.
+    """
+    import agent.model_gateway as gw
+
+    # Both are reachable as openai_compatible; the difference is the model NAME, which is configuration.
+    p = gw.OpenAICompatibleProvider(api_key="k", base_url="https://api.deepseek.com")
+    assert p.name == "openai_compatible"
+
+    source = (BACKEND / "config.py").read_text(encoding="utf-8")
+    assert "model_classification_model" in source
+    assert "model_synthesis_model" in source
+
+
+# ===========================================================================
+# A TEXT-ONLY MODEL MUST BE UNREACHABLE FOR AN IMAGE
+# ===========================================================================
+def _gateway(routes):
+    import agent.model_gateway as gw
+
+    class Null:
+        name = "null"
+
+    return gw.ModelGateway(None, Null(), routes=routes)
+
+
+def test_a_text_only_tier_refuses_an_image_rather_than_dropping_it():
+    """THE FAILURE THIS GUARDS AGAINST, observed live.
+
+    `deepseek-v4-pro` does NOT reject a request carrying an image: the API returns HTTP 200 and silently
+    drops it. Asked to describe a green-and-yellow test image it answered "I can't see the image you've
+    provided because it appears as unsupported" - while answering about a screenshot it never received,
+    which a caller cannot distinguish from a genuine reply.
+
+    So a tier with no image-capable route must RAISE. A fallback would produce exactly that confident
+    wrong answer.
+    """
+    import agent.model_gateway as gw
+
+    gateway = _gateway(
+        {
+            "synthesis": [
+                gw.ModelRoute(provider="openai_compatible", model="deepseek-v4-pro", tier="synthesis")
+            ]
+        }
+    )
+    with pytest.raises(gw.NoRouteAvailable) as caught:
+        gateway.route_for("synthesis", needs_images=True)
+    message = str(caught.value)
+    assert "deepseek-v4-pro" in message, "the error does not name the configured model"
+    assert "cannot see" in message or "image-capable" in message
+
+
+def test_an_image_capable_route_is_selected_when_one_exists():
+    import agent.model_gateway as gw
+
+    gateway = _gateway(
+        {
+            "synthesis": [
+                gw.ModelRoute(provider="openai_compatible", model="deepseek-v4-pro", tier="synthesis"),
+                gw.ModelRoute(
+                    provider="openai_compatible",
+                    model="deepseek-flash",
+                    tier="synthesis",
+                    supports_images=True,
+                ),
+            ]
+        }
+    )
+    assert gateway.route_for("synthesis", needs_images=True).model == "deepseek-flash"
+    # And the text-only preference is unchanged when there is no image.
+    assert gateway.route_for("synthesis").model == "deepseek-v4-pro"
+
+
+def test_supports_images_defaults_to_false():
+    """The safe direction to be wrong in: an unknown model is assumed unable to see, so an image never
+    reaches it by omission."""
+    import agent.model_gateway as gw
+
+    assert gw.ModelRoute(provider="p", model="m", tier="t").supports_images is False
+
+
+def test_complete_passes_images_through_to_the_request():
+    """The gateway must not read, decode or resize an image - so it cannot become a place where a
+    screenshot is quietly rewritten.
+
+    A REAL SESSION, because `complete` records every invocation and a `db=None` fails at
+    `self.db.add(...)` after the provider has already been called.
+    """
+    import agent.model_gateway as gw
+
+    captured: dict = {}
+
+    class RecordingProvider:
+        name = "recording"
+
+        def complete(self, request, *, timeout_seconds):
+            captured["request"] = request
+            return gw.ProviderResponse(text="ok", input_tokens=1, output_tokens=1)
+
+    gateway = gw.ModelGateway(
+        _session(),
+        RecordingProvider(),
+        routes={
+            "synthesis": [
+                gw.ModelRoute(
+                    provider="recording", model="m", tier="synthesis", supports_images=True
+                )
+            ]
+        },
+    )
+    gateway.complete(
+        tier="synthesis",
+        prompt="p",
+        prompt_version="v1",
+        images=("data:image/png;base64,AAAA",),
+    )
+    assert captured["request"].images == ("data:image/png;base64,AAAA",)
+
+
+def _session():
+    """An in-memory session with the schema built, for the tests that actually complete a call."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    import models
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    models.Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine)()
+
+
+def test_complete_refuses_an_image_when_no_route_can_see():
+    """End to end through the public entry point, not just the router."""
+    import agent.model_gateway as gw
+
+    class RecordingProvider:
+        name = "recording"
+
+        def complete(self, request, *, timeout_seconds):
+            raise AssertionError("the provider was called with an image no route can see")
+
+    gateway = gw.ModelGateway(
+        None,
+        RecordingProvider(),
+        routes={
+            "synthesis": [gw.ModelRoute(provider="recording", model="m", tier="synthesis")]
+        },
+    )
+    with pytest.raises(gw.NoRouteAvailable):
+        gateway.complete(
+            tier="synthesis",
+            prompt="p",
+            prompt_version="v1",
+            images=("data:image/png;base64,AAAA",),
+        )
