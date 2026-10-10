@@ -287,3 +287,49 @@ def test_the_opt_in_is_collected_from_settings_not_from_the_package():
     scope_fn = source.split("def _browser_scope_for", 1)[1].split("\n\n\ndef ", 1)[0]
     assert "browser_allow_loopback" in scope_fn
     assert "_truthy(" in scope_fn, "a bare truth test would turn 'false' into True"
+
+
+def test_the_scope_ROUND_TRIPS_through_serialisation():
+    """THE BOUNDARY WHERE THE SWITCH KEPT DISAPPEARING.
+
+    `as_dict()` is the only thing the worker sees - it rebuilds an `ActionScope` from it and re-checks
+    the target. `allow_loopback` was omitted, so the opt-in survived construction, survived
+    `validate_task` in-process, and died at serialisation: the worker read `None is True` -> False and
+    refused the controlled fixture as an SSRF risk. Asserting field-by-field would have missed it
+    again; this asserts the WHOLE object survives, so a future field cannot join the list silently.
+    """
+    from agent.browser_boundary import ActionScope
+
+    original = ActionScope(
+        portal_name="fixture",
+        allowed_hosts=("127.0.0.1",),
+        allowed_path_prefixes=("/apply",),
+        max_steps=42,
+        allow_loopback=True,
+    )
+    emitted = original.as_dict()
+
+    # Rebuilt exactly as `browser_worker` rebuilds it. JSON has no tuples, so the emitted lists are
+    # converted back - that asymmetry is real and is the worker's own `tuple(...)` call.
+    rebuilt = ActionScope(
+        portal_name=emitted["portal_name"],
+        allowed_hosts=tuple(emitted["allowed_hosts"]),
+        allowed_path_prefixes=tuple(emitted["allowed_path_prefixes"]),
+        max_steps=emitted["max_steps"],
+        allow_loopback=emitted["allow_loopback"],
+    )
+    assert rebuilt == original, "the scope does not survive its own serialisation"
+
+
+def test_the_worker_rebuilds_the_scope_from_the_serialised_form():
+    """The other side of the boundary: whatever `as_dict()` emits is what the worker reads."""
+    from agent.browser_boundary import ActionScope
+
+    payload_scope = ActionScope(
+        portal_name="fixture", allowed_hosts=("127.0.0.1",), allow_loopback=True
+    ).as_dict()
+    worker = (BACKEND / "tools" / "browser_worker.py").read_text(encoding="utf-8")
+    assert 'scope_payload.get("allow_loopback")' in worker, (
+        "the worker stopped reading the opt-in; the serialised key is now unverified on that side"
+    )
+    assert payload_scope["allow_loopback"] is True

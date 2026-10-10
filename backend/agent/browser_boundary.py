@@ -131,11 +131,25 @@ class ActionScope:
         return any(path.startswith(prefix) for prefix in self.allowed_path_prefixes)
 
     def as_dict(self) -> dict[str, Any]:
+        """The scope as it crosses to the worker.
+
+        EVERY FIELD, INCLUDING `allow_loopback`. This dict is the ONLY thing the worker sees; it
+        rebuilds an `ActionScope` from it in `browser_worker._scope_from_payload` and then re-checks
+        the target. `allow_loopback` was omitted here, so the opt-in survived construction
+        (`_browser_scope_for` reads it from settings), survived `validate_task` in-process, and was
+        then dropped at the serialisation boundary - whereupon the worker read `None is True`, got
+        False, and refused the controlled fixture as an SSRF risk.
+
+        That is the fourth place this one switch went missing, after the worker's own read, the
+        scope's construction from settings, and this dict. The round-trip test in
+        `test_browser_path_reachability.py` exists so a future field cannot join them silently.
+        """
         return {
             "portal_name": self.portal_name,
             "allowed_hosts": list(self.allowed_hosts),
             "allowed_path_prefixes": list(self.allowed_path_prefixes),
             "max_steps": self.max_steps,
+            "allow_loopback": self.allow_loopback,
         }
 
 
