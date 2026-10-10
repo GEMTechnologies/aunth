@@ -1552,6 +1552,71 @@ class MailAccount(Base):
     updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
 
+class CredentialSecret(Base):
+    """Encrypted credentials for one organisation's connection.
+
+    WHY THIS TABLE EXISTS
+
+    `MailAccount.credentials_ref` has always pointed at a secret store, and there was never one to point
+    at - so an OAuth token had nowhere to live and a per-organisation IMAP password was impossible by
+    construction. The schema's rule stands and is not weakened here:
+
+        "No provider password is ever stored. There is no column for one."
+
+    `ciphertext` is not a password column. It is an authenticated-encryption blob that is useless
+    without the key, which lives in the environment and never in the database. A database backup, a
+    replica, or a `pg_dump` in someone's home directory yields nothing readable.
+
+    WHY THE TENANT IS PART OF THE KEY
+
+    `(org_id, ref)` is unique, and every read goes through RLS. A reference alone is therefore not
+    enough to resolve a credential: a caller that guessed another organisation's ref would still be
+    filtered to its own rows. That matters because refs appear in logs and error messages far more
+    casually than a credential ever should.
+
+    WHAT IS DELIBERATELY ABSENT
+
+    There is no column for the plaintext, no column for the key, and no column recording what a
+    credential is worth. A leak of this table alone discloses which organisations have connections -
+    which is metadata, not a credential.
+    """
+
+    __tablename__ = "credential_secrets"
+
+    KIND_OAUTH_TOKEN = "OAUTH_TOKEN"
+    KIND_IMAP_PASSWORD = "IMAP_PASSWORD"
+    KIND_SMTP_PASSWORD = "SMTP_PASSWORD"
+    KIND_API_KEY = "API_KEY"
+
+    ACTIVE = "ACTIVE"
+    REVOKED = "REVOKED"
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "ref", name="uq_credential_secret_org_ref"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id"), index=True)
+    #: The name a caller resolves by, e.g. `mail:account:<id>`. Not a secret, and not unique across
+    #: organisations on its own - the uniqueness is `(org_id, ref)`.
+    ref: Mapped[str] = mapped_column(String(255), index=True)
+    kind: Mapped[str] = mapped_column(String(40))
+    #: Fernet token: AES-128-CBC with an HMAC. Tampering is detected on decrypt rather than producing
+    #: plausible garbage.
+    ciphertext: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default=ACTIVE, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    #: Set when a credential is replaced. Kept rather than deleted so "when did this stop working"
+    #: has an answer after the fact.
+    rotated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    #: Free text for an operator: "token expired", "revoked by the customer". Never the secret.
+    note: Mapped[Optional[str]] = mapped_column(String(500))
+
+
 class MailIdentity(Base):
     """An address Granada may eventually communicate *from*.
 

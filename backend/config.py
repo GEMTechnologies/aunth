@@ -261,6 +261,19 @@ class Settings(BaseSettings):
     imap_ssl: bool = True
     imap_mailbox: str = "INBOX"
 
+    # -- Credential store -------------------------------------------------
+    #: The Fernet key for encrypted per-organisation credentials.
+    #:
+    #: NO WORKING DEFAULT, deliberately. `MailAccount.credentials_ref` has pointed at a secret store
+    #: since the mail schema was written; this is what makes the reference resolvable, and a default
+    #: here would mean a deployment that never set one still "encrypts" - with a value that lives in
+    #: the source tree, which is not encryption. The store refuses to construct without a key, so the
+    #: failure is a startup error rather than a false sense of safety.
+    #:
+    #: Generate one with:
+    #:   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    credential_encryption_key: str = ""
+
     # -- Cookies ----------------------------------------------------------
     cookie_domain: str = ".localhost"
     cookie_secure: bool = False
