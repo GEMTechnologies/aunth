@@ -208,6 +208,18 @@ class ExecutionResult:
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
+def _truthy(value: Optional[str], *, default: bool = False) -> bool:
+    """Interpret a configuration string. Absent means the default; a RECOGNISED false word means False.
+
+    `bool(os.environ.get(...))` is the classic defect here: the string "0" is truthy, so
+    `FLEET_NARROW_CLAIM=0` would have ENABLED the cutover. A flag whose off value turns it on is worse
+    than no flag.
+    """
+    if value is None or not str(value).strip():
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 class FleetDispatcher:
     """Discovers due work across every agent and enqueues it. Nothing else."""
 
@@ -217,10 +229,28 @@ class FleetDispatcher:
         *,
         batch_size: int = DEFAULT_BATCH_SIZE,
         per_agent_limit: int = DEFAULT_PER_AGENT_LIMIT,
+        use_narrow_claim: Optional[bool] = None,
     ) -> None:
+        """`use_narrow_claim` defaults to the class attribute, which is False, and to the environment
+        when one is set.
+
+        THE ENVIRONMENT IS READ HERE RATHER THAN AT IMPORT. A module-level read would freeze the value
+        at import time, so a test that sets the variable would not see it and a rolling restart could
+        not change it - and a deployment flag you cannot change by deploying is not a flag.
+
+        Precedence is explicit argument > environment > class default, because that is the order a
+        caller would expect: the most local, most explicit statement wins.
+        """
         self.db = db
         self.batch_size = batch_size
         self.per_agent_limit = per_agent_limit
+        if use_narrow_claim is None:
+            import os
+
+            use_narrow_claim = _truthy(
+                os.environ.get("FLEET_NARROW_CLAIM"), default=type(self).USE_NARROW_CLAIM
+            )
+        self.use_narrow_claim = use_narrow_claim
 
     #: Whether to discover due work through the narrow SECURITY DEFINER function instead of reading
     #: `agent_workflows` directly under `granada_fleet`'s BYPASSRLS (ADR-0011).
@@ -264,7 +294,7 @@ class FleetDispatcher:
         """
         moment = now or datetime.now(timezone.utc)
 
-        if self.USE_NARROW_CLAIM:
+        if self.use_narrow_claim:
             # IDS from the function, rows from the ORM. The function returns ids only, so this path
             # cannot be used to read a column the caller is not entitled to - the re-select below is
             # still subject to the caller's own row policies.

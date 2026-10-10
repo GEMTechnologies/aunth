@@ -171,3 +171,69 @@ def test_an_empty_candidate_set_returns_early(monkeypatch):
 
     assert rows == []
     assert len(db.statements) == 1, "an empty candidate set still issued a second query"
+
+
+# ===========================================================================
+# THE ENVIRONMENT FLAG
+# ===========================================================================
+def test_the_flag_can_be_set_by_environment(monkeypatch):
+    """A deployment flag you cannot change by deploying is not a flag. Read at CONSTRUCTION, not at
+    import - a module-level read would freeze it and a test setting the variable would not see it."""
+    from agent.workflow_engine import FleetDispatcher
+
+    monkeypatch.setenv("FLEET_NARROW_CLAIM", "1")
+    assert _dispatcher(_StubDB([])).use_narrow_claim is True
+
+
+def test_the_environment_flag_defaults_to_off(monkeypatch):
+    from agent.workflow_engine import FleetDispatcher
+
+    monkeypatch.delenv("FLEET_NARROW_CLAIM", raising=False)
+    assert _dispatcher(_StubDB([])).use_narrow_claim is False
+
+
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off", "", "   "])
+def test_a_FALSE_WORD_in_the_environment_does_not_enable_it(monkeypatch, value):
+    """THE trap. `bool(os.environ.get(...))` would read the string "0" as True, so
+    `FLEET_NARROW_CLAIM=0` would have ENABLED the cutover. A flag whose off value turns it on is worse
+    than no flag at all."""
+    from agent.workflow_engine import FleetDispatcher
+
+    monkeypatch.setenv("FLEET_NARROW_CLAIM", value)
+    assert _dispatcher(_StubDB([])).use_narrow_claim is False, (
+        f"FLEET_NARROW_CLAIM={value!r} enabled the cutover"
+    )
+
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_a_TRUE_WORD_enables_it(monkeypatch, value):
+    from agent.workflow_engine import FleetDispatcher
+
+    monkeypatch.setenv("FLEET_NARROW_CLAIM", value)
+    assert _dispatcher(_StubDB([])).use_narrow_claim is True
+
+
+def test_an_explicit_argument_beats_the_environment(monkeypatch):
+    """Precedence: explicit argument > environment > class default. Most local and most explicit wins."""
+    from agent.workflow_engine import FleetDispatcher
+
+    monkeypatch.setenv("FLEET_NARROW_CLAIM", "1")
+    d = FleetDispatcher(_StubDB([]), batch_size=200, per_agent_limit=25, use_narrow_claim=False)
+    assert d.use_narrow_claim is False
+
+
+def test_the_environment_reaches_the_narrow_branch_end_to_end(monkeypatch):
+    """Set the variable, construct, call - and require the function to have been called. This is the
+    whole feature exercised the way production will exercise it."""
+    from agent.workflow_engine import FleetDispatcher
+
+    monkeypatch.setenv("FLEET_NARROW_CLAIM", "true")
+    db = _StubDB([])
+    FleetDispatcher(db, batch_size=200, per_agent_limit=25).due_workflows(
+        now=datetime.now(timezone.utc)
+    )
+
+    assert any("fleet_due_workflow_ids" in s for s in db.statements), (
+        "FLEET_NARROW_CLAIM=true did not reach the narrow claim"
+    )
+
