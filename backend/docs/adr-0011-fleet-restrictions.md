@@ -172,4 +172,45 @@ I drew from counting call sites — twice.
 kind of equivalence check that caught the fairness trap: change the connection's tenant binding and
 verify the sweep returns the same candidate set, **over a non-empty set**.
 
+## ADDENDUM 3: the reframing is now PROVEN against production data
+
+Run against the live database with a literal organisation id, as `granada_app` (**`rolbypassrls = false`**):
+
+```
+SET ROLE granada_app;
+  A. unbound              -> agent_workflows = 0        <- blind
+  set_config('app.current_org_id', '3d4edeec-...')
+  B. bound to real org    -> agent_workflows = 57       <- ALL of them
+  C. bound to real org    -> jobs            = 1381
+  D. bound to real org    -> granada_agents  = 1
+  set_config('app.current_org_id', '00000000-...')
+  E. bound to OTHER org   -> agent_workflows = 0        <- isolation HOLDS
+```
+
+**Four things are established, and the fourth is the one that matters:**
+
+1. An unbound connection sees **nothing** — confirming the mechanism, not assuming it
+2. A connection bound to a real organisation sees **that organisation's rows in full, with no privilege**
+3. **Binding to a different organisation returns 0** — so a tenant-bound fleet connection cannot reach
+   another tenant's data **even if the code forgets a predicate**
+4. Therefore `BYPASSRLS` is required for **the roster read and nothing else**, not for the 36 scoped queries
+
+**The correct GUC is `app.current_org_id`.** `app.current_org()` is a wrapper over
+`current_setting('app.current_org_id', true)`.
+
+### Two failed attempts before this one — both mine, both worth recording
+
+- **Attempt 1:** tried to read the `org_id` from `agent_workflows` **using the blind role**, to then
+  un-blind it. `\gset` returned no rows. **Circular: the role cannot see the value it needs to see rows.**
+- **Attempt 2:** set `app.current_org` instead of `app.current_org_id`. The binding silently did nothing
+  and the test reported **0 for the bound case** — which read exactly like a refutation of the design.
+
+**Both failures produced plausible-looking numbers.** Attempt 2 in particular would have justified
+abandoning a correct design. The `0` was not evidence about the policy; it was evidence about my
+variable name. **A test that cannot distinguish "denied" from "misconfigured" is not a test.**
+
+**Nothing has been changed in production as a result.** `BYPASSRLS` remains granted; the cutover flag
+remains the only thing changed.
+
+
 
