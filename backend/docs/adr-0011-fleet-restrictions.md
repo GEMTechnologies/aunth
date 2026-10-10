@@ -1,14 +1,38 @@
 # ADR-0011: what is narrowed, what is not, and the restrictions required before a browser worker gets credentials
 
-**Status:** candidate selection narrowed and proven; **`BYPASSRLS` remains granted**; remaining scope
-enumerated
+**Status: COMPLETE. `BYPASSRLS` is REVOKED and the fleet runs bound.**
 **Date:** 2026-10-10
 **Supersedes:** the target-table error in `adr-0011-narrowing-plan.md` (see its top section)
+**Superseded by nothing:** the addenda below are the working record, including the failures.
 
-## Where the privilege actually is
+## OUTCOME
 
 ```
-granada_fleet   bypassrls = TRUE    the only role with unfiltered cross-tenant visibility
+granada_fleet   bypassrls = FALSE     <- revoked 2026-10-10, fleet observed working after
+granada_app     bypassrls = FALSE
+granada_user    bypassrls = FALSE
+```
+
+Verified immediately after the revoke, as `granada_fleet` with no privilege:
+
+| Check | Result |
+|---|---|
+| unbound connection | `agent_workflows = 0` — blind, as designed |
+| bound to a real organisation | `agent_workflows = 57` — full access |
+| bound to a different organisation | `agent_workflows = 0` — **isolation holds** |
+| roster capability | 1 row |
+| refs capability | returns due ids with their org |
+| **fleet dispatching with the privilege revoked** | **jobs advanced by exactly the number forced due** |
+| failures since the revoke | **0** |
+
+**The migration did NOT work on the first attempt.** It failed on the write path within seconds, and
+the failure is recorded below rather than tidied away, because the reason it was missed is the useful
+part.
+
+## Where the privilege WAS
+
+```
+granada_fleet   bypassrls = TRUE     the only role with unfiltered cross-tenant visibility
 granada_app     bypassrls = FALSE
 granada_user    bypassrls = FALSE
 ```
