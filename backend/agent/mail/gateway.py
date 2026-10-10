@@ -50,6 +50,17 @@ import models
 from agent.mail.providers.base import MailTransport, ProviderEvent, refuse_send
 from agent.mail.vocabulary import Capability, assert_capability
 
+
+class MailTenantMismatch(PermissionError):
+    """A mailbox was offered to a gateway that does not own it.
+
+    A `PermissionError` rather than a generic mail error, because the distinction matters to a caller:
+    a provider failure means try again, while this means a caller reached for something it does not own
+    and nothing about the request should be retried or reinterpreted.
+
+    Named rather than inlined so an audit log, an alert and a test can all refer to the same condition.
+    """
+
 logger = logging.getLogger(__name__)
 
 
@@ -349,6 +360,109 @@ class MailGateway:
 
     def transport_for(self, provider: str) -> Optional[Any]:
         return get_transport(provider)
+
+    def transport_for_account(self, account: models.MailAccount) -> Optional[Any]:
+        """The inbound transport for ONE mailbox, built from that mailbox's OWN credential.
+
+        WHY NOT `transport_for(account.provider)`
+
+        That returns the deployment-wide transport registered under a provider name - one mailbox for
+        the whole system. Every organisation would then read and send through the same account, which is
+        the exact opposite of "a browser task for NGO A must never read NGO B's credentials".
+
+        This resolves `account.credentials_ref` through the credential store, scoped to
+        `self.org_id`. Three things follow:
+
+          * an account belonging to ANOTHER organisation is refused before any lookup, so a forged
+            `account` object cannot be used to reach across tenants
+          * an account WITH a `credentials_ref` always uses it, and never falls back to a
+            deployment-wide transport - the fallback would be a silent cross-tenant read
+          * an account WITHOUT one gets the registered transport, which is a single-mailbox deployment
+            or a test double rather than a shared multi-tenant one
+
+        Returns None when the mailbox is configured but has no usable credential, matching
+        `get_transport`'s contract: the caller parks the work rather than failing it.
+        """
+        if account.org_id != self.org_id:
+            # Before the lookup, not after. A forged account object must not even reach the store.
+            raise MailTenantMismatch(
+                "refusing to resolve a transport for a mailbox belonging to another organisation"
+            )
+
+        if account.credentials_ref:
+            # A PER-ACCOUNT CREDENTIAL WINS, and wins FIRST.
+            #
+            # The first version consulted the provider-wide registry before this, which meant a
+            # deployment-wide transport silently bypassed per-account scoping - every organisation
+            # sharing one mailbox again, through the front door this method exists to close. Found by a
+            # test asserting that an account with no credential does not borrow one.
+            #
+            # There is NO fallback when the credential is missing, revoked or undecryptable. A fallback
+            # here would be a silent cross-tenant read, which is the worst possible failure for this
+            # method, so every failure returns None and the caller parks the work.
+            return self._build_from_stored_credential(account)
+
+        # No per-account credential. This is a single-mailbox deployment or a test double, and the
+        # registered transport is the honest answer. It cannot be reached by an account that HAS a
+        # credential, so it cannot displace one.
+        return _TRANSPORTS.get((account.provider or "").upper())
+
+    def _build_from_stored_credential(self, account: models.MailAccount) -> Optional[Any]:
+        """Build the provider adapter named by the account, using its stored credential."""
+        if not account.credentials_ref:
+            logger.info(
+                "mail.transport_no_credential_ref",
+                extra={"mail_account_id": account.id, "provider": account.provider},
+            )
+            return None
+
+        try:
+            from config import settings
+
+            from agent.credential_store import store_from_settings
+
+            store = store_from_settings(self.db, settings)
+        except Exception as exc:  # noqa: BLE001 - an unconfigured store is a deployment state
+            logger.warning(
+                "mail.credential_store_unavailable",
+                extra={"mail_account_id": account.id, "error": type(exc).__name__},
+            )
+            return None
+
+        try:
+            payload = store.get(org_id=self.org_id, ref=account.credentials_ref)
+        except Exception as exc:  # noqa: BLE001 - missing, revoked and undecryptable all land here
+            # Logged WITHOUT the payload or the ref's content beyond the account id: a credential ref
+            # reaching a log line is how a secret store becomes a list of targets.
+            logger.warning(
+                "mail.credential_unavailable",
+                extra={"mail_account_id": account.id, "error": type(exc).__name__},
+            )
+            return None
+
+        provider = (account.provider or "").upper()
+        if provider == "IMAP":
+            from agent.mail.providers.imap import ImapConfig, ImapInboundMailProvider
+
+            return ImapInboundMailProvider(
+                ImapConfig(
+                    host=payload.get("host", ""),
+                    port=int(payload.get("port") or 993),
+                    username=payload.get("username", account.address),
+                    password=payload.get("password", ""),
+                    use_ssl=bool(payload.get("use_ssl", True)),
+                    mailbox=payload.get("mailbox") or "INBOX",
+                )
+            )
+
+        # GOOGLE and MICROSOFT adapters take a token rather than a password, and their construction is
+        # a separate step with its own refresh path. Returning None is honest: this mailbox is
+        # configured but its provider has no per-account builder yet, so the caller parks the work.
+        logger.info(
+            "mail.transport_not_buildable",
+            extra={"mail_account_id": account.id, "provider": provider},
+        )
+        return None
 
     def receive(
         self,
