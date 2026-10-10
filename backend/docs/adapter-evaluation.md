@@ -151,6 +151,73 @@ one browser at a time, which is a bound a memory figure cannot express.
 * **Tokens or cost per task.** Browser Use's completed run is one data point at 44.9 s; Stagehand has
   none.
 
+## §10 layout adaptation — and a result that is genuinely two-sided
+
+The requirement: *"Test with deliberately altered layouts to assess whether the selected browser agent
+adapts without rewriting fixed scripts."*
+
+`tools/altered_portal.py` presents the same sign-in semantics with **every structural handle removed**:
+
+* **no `<label for=...>` association** — the caption is a `<span>`, visually adjacent but structurally
+  unrelated to its input
+* **no meaningful ids or names** — `f1`, `f2`
+* **reversed visual order** — password first, email second
+* a decorative `<canvas>` and a repeated heading as noise
+
+The ids are meaningless on purpose: if the page kept `id="email"`, a hardcoded selector and a reader
+would both succeed and **the test would prove nothing**.
+
+### What the agent did
+
+```
+Page title: "Account access"
+Input fields on the form (2 total):
+1. Email address — type: text (input id f1)
+2. Password — type: password (input id f2)
+```
+
+**Both fields correct, on a layout whose handles were removed.** `f1` really is the text input and
+`f2` really is the password input, and the captions really do read *Email address* and *Password*. This
+is adaptation: no selector from the original portal would have found these.
+
+### What the framework said about it
+
+Browser Use ships an internal judge, and it marked the run **FAIL**:
+
+> *"the agent's extracted data shows the labels are empty (label: ''), and the agent then reported the
+> purposes as 'Email address' and 'Password' in the final output without these purposes being derived
+> from the label/placeholder data in the extraction... it likely inferred it from the sign-in form
+> context."*
+
+**The judge is right about the evidence and wrong about the conclusion.** The agent's own extraction
+script queried only `label[for]` and `placeholder`, so it reported empty — but the captions exist as
+`<span class="caption">`, and the agent separately quoted *"Sign in to continue your application."*,
+which is the `<p class="lede">` text and likewise absent from its script. It had read the page; its
+verification script was too narrow to prove it.
+
+### Why this is worth recording rather than resolving
+
+**The two readings are not reconcilable from the transcript alone**, and that ambiguity is the finding:
+
+* **On outcome**, the agent adapted correctly and the layout change did not defeat it.
+* **On evidence**, the run cannot demonstrate that it read the captions rather than inferring them from
+  a sign-in page whose fields are almost always email and password.
+
+**A correct answer that cannot be distinguished from a lucky inference is not a verified answer** — and
+Browser Use's judge reached that conclusion by itself, about its own agent, with no prompting.
+
+**That is the same rule this project enforces structurally**: `perception.FACT_CHANNELS` excludes VISION
+precisely because a plausible reading is not evidence, and `RunReport.field_outcomes` is kept separate
+from `vision_observations` so a screenshot reading can never be written into a form as an organisation's
+fact. Two independent systems, the same principle: **a confident answer is not a receipt.**
+
+### The practical consequence for Granada
+
+Granada's own runtime does not rely on the agent's self-report. `browser_runtime` records
+`field_outcomes` only from verified package values, and a vision reading lands in
+`vision_observations`, which no form is filled from. So the failure mode the judge flagged — a claimed
+value with inadequate support — is one the runtime is already shaped to prevent.
+
 ## Selection
 
 **Primary adapter: Browser Use Python.**
