@@ -123,12 +123,32 @@ class SubprocessInvoker:
                 ],
             }
         if completed.returncode != 0:
+            # UNCERTAIN, NOT FAILED, AND THIS WAS A REAL SAFETY GAP.
+            #
+            # The worker is careful about its own crashes: it catches them and reports
+            # `{"status": "UNCERTAIN", "outcome_certain": false, "problems": [{"kind": "WORKER_CRASH"}]}`.
+            # But a worker that exits non-zero has NOT reported anything - it was killed, OOM-ed, or
+            # died below its own handler. That is precisely the case where we cannot know whether it
+            # reached the click before it went.
+            #
+            # The previous version returned FAILED with no `outcome_certain`, and `_interpret` defaults
+            # that to True - so a crashed worker was reported as a DEFINITE failure. §11 forbids this in
+            # as many words: "If a browser crashes after clicking Submit, Granada must not automatically
+            # repeat the submission without determining whether the first attempt succeeded." A definite
+            # FAILED invites exactly that repeat.
+            #
+            # The asymmetry was the bug: a crash INSIDE the worker was uncertain, a crash OF the worker
+            # was certain. Both are the same epistemic situation.
             return {
-                "status": "FAILED",
+                "status": "UNCERTAIN",
+                "outcome_certain": False,
                 "problems": [
                     {
                         "kind": "WORKER_EXIT",
-                        "detail": f"worker exited {completed.returncode}",
+                        "detail": (
+                            f"worker exited {completed.returncode} without reporting an outcome; it may "
+                            "have acted before it died, so this must be reconciled rather than retried"
+                        ),
                         # stderr may contain a URL or a form value; it is truncated and never trusted
                         # as a status.
                         "stderr_tail": completed.stderr.decode("utf-8", "replace")[-400:],
