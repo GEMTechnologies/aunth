@@ -477,9 +477,29 @@ def read_page_with_vision(
         label = str(entry.get("label") or "").strip()
         if not label:
             continue
+        # THE FIELD'S EXISTENCE IS THE OBSERVATION, and getting this wrong made the function useless
+        # for its main case.
+        #
+        # The first version only emitted a value when `entry["value"]` was non-empty. But the reason
+        # vision is needed at all is that the DOM did not declare the fields - so "there is an Email
+        # address field here" is the actionable finding, and on a real sign-in page every value is
+        # empty by definition. The function read the page correctly and returned nothing.
+        #
+        # Recorded with value=None rather than dropped: a field that exists and is EMPTY is different
+        # from a field that is not there, and only the first means "fill this in".
+        values.append(
+            PerceivedValue(
+                name=f"{label}::present",
+                value=None,
+                channel=Channel.VISION,
+                evidence_ref=shot.ref,
+                confidence=None,
+                observed_at=moment,
+            )
+        )
         # A required marker the DOM did not declare is the case that makes vision necessary at all -
-        # a field marked only by a red border. It is recorded as its own value rather than folded into
-        # the field, so a planner can see which channel claimed it.
+        # a field marked only by a red border. Recorded separately so a planner can see which channel
+        # claimed it.
         if entry.get("required_marker"):
             values.append(
                 PerceivedValue(

@@ -256,6 +256,51 @@ def test_an_obstacle_is_captured_as_a_value():
     assert [v.value for v in values if v.name == "obstacle"] == ["Verify you are human"]
 
 
+def test_an_empty_field_is_still_reported_as_present():
+    """THE BUG A LIVE RUN FOUND, and the one that made this function useless for its main case.
+
+    A real sign-in page read correctly returned:
+
+        {"fields": [{"label": "Email address", "value": "", "required_marker": false},
+                    {"label": "Password",      "value": "", "required_marker": false}]}
+
+    Every value was empty, so the first version - which emitted a value only when it was non-empty -
+    returned NOTHING. But the reason vision is needed at all is that the DOM did not declare the
+    fields, so "there is an Email address field here" IS the actionable finding, and on any blank form
+    every value is empty by definition.
+
+    `value=None` rather than dropped: a field that exists and is empty means "fill this in", which is
+    not the same as a field that is not there.
+    """
+    gateway = FakeGateway(
+        {
+            "fields": [
+                {"label": "Email address", "value": "", "required_marker": False},
+                {"label": "Password", "value": "", "required_marker": False},
+            ]
+        }
+    )
+    values = read_page_with_vision(
+        _observation(), gateway=gateway, org_id="o", prompt_version="v1"
+    )
+    names = {v.name for v in values}
+    assert "Email address::present" in names
+    assert "Password::present" in names
+    assert all(v.channel == Channel.VISION for v in values)
+    assert not any(v.is_fact for v in values)
+
+
+def test_a_field_with_a_value_reports_both_presence_and_value():
+    """Both, because they answer different questions: 'is this field here' and 'what does it say'."""
+    gateway = FakeGateway({"fields": [{"label": "Amount", "value": "500"}]})
+    values = read_page_with_vision(
+        _observation(), gateway=gateway, org_id="o", prompt_version="v1"
+    )
+    names = {v.name for v in values}
+    assert "Amount::present" in names
+    assert "Amount" in names
+
+
 # ===========================================================================
 # MALFORMED MODEL OUTPUT
 # ===========================================================================
