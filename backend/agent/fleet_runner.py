@@ -36,6 +36,7 @@ running" is not something an operator should have to infer from silence.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import threading
 import time
@@ -43,11 +44,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 import models
 from agent import heartbeat
-from agent.workflow_engine import DispatchResult, FleetDispatcher
+from agent.workflow_engine import DispatchResult, FleetDispatcher, _truthy
 from observability import metrics
 
 logger = logging.getLogger(__name__)
@@ -142,6 +144,15 @@ class FleetRunner:
         self.batch_size = batch_size
         self.per_agent_limit = per_agent_limit
         self.on_sweep = on_sweep
+        #: ADR-0011 step 2. Mirrors `FleetDispatcher.USE_TENANT_BINDING`: when on, every tenant-scoped
+        #: sweep binds `app.current_org_id` instead of relying on `granada_fleet`'s BYPASSRLS.
+        #:
+        #: READ FROM THE SAME ENVIRONMENT VARIABLE, not from the dispatcher instance, because the mail
+        #: sweep runs on its OWN session and its own clock - it never goes through `FleetDispatcher`.
+        #: Two readers of one flag is a smell; two flags for one migration would be worse.
+        self.use_tenant_binding = _truthy(
+            os.environ.get("FLEET_TENANT_BINDING"), default=False
+        )
         self.health = FleetHealth()
         self._stop = threading.Event()
         #: Reconciliation runs on its own, slower clock inside the SAME process.
@@ -165,14 +176,51 @@ class FleetRunner:
 
         Bounded by ``batch_size`` like every other sweep, so a fleet with a hundred
         thousand mailboxes cannot load them all into one transaction.
+
+        ADR-0011: WITH TENANT BINDING ON, THIS WALKS THE ROSTER. `MailAccount` is under ROW LEVEL
+        SECURITY, so the unscoped query below returns rows only while the connection carries
+        BYPASSRLS. Once that privilege is revoked an unbound sweep returns **zero**, and the failure is
+        an ABSENCE - a mailbox that never reconciles again logs nothing. So the sweep is scoped to one
+        organisation at a time, exactly like the dispatcher: learn the roster while privileged, then
+        do the work bound.
         """
         db = self.session_factory()
         try:
             from agent.mail.gateway import schedule_mail_sync
 
-            queued = schedule_mail_sync(
-                db, stale_seconds=stale_seconds, batch_size=self.batch_size
-            )
+            if self.use_tenant_binding:
+                # The roster is the one legitimate cross-tenant read: "which organisations exist"
+                # cannot be answered from inside any single tenant.
+                orgs = [
+                    row[0]
+                    for row in db.execute(
+                        text("SELECT DISTINCT org_id FROM fleet_active_agent_ids()")
+                    )
+                ]
+                queued = 0
+                for org_id in orgs:
+                    db.execute(
+                        text("SELECT set_config('app.current_org_id', :org, false)"),
+                        {"org": org_id},
+                    )
+                    try:
+                        queued += schedule_mail_sync(
+                            db,
+                            stale_seconds=stale_seconds,
+                            batch_size=self.batch_size,
+                            org_id=org_id,
+                        )
+                    finally:
+                        # Clear after EVERY organisation, including on failure - a leaked binding
+                        # would run the next organisation's sweep under this one's context.
+                        db.execute(
+                            text("SELECT set_config('app.current_org_id', :org, false)"),
+                            {"org": ""},
+                        )
+            else:
+                queued = schedule_mail_sync(
+                    db, stale_seconds=stale_seconds, batch_size=self.batch_size
+                )
             db.commit()
             self.health.mail_sync_sweeps += 1
             self.health.mail_sync_queued += queued

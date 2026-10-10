@@ -360,7 +360,7 @@ SUBJECT_MAIL_ACCOUNT = "MAIL_ACCOUNT"
 
 
 def schedule_mail_sync(
-    db: Session, *, stale_seconds: int = 900, batch_size: int = 200
+    db: Session, *, stale_seconds: int = 900, batch_size: int = 200, org_id: Optional[str] = None
 ) -> int:
     """Find mailboxes due for reconciliation and create durable work for each.
 
@@ -373,6 +373,14 @@ def schedule_mail_sync(
     The work is bounded by ``batch_size`` so a fleet with a hundred thousand
     mailboxes cannot load them all into one transaction.
 
+    ``org_id`` SCOPES THE SWEEP TO ONE ORGANISATION, and it exists for ADR-0011.
+    The query below crosses tenants by default, which only works while the fleet
+    connection carries BYPASSRLS. With binding on, `FleetRunner` calls this once per
+    organisation with `app.current_org_id` set, and the scope argument makes the
+    statement match the binding rather than fight it. Without it the query returns
+    zero rows under RLS and **mail reconciliation stops silently** - a mailbox that
+    never syncs again produces no error, only an absence.
+
     Returned count is how many workflows were newly created. A mailbox already
     queued is not queued twice - the workflow uniqueness constraint on
     ``(agent_id, workflow_type, subject_type, subject_id)`` decides that, not this
@@ -383,17 +391,17 @@ def schedule_mail_sync(
     from agent.workflow_engine import WORKFLOW_MAIL_SYNC
 
     cutoff = _now() - timedelta(seconds=max(60, int(stale_seconds)))
+    stale = select(models.MailAccount).where(
+        models.MailAccount.status == models.MailAccount.ACTIVE,
+        # A mailbox that has never synced is due immediately; one that synced
+        # recently is not. NULL is not "unknown", it is "never".
+        (models.MailAccount.last_sync_at.is_(None))
+        | (models.MailAccount.last_sync_at < cutoff),
+    )
+    if org_id is not None:
+        stale = stale.where(models.MailAccount.org_id == org_id)
     candidates = db.execute(
-        select(models.MailAccount)
-        .where(
-            models.MailAccount.status == models.MailAccount.ACTIVE,
-            # A mailbox that has never synced is due immediately; one that synced
-            # recently is not. NULL is not "unknown", it is "never".
-            (models.MailAccount.last_sync_at.is_(None))
-            | (models.MailAccount.last_sync_at < cutoff),
-        )
-        .order_by(models.MailAccount.last_sync_at.asc().nullsfirst())
-        .limit(batch_size)
+        stale.order_by(models.MailAccount.last_sync_at.asc().nullsfirst()).limit(batch_size)
     ).scalars().all()
 
     queued = 0

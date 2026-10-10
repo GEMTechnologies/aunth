@@ -339,3 +339,51 @@ def test_tenant_scope_is_used_around_the_row_load():
     bind_at = dispatch.index("with self.tenant_scope(org_id):")
     load_at = dispatch.index("models.AgentWorkflow.id == workflow_id")
     assert bind_at < load_at, "the row is loaded before the tenant is bound"
+
+
+# ===========================================================================
+# THE SECOND CROSS-TENANT SWEEP: mail reconciliation
+# ===========================================================================
+def test_mail_sync_accepts_an_org_scope():
+    """`MailAccount` is under RLS. An unscoped stale-mailbox query returns rows only while the fleet
+    connection carries BYPASSRLS; once revoked it returns ZERO, and the failure is an ABSENCE - a
+    mailbox that never reconciles again logs nothing at all."""
+    import inspect
+
+    from agent.mail.gateway import schedule_mail_sync
+
+    signature = inspect.signature(schedule_mail_sync)
+    assert "org_id" in signature.parameters, (
+        "schedule_mail_sync cannot be scoped to one organisation, so it cannot run bound"
+    )
+    assert signature.parameters["org_id"].default is None, (
+        "the scope must be opt-in: the default path is unchanged"
+    )
+
+
+def test_the_mail_sweep_walks_the_roster_when_binding():
+    source = (BACKEND / "agent" / "fleet_runner.py").read_text(encoding="utf-8")
+    mail = source.split("def sync_due_mail_accounts", 1)[1].split("def _mail_sync_due", 1)[0]
+    assert "fleet_active_agent_ids" in mail, (
+        "the mail sweep does not use the roster, so it would go blind under RLS"
+    )
+    assert "app.current_org_id" in mail, "the mail sweep never binds a tenant"
+    assert "org_id=org_id" in mail, "the mail sweep does not scope the query to the bound tenant"
+
+
+def test_the_mail_sweep_clears_the_binding_after_every_organisation():
+    """A leaked binding would run the NEXT organisation's mail sweep under this one's context - the
+    same cross-tenant hazard `tenant_scope` guards against in the dispatcher."""
+    source = (BACKEND / "agent" / "fleet_runner.py").read_text(encoding="utf-8")
+    mail = source.split("def sync_due_mail_accounts", 1)[1].split("def _mail_sync_due", 1)[0]
+    assert "finally:" in mail, (
+        "the mail sweep binds a tenant without a finally-clear; a failure would leak the binding"
+    )
+
+
+def test_fleet_runner_and_dispatcher_read_the_same_flag():
+    """Two flags for one migration would let the dispatcher bind while the mail sweep did not - and
+    the half that stayed unprivileged is the half that fails silently."""
+    runner = (BACKEND / "agent" / "fleet_runner.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("FLEET_TENANT_BINDING")' in runner
+    assert "use_tenant_binding" in runner
