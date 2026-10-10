@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 import models
@@ -222,6 +222,16 @@ class FleetDispatcher:
         self.batch_size = batch_size
         self.per_agent_limit = per_agent_limit
 
+    #: Whether to discover due work through the narrow SECURITY DEFINER function instead of reading
+    #: `agent_workflows` directly under `granada_fleet`'s BYPASSRLS (ADR-0011).
+    #:
+    #: FALSE BY DEFAULT, and deliberately additive. This class serves the fleet today and the code it
+    #: replaces is the code every existing test exercises, so switching the default here would change
+    #: production behaviour in the same commit that introduces the option - and a regression would be
+    #: indistinguishable from the intended change. Setting it true is the CUTOVER, and it is a separate,
+    #: reversible decision made by configuration.
+    USE_NARROW_CLAIM = False
+
     def due_workflows(self, *, now: Optional[datetime] = None, limit: Optional[int] = None) -> list[models.AgentWorkflow]:
         """Due work across the whole fleet, **fairly partitioned per agent**.
 
@@ -241,8 +251,45 @@ class FleetDispatcher:
         This is why the fairness test uses a *lower* priority for the small
         organisation: only a partition-level guarantee saves it, and a
         fetch-then-cap implementation fails that test.
+
+        ADR-0011: when ``USE_NARROW_CLAIM`` is set, the candidate ids come from
+        ``fleet_due_workflow_ids`` - a SECURITY DEFINER function that performs the same partition
+        inside the database and returns IDS ONLY. The privilege then belongs to one reviewed query
+        rather than to the whole connection, which is what `granada_fleet`'s BYPASSRLS currently gives
+        the dispatcher for every statement it runs.
+
+        The two paths are equivalent by construction AND by test
+        (`tests/test_adr0011_narrowing.py`), because a narrowed claim that returned a different
+        candidate set would silently change which organisations get dispatched.
         """
         moment = now or datetime.now(timezone.utc)
+
+        if self.USE_NARROW_CLAIM:
+            # IDS from the function, rows from the ORM. The function returns ids only, so this path
+            # cannot be used to read a column the caller is not entitled to - the re-select below is
+            # still subject to the caller's own row policies.
+            ids = [
+                row[0]
+                for row in self.db.execute(
+                    text(
+                        "SELECT workflow_id FROM fleet_due_workflow_ids(:batch, :per_agent)"
+                    ),
+                    {"batch": limit or self.batch_size, "per_agent": self.per_agent_limit},
+                )
+            ]
+            if not ids:
+                return []
+            rows = list(
+                self.db.execute(
+                    select(models.AgentWorkflow).where(models.AgentWorkflow.id.in_(ids))
+                ).scalars()
+            )
+            # ORDER IN PYTHON, by the same keys the SQL orders by. `IN (...)` does not preserve the
+            # function's ordering, and a different order is a different dispatch sequence - the
+            # trailing id is part of the contract, not a nicety.
+            rows.sort(key=lambda w: (w.priority, w.next_run_at, w.id))
+            return rows
+
         ranked = (
             select(
                 models.AgentWorkflow.id.label("workflow_id"),
