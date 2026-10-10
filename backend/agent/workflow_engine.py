@@ -2277,6 +2277,7 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
             db,
             package,
             action_scope=_browser_scope_for(package, settings),
+            form_data=_verified_form_data(package),
         )
     except Exception as exc:
         # build_task refuses an unready package. That refusal is the readiness engine doing its job,
@@ -2331,6 +2332,47 @@ def _browser_summary(outcome: Any) -> str:
     if outcome.status == "UNAVAILABLE":
         return "the browser worker is not available on this host"
     return f"the browser reported {outcome.status}"
+
+
+def _verified_form_data(package: Any) -> dict[str, str]:
+    """The values a browser may type into a funder's form, from an assembled package.
+
+    VERIFIED ANSWERS ONLY, AND THE PROVENANCE IS WHY.
+
+    `build_task`'s own docstring says "Verified form data only. An empty dict is the honest default:
+    the platform does not fabricate a value to make a form look complete", and `FrozenAnswer` carries
+    `verified` and `source` precisely so the two can be told apart. `manifest["answers"]` holds both
+    kinds. Passing the whole list would put a model's suggestion into a legally consequential
+    statement to a funder, under the organisation's name - so an unverified answer is dropped here,
+    at the boundary, rather than filtered hopefully at the browser.
+
+    THE JOB PATH PASSED NOTHING AT ALL until this function existed. `_handle_browser_task` called
+    `build_task(db, package, action_scope=...)` and left `form_data` at its `{}` default, so every
+    invocation through the job system reached the worker with no values - and the worker's own
+    perception then correctly reported "the page requires email and Granada holds no verified value".
+    That refusal was honest, which is exactly why the gap was invisible: it looked like a data
+    problem rather than a wiring problem. Driven by hand with a literal payload the same worker
+    filled the form, so the end-to-end check said nothing about this route.
+
+    `contact_email` is deliberately NOT synthesised into a value. It is the address chosen for
+    correspondence with the funder, which is not the same claim as "this is the verified contact
+    address the portal asks for"; the platform has a field for that and it is a verified fact. If a
+    verified answer names the email question, it arrives through the loop above like any other.
+    """
+    manifest = getattr(package, "manifest", None) or {}
+    values: dict[str, str] = {}
+    for entry in manifest.get("answers") or []:
+        if not isinstance(entry, dict):
+            continue
+        # `is True`, not truthy: a JSON `1` or the string "true" is not a verification claim, the same
+        # strictness `browser_invocation.enabled` applies to its own flag.
+        if entry.get("verified") is not True:
+            continue
+        question = str(entry.get("question") or "").strip()
+        answer = str(entry.get("answer") or "").strip()
+        if question and answer:
+            values[question] = answer
+    return values
 
 
 def _browser_scope_for(package: Any, settings: dict[str, Any]) -> Any:

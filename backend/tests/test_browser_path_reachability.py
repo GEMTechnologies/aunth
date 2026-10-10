@@ -333,3 +333,66 @@ def test_the_worker_rebuilds_the_scope_from_the_serialised_form():
         "the worker stopped reading the opt-in; the serialised key is now unverified on that side"
     )
     assert payload_scope["allow_loopback"] is True
+
+
+# ===========================================================================
+# THE VERIFIED VALUES - the input §6 requires and the job path never sent
+# ===========================================================================
+class _Package:
+    def __init__(self, manifest):
+        self.manifest = manifest
+
+
+def test_only_VERIFIED_answers_become_form_values():
+    """`FrozenAnswer` carries `verified` and `source` so the two can be told apart. Typing an
+    unverified model suggestion into a funder's form makes it a statement by the organisation."""
+    from agent.workflow_engine import _verified_form_data
+
+    values = _verified_form_data(_Package({"answers": [
+        {"question": "email", "answer": "ngo@example.invalid", "source": "org_fact", "verified": True},
+        {"question": "turnover", "answer": "1000000", "source": "model", "verified": False},
+        {"question": "country", "answer": "Kenya", "source": "org_fact"},
+    ]}))
+    assert values == {"email": "ngo@example.invalid"}
+
+
+@pytest.mark.parametrize("marker", [1, "true", "True", None, 0])
+def test_a_non_boolean_verified_marker_is_not_a_verification_claim(marker):
+    """`is True`, not truthy - the same strictness `browser_invocation.enabled` applies, because a
+    JSON `1` from a settings column must not arm a consequential statement."""
+    from agent.workflow_engine import _verified_form_data
+
+    values = _verified_form_data(_Package({"answers": [
+        {"question": "email", "answer": "x@y.invalid", "verified": marker},
+    ]}))
+    assert values == {}
+
+
+def test_a_package_with_no_answers_yields_an_empty_mapping_not_a_crash():
+    from agent.workflow_engine import _verified_form_data
+
+    assert _verified_form_data(_Package({})) == {}
+    assert _verified_form_data(_Package({"answers": None})) == {}
+    assert _verified_form_data(_Package({"answers": ["not-a-dict", None]})) == {}
+
+
+def test_blank_questions_and_answers_are_dropped():
+    """An empty key would let a form field be addressed by nothing in particular."""
+    from agent.workflow_engine import _verified_form_data
+
+    assert _verified_form_data(_Package({"answers": [
+        {"question": "  ", "answer": "v", "verified": True},
+        {"question": "k", "answer": "   ", "verified": True},
+    ]})) == {}
+
+
+def test_the_handler_PASSES_the_verified_values_it_resolves():
+    """THE WIRING. The resolver existing is not the same as the handler using it - which is the
+    exact shape of every other defect this file records."""
+    source = (BACKEND / "agent" / "workflow_engine.py").read_text(encoding="utf-8")
+    handler = source.split("def _handle_browser_task", 1)[1].split("def _browser_summary", 1)[0]
+    assert "form_data=_verified_form_data(package)" in handler, (
+        "the handler builds a task without the package's verified values, so the browser reaches "
+        "every form with nothing to type - and refuses honestly, which is why it looked like a data "
+        "gap rather than a wiring one"
+    )
