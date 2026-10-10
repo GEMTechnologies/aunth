@@ -99,3 +99,34 @@ This is the directive's own fallback, and it is stated here so it can be enforce
 - a design for the **writes**, which a read-scoping function cannot cover
 - and a session with room to check its own work: this directive has produced a false-pass hash check, a
   false alarm about a production tree, and a flag that "deployed" without arriving — all in one day
+
+## ADDENDUM: the 30 call sites are not 30 capabilities
+
+**Read rather than counted.** Taking `discover_opportunity_work` (the largest of the 30) and classifying
+each statement:
+
+```python
+agents = SELECT * FROM granada_agents WHERE status = 'ACTIVE'   # CROSS-TENANT - the roster
+for agent in agents:
+    evaluated  = OpportunityMatch   WHERE org_id  == agent.org_id   # already tenant-scoped
+    queued     = AgentWorkflow      WHERE agent_id == agent.id      # already tenant-scoped
+    candidates = Opportunity        WHERE id NOT IN (...)           # the catalogue, unscoped by ADR-0009
+    GranadaAgentService(self.db, agent.org_id)                      # already TENANT BOUND
+```
+
+**One statement needs cross-tenant visibility. Four do not.**
+
+That matters because the shape of the fix changes: this method does not need a function per query, it
+needs **one** narrow capability — *the active agent roster*, returning `id` and `org_id` only — after
+which the loop can run under each agent's own tenant context.
+
+**The same classification has not yet been done for the other 29 sites**, and it should be, because:
+
+- if the ratio holds, the real capability count may be **a handful, not thirty**
+- a per-call-site function would over-build and create thirty privileges where three would do
+- **and "30 sites" as a plan understates nothing but overstates the work** — the opposite error to the
+  "three reads" I reported two rounds earlier
+
+**Both estimates were made from counting rather than reading.** The count is a starting point; the
+classification is the plan.
+
