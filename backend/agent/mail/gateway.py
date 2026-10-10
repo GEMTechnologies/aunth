@@ -146,6 +146,11 @@ def get_outbound_transport(provider: str) -> Optional[Any]:
     into a refusal with a name rather than an AttributeError. That distinction
     matters: one is a configuration state an operator fixes, the other looks like a
     bug and invites a workaround.
+
+    SMTP IS BUILT ON DEMAND FROM SETTINGS. Nothing in production called
+    `register_outbound_transport` - only tests did - so every adapter was reachable from a test and
+    from nowhere else. A configuration-driven factory means setting `smtp_host` is genuinely enough,
+    with no start-up hook to remember and no import-order dependency.
     """
     if not provider:
         return None
@@ -157,8 +162,23 @@ def get_outbound_transport(provider: str) -> Optional[Any]:
 
         registry = getattr(settings, "outbound_mail_transports", None)
         if isinstance(registry, dict):
-            return registry.get(provider) or registry.get(provider.upper())
-    except Exception:  # pragma: no cover
+            found = registry.get(provider) or registry.get(provider.upper())
+            if found is not None:
+                return found
+
+        if provider.upper() == "SMTP":
+            # Imported here: `smtp.py` pulls in `outbound.py`, and this module is imported by the
+            # scheduler. A module-scope import would put the whole mail stack on the fleet's start-up
+            # path whether or not mail is configured.
+            from agent.mail.providers.smtp import build_from_settings
+
+            built = build_from_settings(settings)
+            if built is not None:
+                # Cached, so a configured SMTP transport is constructed once per process rather than
+                # once per message.
+                _OUTBOUND["SMTP"] = built
+            return built
+    except Exception:  # pragma: no cover - configuration is optional here
         return None
     return None
 

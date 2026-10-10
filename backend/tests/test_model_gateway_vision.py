@@ -151,7 +151,6 @@ def test_the_openai_payload_stays_a_string_without_images():
     import agent.model_gateway as gw
 
     captured: dict = {}
-
     class FakeResponse:
         status_code = 200
 
@@ -197,3 +196,105 @@ def test_deepseek_is_reachable_as_openai_compatible():
 
     p = gw.OpenAICompatibleProvider(api_key="k", base_url="https://api.deepseek.com")
     assert p.name == "openai_compatible"
+
+
+# ===========================================================================
+# AN EMPTY COMPLETION IS A FAILURE, NOT AN ANSWER
+# ===========================================================================
+def _run_provider_with(body: dict):
+    """Drive the real provider against a fake httpx that returns `body`."""
+    import agent.model_gateway as gw
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return body
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            return FakeResponse()
+
+    class FakeHttpx:
+        Client = FakeClient
+
+    real = sys.modules.get("httpx")
+    sys.modules["httpx"] = FakeHttpx  # type: ignore[assignment]
+    try:
+        return gw.OpenAICompatibleProvider(api_key="k", base_url="https://api.deepseek.com").complete(
+            ModelRequest(model="deepseek-flash", system="s", prompt="p", max_output_tokens=16),
+            timeout_seconds=5,
+        )
+    finally:
+        if real is not None:
+            sys.modules["httpx"] = real
+        else:
+            sys.modules.pop("httpx", None)
+
+
+def test_a_truncated_empty_completion_raises_rather_than_returning_blank():
+    """THE BUG THE LIVE PROBE FOUND.
+
+    DeepSeek's models spend reasoning tokens from the SAME budget as the answer. With
+    `max_output_tokens=16` the budget ran out during reasoning, `content` came back empty, and the
+    provider returned `""` as a SUCCESS - HTTP 200, tokens in=58 out=16, `finish_reason="length"`.
+    Nothing raised and nothing logged. The identical request with 512 tokens answered "blue".
+
+    A caller cannot distinguish those two outcomes from the return value, so the provider must not
+    return an empty string as if it were content.
+    """
+    import agent.model_gateway as gw
+    import pytest
+
+    with pytest.raises(gw.ModelCallFailed) as caught:
+        _run_provider_with(
+            {
+                "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 58, "completion_tokens": 16},
+            }
+        )
+    assert "truncated" in str(caught.value).lower()
+    assert "max_output_tokens" in str(caught.value)
+
+
+def test_an_empty_completion_without_truncation_also_raises():
+    """A provider that answers nothing is a failure whatever the reason field says."""
+    import agent.model_gateway as gw
+    import pytest
+
+    with pytest.raises(gw.ModelCallFailed):
+        _run_provider_with(
+            {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}], "usage": {}}
+        )
+
+
+def test_whitespace_only_content_counts_as_empty():
+    """`" "` is not an answer either, and a truthiness check would have accepted it."""
+    import agent.model_gateway as gw
+    import pytest
+
+    with pytest.raises(gw.ModelCallFailed):
+        _run_provider_with(
+            {"choices": [{"message": {"content": "   \n  "}, "finish_reason": "stop"}], "usage": {}}
+        )
+
+
+def test_a_real_answer_still_comes_back():
+    """The guard must not have broken the working case - which is the whole reason it exists."""
+    response = _run_provider_with(
+        {
+            "choices": [{"message": {"content": "blue"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 58, "completion_tokens": 27},
+        }
+    )
+    assert response.text == "blue"
+    assert response.output_tokens == 27

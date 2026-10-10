@@ -240,7 +240,34 @@ class OpenAICompatibleProvider:
         choices = body.get("choices") or []
         if not choices:
             raise ModelCallFailed("provider returned no choices")
-        text = (choices[0].get("message") or {}).get("content") or ""
+        choice = choices[0] or {}
+        message = choice.get("message") or {}
+        text = message.get("content") or ""
+
+        # AN EMPTY ANSWER IS NOT AN ANSWER, and it must not be returned as one.
+        #
+        # Reasoning models (DeepSeek's included) emit reasoning tokens BEFORE the answer, drawn from the
+        # same max_tokens budget. If the budget runs out during reasoning, `content` comes back empty
+        # with `finish_reason="length"` - and the caller above receives `""`, which is
+        # indistinguishable from a model that genuinely answered nothing.
+        #
+        # Found by running the probe: max_output_tokens=16 produced an empty string, tokens in=58
+        # out=16, HTTP 200. Nothing raised, nothing logged. The same config with 512 tokens answered
+        # "blue". A caller cannot tell those two apart from the return value alone.
+        #
+        # Raising is right rather than retrying here: the provider does not know the caller's budget,
+        # and silently retrying with a larger one would multiply cost without the caller's consent.
+        finish_reason = choice.get("finish_reason")
+        if not text.strip():
+            if finish_reason == "length":
+                raise ModelCallFailed(
+                    "response was truncated before any content: the token budget was consumed by "
+                    "reasoning. Raise max_output_tokens for this model."
+                )
+            raise ModelCallFailed(
+                f"provider returned an empty completion (finish_reason={finish_reason!r})"
+            )
+
         usage = body.get("usage") or {}
         return ProviderResponse(
             text=text,
