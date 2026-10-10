@@ -130,3 +130,46 @@ which the loop can run under each agent's own tenant context.
 **Both estimates were made from counting rather than reading.** The count is a starting point; the
 classification is the plan.
 
+## ADDENDUM 2: the dispatcher is ALREADY tenant-scoped — which changes the whole shape of the fix
+
+Grepped every `org_id` comparison in `workflow_engine.py`. **36 matches, and all but one are already
+tenant-bound:**
+
+```
+OpportunityMatch.org_id == agent.org_id        AgentWorkflow.org_id == job.org_id
+Organisation.id        == agent.org_id         MailSendIntent.org_id == agent.org_id
+MailAccount.org_id     == agent.org_id         Application.org_id    == agent.org_id
+
+Matcher(db, agent.org_id)              OrganisationMemory(db, agent.org_id)
+ApplicationWorkspace(db, agent.org_id) DocumentVault(db, agent.org_id)
+GranadaMail(db, org_id=agent.org_id)   GranadaAgentService(db, agent.org_id)
+```
+
+**Every query in the hot path already carries a tenant predicate, and every service is constructed with
+an org.**
+
+### So why is BYPASSRLS needed at all?
+
+**Not because the queries are unscoped — because the CONNECTION has no tenant bound.** The policies are
+`org_id = app.current_org()`. On the fleet connection `app.current_org()` is NULL, so the predicate is
+false for every row and the sweep returns **zero** — the "healthy-looking and blind" failure the compose
+comment already records.
+
+**That is a different problem from the one I described.** It is not "30 queries leak across tenants"; it
+is "one connection refuses to see anything, so the privilege was granted to the whole session."
+
+### The fix that follows
+
+1. **One capability** — the active-agent roster (`id`, `org_id`), the single genuinely cross-tenant read.
+2. **`SET app.current_org()` per agent** before its work, since `agent.org_id` is available at every call
+   site already.
+3. **Then the 36 tenant-scoped queries run under RLS with no privilege at all.**
+
+**That is a bounded design, not a 30-function re-write.** And it is the opposite conclusion from the one
+I drew from counting call sites — twice.
+
+**This has not been implemented or proven.** It is a reading of the code, and the next step is the same
+kind of equivalence check that caught the fairness trap: change the connection's tenant binding and
+verify the sweep returns the same candidate set, **over a non-empty set**.
+
+
