@@ -2,7 +2,7 @@
 
 WHY THIS FILE EXISTS
 
-`_handle_browser_execution` reads `context.get("settings") or {}` and refuses when
+`_handle_browser_task` reads `context.get("settings") or {}` and refuses when
 `browser_execution_enabled` is falsy. The job runner builds the handler context in
 `WorkflowEngine._execute_with`, and **that dict had no `"settings"` key at all.**
 
@@ -87,7 +87,7 @@ def test_the_handler_context_carries_the_agents_settings():
     """
     block = _context_block()
     assert '"settings"' in block, (
-        "the handler context has no settings key, so `_handle_browser_execution` reads an empty "
+        "the handler context has no settings key, so `_handle_browser_task` reads an empty "
         "mapping and browser execution is unreachable from the job system"
     )
     assert '"agent"' in block

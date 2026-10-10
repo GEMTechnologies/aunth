@@ -923,7 +923,7 @@ class AgentWorker:
             "correlation_id": (workflow.context or {}).get("correlation_id") if workflow else None,
             # THE AGENT'S OWN SETTINGS, WHICH NOTHING WAS PASSING.
             #
-            # `_handle_browser_execution` reads `context.get("settings") or {}` and gates on
+            # `_handle_browser_task` reads `context.get("settings") or {}` and gates on
             # `browser_execution_enabled`. That key was never populated here, so the handler saw an
             # empty mapping on every single job, concluded browser execution was disabled, and
             # returned `browser.disabled` - **the browser path could not run at all**, whatever an

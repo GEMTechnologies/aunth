@@ -10,7 +10,7 @@ measured, not assumed:
     Chromium on disk in the container      absent
     host eval venv mounted into container  no - only postgres has a volume
 
-So a job routed through `_handle_browser_execution` today spawns the worker INSIDE the container, where
+So a job routed through `_handle_browser_task` today spawns the worker INSIDE the container, where
 its dependencies do not exist. Verified by running it:
 
     {"status": "UNCERTAIN", "outcome_certain": false,
