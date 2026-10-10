@@ -316,3 +316,52 @@ def test_a_non_imap_provider_is_honest_about_having_no_builder(db, orgs, key, mo
     assert gateway.transport_for_account(
         FakeAccount(org_id="org-a", provider="GOOGLE", credentials_ref="r")
     ) is None
+
+
+# ===========================================================================
+# THE CALLER MUST USE IT - a correct method with no callers is not a fix
+# ===========================================================================
+def test_sync_resolves_the_accounts_own_transport(db, orgs, key, monkeypatch):
+    """`sync` called `transport_for(account.provider)`, the provider-WIDE transport, so every
+    organisation's reconciliation would have read whichever mailbox was registered. Asserting the
+    method exists is not enough; the caller has to use it."""
+    from agent.credential_store import CredentialStore
+
+    _patch_settings(monkeypatch, key)
+    CredentialStore(db, key=key).put(
+        org_id="org-a", ref="r", payload={"host": "imap.a.example", "password": "a"}
+    )
+
+    seen: dict = {}
+
+    class FakeMail:
+        def __init__(self, db, *, org_id, agent_id, transport):
+            seen["transport"] = transport
+
+        def sync(self, *, account, limit, max_batches):
+            return {"ok": True}
+
+    import agent.mail.service as mail_service
+
+    monkeypatch.setattr(mail_service, "GranadaMail", FakeMail)
+
+    gateway = mail_gateway.MailGateway(db, org_id="org-a", agent_id="agent-1")
+    account = FakeAccount(org_id="org-a", credentials_ref="r")
+    gateway.sync(account=account)
+
+    transport = seen.get("transport")
+    assert transport is not None, "sync passed no transport at all"
+    assert getattr(transport, "config", None) is not None, (
+        "sync used the provider-wide transport instead of resolving the account's own credential"
+    )
+    assert transport.config.host == "imap.a.example"
+
+
+def test_sync_refuses_an_account_from_another_organisation(db, orgs, key, monkeypatch):
+    """The scoping has to hold at the caller too, not only in the method it delegates to."""
+    from agent.mail.gateway import MailTenantMismatch
+
+    _patch_settings(monkeypatch, key)
+    gateway = mail_gateway.MailGateway(db, org_id="org-a", agent_id="agent-1")
+    with pytest.raises(MailTenantMismatch):
+        gateway.sync(account=FakeAccount(org_id="org-b", credentials_ref="r"))

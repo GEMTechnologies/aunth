@@ -484,10 +484,17 @@ class MailGateway:
         )
 
     def sync(self, *, account: models.MailAccount, limit: int = 50, max_batches: int = 5) -> dict[str, Any]:
-        """Bounded reconciliation, because a webhook alone is not reliable."""
+        """Bounded reconciliation, because a webhook alone is not reliable.
+
+        USES `transport_for_account`, NOT `transport_for(account.provider)`. The latter returned the
+        deployment-wide transport registered under a provider name, so every organisation's
+        reconciliation would have read whichever mailbox was registered - one tenant's mail delivered
+        into another tenant's pipeline. The per-account method resolves that mailbox's OWN credential and
+        refuses an account belonging to a different organisation.
+        """
         from agent.mail.service import GranadaMail
 
-        transport = self.transport_for(account.provider)
+        transport = self.transport_for_account(account)
         mail = GranadaMail(
             self.db, org_id=self.org_id, agent_id=self.agent_id, transport=transport
         )
