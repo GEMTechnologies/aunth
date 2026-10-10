@@ -1917,9 +1917,33 @@ def _mail_transport(provider: str) -> Any:
     return get_transport(provider)
 
 
-def _outbound_transport(provider: str) -> Any:
-    """Resolve an OUTBOUND transport. Separate registry from inbound, on purpose."""
-    from agent.mail.gateway import get_outbound_transport
+def _outbound_transport(provider: str, *, db: Session = None, intent: Any = None) -> Any:
+    """Resolve an OUTBOUND transport. Separate registry from inbound, on purpose.
+
+    WHEN AN INTENT NAMES A MAILBOX, the transport is built from THAT mailbox's own credential.
+    `get_outbound_transport(provider)` returns the deployment-wide transport registered under a provider
+    name, so without this every organisation would send through whichever mailbox was configured - one
+    organisation's reply arriving from another organisation's address, which looks deliberate to the
+    recipient.
+
+    The account is looked up rather than passed because the intent carries `mail_account_id`, and
+    resolving it here keeps the caller's shape unchanged for the tests that pass a provider alone.
+    """
+    from agent.mail.gateway import get_outbound_transport, outbound_transport_for_account
+
+    account_id = getattr(intent, "mail_account_id", None) if intent is not None else None
+    if db is not None and account_id:
+        account = db.execute(
+            select(models.MailAccount).where(models.MailAccount.id == account_id)
+        ).scalars().first()
+        if account is not None:
+            try:
+                return outbound_transport_for_account(db, account=account, org_id=account.org_id)
+            except Exception:  # noqa: BLE001 - a tenant mismatch must not become a crash here
+                # A mismatch means the intent names a mailbox the intent's own organisation does not
+                # own. Falling through to the provider-wide transport would be exactly the wrong
+                # recovery, so this returns None and the caller parks the work.
+                return None
 
     return get_outbound_transport(provider)
 
@@ -1961,7 +1985,7 @@ def _handle_mail_send(db: Session, context: dict[str, Any]) -> dict[str, Any]:
             "meaningful": False,
         }
 
-    transport = _outbound_transport(intent.provider or payload.get("provider") or "")
+    transport = _outbound_transport(intent.provider or payload.get("provider") or "", db=db, intent=intent)
     if transport is None:
         # No outbound provider configured is an operational state, not a failure.
         # Parking keeps the approved intent intact and resumable.
@@ -2056,7 +2080,7 @@ def _handle_mail_reconcile(db: Session, context: dict[str, Any]) -> dict[str, An
             "meaningful": False,
         }
 
-    transport = _outbound_transport(intent.provider or "")
+    transport = _outbound_transport(intent.provider or "", db=db, intent=intent)
     if transport is None:
         return {
             "summary": "no outbound provider available to reconcile against",

@@ -166,6 +166,87 @@ def clear_outbound_transports() -> None:
     _OUTBOUND.clear()
 
 
+def outbound_transport_for_account(
+    db: Session, *, account: models.MailAccount, org_id: str
+) -> Optional[Any]:
+    """The OUTBOUND transport for ONE mailbox, built from that mailbox's OWN credential.
+
+    The symmetric counterpart of `MailGateway.transport_for_account`, and it exists for the same reason:
+    `get_outbound_transport(provider)` returns the DEPLOYMENT-WIDE transport registered under a provider
+    name, so every organisation would send through whichever mailbox was registered. For inbound that
+    means one tenant's mail delivered into another's pipeline; for outbound it means **one organisation's
+    reply arriving from another organisation's address**, which is worse - it looks deliberate to the
+    recipient.
+
+    Order, matching the inbound method because the reasoning is the same:
+
+      1. account belongs to another organisation -> REFUSE, before any lookup
+      2. account HAS a credentials_ref          -> resolve it, and NEVER fall back
+      3. account has no credentials_ref         -> the registered transport
+
+    A module-level function rather than a method because the dispatcher resolves an outbound transport
+    from a `MailSendIntent`, which carries `mail_account_id` and `provider` rather than a gateway.
+    """
+    if account.org_id != org_id:
+        raise MailTenantMismatch(
+            "refusing to resolve an outbound transport for a mailbox belonging to another organisation"
+        )
+
+    if account.credentials_ref:
+        # A per-account credential ALWAYS wins, and there is NO fallback when it fails - see the inbound
+        # method for why the order matters.
+        payload = _stored_payload(db, account=account, org_id=org_id)
+        if payload is None:
+            return None
+        provider = (account.provider or "").upper()
+        if provider == "SMTP":
+            from agent.mail.providers.smtp import SmtpConfig, SmtpOutboundMailProvider
+
+            return SmtpOutboundMailProvider(
+                SmtpConfig(
+                    host=payload.get("host", ""),
+                    port=int(payload.get("port") or 587),
+                    username=payload.get("username", ""),
+                    password=payload.get("password", ""),
+                    use_starttls=bool(payload.get("use_tls", True)),
+                    use_ssl=bool(payload.get("use_ssl", False)),
+                )
+            )
+        logger.info(
+            "mail.outbound_not_buildable",
+            extra={"mail_account_id": account.id, "provider": provider},
+        )
+        return None
+
+    return _OUTBOUND.get((account.provider or "").upper())
+
+
+def _stored_payload(
+    db: Session, *, account: models.MailAccount, org_id: str
+) -> Optional[dict[str, Any]]:
+    """Resolve one account's stored credential, or None on every failure.
+
+    None rather than an exception for a missing, revoked or undecryptable credential, and for an
+    unconfigured store: the caller's correct response is to park the work, and a failure that raised
+    here would stop the fleet for one organisation's key rotation.
+    """
+    if not account.credentials_ref:
+        return None
+    try:
+        from config import settings
+
+        from agent.credential_store import store_from_settings
+
+        store = store_from_settings(db, settings)
+        return store.get(org_id=org_id, ref=account.credentials_ref)
+    except Exception as exc:  # noqa: BLE001 - all four cases park the work
+        logger.warning(
+            "mail.outbound_credential_unavailable",
+            extra={"mail_account_id": account.id, "error": type(exc).__name__},
+        )
+        return None
+
+
 def get_outbound_transport(provider: str) -> Optional[Any]:
     """The OUTBOUND transport for a provider, or ``None``.
 

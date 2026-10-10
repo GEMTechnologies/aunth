@@ -365,3 +365,165 @@ def test_sync_refuses_an_account_from_another_organisation(db, orgs, key, monkey
     gateway = mail_gateway.MailGateway(db, org_id="org-a", agent_id="agent-1")
     with pytest.raises(MailTenantMismatch):
         gateway.sync(account=FakeAccount(org_id="org-b", credentials_ref="r"))
+
+
+# ===========================================================================
+# OUTBOUND - the symmetric gap, and the worse failure
+# ===========================================================================
+def test_outbound_resolves_the_accounts_own_smtp_credential(db, orgs, key, monkeypatch):
+    """For inbound, sharing a transport means one tenant's mail in another's pipeline. For OUTBOUND it
+    means one organisation's reply arriving FROM another organisation's address - which looks
+    deliberate to the recipient."""
+    from agent.credential_store import CredentialStore
+    from agent.mail.gateway import outbound_transport_for_account
+    from agent.mail.providers.smtp import SmtpOutboundMailProvider
+
+    _patch_settings(monkeypatch, key)
+    CredentialStore(db, key=key).put(
+        org_id="org-a",
+        ref="smtp:1",
+        payload={
+            "host": "smtp.a.example",
+            "port": 587,
+            "username": "grants@a.example",
+            "password": "a-secret",
+            "use_tls": True,
+            "use_ssl": False,
+        },
+        kind="SMTP_PASSWORD",
+    )
+
+    transport = outbound_transport_for_account(
+        db,
+        account=FakeAccount(org_id="org-a", provider="SMTP", credentials_ref="smtp:1"),
+        org_id="org-a",
+    )
+    assert isinstance(transport, SmtpOutboundMailProvider)
+    assert transport.config.host == "smtp.a.example"
+    assert transport.config.username == "grants@a.example"
+
+
+def test_outbound_refuses_an_account_from_another_organisation(db, orgs, key, monkeypatch):
+    from agent.mail.gateway import MailTenantMismatch, outbound_transport_for_account
+
+    _patch_settings(monkeypatch, key)
+    with pytest.raises(MailTenantMismatch):
+        outbound_transport_for_account(
+            db,
+            account=FakeAccount(org_id="org-b", provider="SMTP", credentials_ref="smtp:1"),
+            org_id="org-a",
+        )
+
+
+def test_outbound_does_not_fall_back_when_the_credential_is_gone(db, orgs, key, monkeypatch):
+    """A registered deployment-wide transport must not become the answer for an account whose own
+    credential was revoked. That fallback would send from the wrong mailbox rather than from none."""
+    from agent.credential_store import CredentialStore
+    from agent.mail.gateway import outbound_transport_for_account
+
+    _patch_settings(monkeypatch, key)
+    store = CredentialStore(db, key=key)
+    store.put(org_id="org-a", ref="smtp:1", payload={"host": "smtp.a.example", "password": "a"})
+    store.revoke(org_id="org-a", ref="smtp:1")
+
+    sentinel = object()
+    mail_gateway.register_outbound_transport("SMTP", sentinel)
+
+    assert outbound_transport_for_account(
+        db,
+        account=FakeAccount(org_id="org-a", provider="SMTP", credentials_ref="smtp:1"),
+        org_id="org-a",
+    ) is None
+
+
+def test_outbound_uses_the_registered_transport_when_the_account_has_no_credential(db, orgs, key, monkeypatch):
+    """Single-mailbox deployments and test doubles still work - the registration is not broken, it is
+    simply not allowed to displace a per-account credential."""
+    from agent.mail.gateway import outbound_transport_for_account
+
+    _patch_settings(monkeypatch, key)
+    sentinel = object()
+    mail_gateway.register_outbound_transport("SMTP", sentinel)
+
+    assert outbound_transport_for_account(
+        db,
+        account=FakeAccount(org_id="org-a", provider="SMTP", credentials_ref=None),
+        org_id="org-a",
+    ) is sentinel
+
+
+def test_two_organisations_send_through_two_mailboxes(db, orgs, key, monkeypatch):
+    """The property the whole function exists for."""
+    from agent.credential_store import CredentialStore
+    from agent.mail.gateway import outbound_transport_for_account
+
+    _patch_settings(monkeypatch, key)
+    store = CredentialStore(db, key=key)
+    store.put(org_id="org-a", ref="r", payload={"host": "smtp.a.example", "password": "a"})
+    store.put(org_id="org-b", ref="r", payload={"host": "smtp.b.example", "password": "b"})
+
+    a = outbound_transport_for_account(
+        db, account=FakeAccount(org_id="org-a", provider="SMTP", credentials_ref="r"), org_id="org-a"
+    )
+    b = outbound_transport_for_account(
+        db, account=FakeAccount(org_id="org-b", provider="SMTP", credentials_ref="r"), org_id="org-b"
+    )
+    assert a.config.host == "smtp.a.example"
+    assert b.config.host == "smtp.b.example", "org-b would have sent from org-a's address"
+
+
+def test_the_dispatcher_prefers_the_intents_own_mailbox(db, orgs, key, monkeypatch):
+    """`_outbound_transport` gained `db` and `intent` for this: the intent carries `mail_account_id`, so
+    the transport must be built from that mailbox rather than from a provider name.
+
+    The account is fetched from the database by id, so the lookup is patched to return a stand-in
+    rather than inserting a real `MailAccount` - whose composite foreign key to `granada_agents` is
+    enforced in the full suite and would need a second fixture to satisfy.
+    """
+    from agent.credential_store import CredentialStore
+    from agent import workflow_engine
+
+    _patch_settings(monkeypatch, key)
+    CredentialStore(db, key=key).put(
+        org_id="org-a", ref="r", payload={"host": "smtp.a.example", "password": "a"}
+    )
+
+    class FakeIntent:
+        provider = "SMTP"
+        mail_account_id = "acct-1"
+
+    class FakeResult:
+        def scalars(self):
+            return self
+
+        def first(self):
+            return FakeAccount(org_id="org-a", provider="SMTP", credentials_ref="r")
+
+    real_execute = db.execute
+
+    def execute(statement, *args, **kwargs):
+        if "mail_accounts" in str(statement):
+            return FakeResult()
+        return real_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, "execute", execute)
+
+    transport = workflow_engine._outbound_transport("SMTP", db=db, intent=FakeIntent())
+    assert transport is not None, "the intent's own mailbox was not used"
+    assert transport.config.host == "smtp.a.example"
+
+
+def test_the_dispatcher_falls_back_when_the_intent_names_no_mailbox(db, orgs, key, monkeypatch):
+    """An intent with no `mail_account_id` still resolves by provider, so nothing that worked before
+    stops working."""
+    from agent.workflow_engine import _outbound_transport
+
+    _patch_settings(monkeypatch, key)
+    sentinel = object()
+    mail_gateway.register_outbound_transport("SMTP", sentinel)
+
+    class FakeIntent:
+        provider = "SMTP"
+        mail_account_id = None
+
+    assert _outbound_transport("SMTP", db=db, intent=FakeIntent()) is sentinel
