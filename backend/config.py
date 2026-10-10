@@ -242,6 +242,25 @@ class Settings(BaseSettings):
     smtp_tls: bool = True
     smtp_ssl: bool = False
 
+    # Inbound mail over IMAP, for mailboxes that are not Google or Microsoft.
+    #
+    # THESE ARE THE TRANSPORT'S OWN CREDENTIALS, not a per-account secret. A `MailAccount` row
+    # deliberately has NO password column - `credentials_ref` points at a secret store - so a generic
+    # IMAP account is configured here as one transport for one deployment, exactly as the SMTP settings
+    # above are. Per-account IMAP credentials belong in the secret store the schema already refers to,
+    # and are a separate piece of work.
+    #
+    # Defaults are EMPTY rather than a localhost guess: an unset host means "IMAP is not configured",
+    # and `build_from_settings` returns None rather than attempting a connection on every sweep.
+    imap_host: str = ""
+    imap_port: int = 993
+    imap_user: str = ""
+    imap_pass: str = ""
+    #: Implicit TLS. True by default because plaintext IMAP sends the password in the clear, and a
+    #: default of False makes the insecure option the path of least resistance.
+    imap_ssl: bool = True
+    imap_mailbox: str = "INBOX"
+
     # -- Cookies ----------------------------------------------------------
     cookie_domain: str = ".localhost"
     cookie_secure: bool = False

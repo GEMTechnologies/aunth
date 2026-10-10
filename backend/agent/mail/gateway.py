@@ -90,6 +90,10 @@ def get_transport(provider: str) -> Optional[Any]:
     ``None`` rather than an exception: an unconfigured provider is a deployment
     state, and the caller's correct response is to park the work and retry later,
     not to mark the mail as failed.
+
+    IMAP IS BUILT ON DEMAND FROM SETTINGS, for the same reason SMTP is: nothing in production ever
+    called `register_transport`, so every adapter was reachable from a test and from nowhere else.
+    Setting `imap_host` is now genuinely enough.
     """
     if not provider:
         return None
@@ -103,7 +107,19 @@ def get_transport(provider: str) -> Optional[Any]:
 
         registry = getattr(settings, "mail_transports", None)
         if isinstance(registry, dict):
-            return registry.get(provider) or registry.get(provider.upper())
+            found = registry.get(provider) or registry.get(provider.upper())
+            if found is not None:
+                return found
+
+        if provider.upper() == "IMAP":
+            # Imported here: this module is imported by the scheduler, and a module-scope import would
+            # put the IMAP stack on the fleet's start-up path whether or not mail is configured.
+            from agent.mail.providers.imap import build_from_settings
+
+            built = build_from_settings(settings)
+            if built is not None:
+                _TRANSPORTS["IMAP"] = built  # cached: one construction per process
+            return built
     except Exception:  # pragma: no cover - configuration is optional here
         return None
     return None
