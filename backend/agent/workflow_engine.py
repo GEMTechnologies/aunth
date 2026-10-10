@@ -921,6 +921,22 @@ class AgentWorker:
             "specialist": spec,
             "db": self.db,
             "correlation_id": (workflow.context or {}).get("correlation_id") if workflow else None,
+            # THE AGENT'S OWN SETTINGS, WHICH NOTHING WAS PASSING.
+            #
+            # `_handle_browser_execution` reads `context.get("settings") or {}` and gates on
+            # `browser_execution_enabled`. That key was never populated here, so the handler saw an
+            # empty mapping on every single job, concluded browser execution was disabled, and
+            # returned `browser.disabled` - **the browser path could not run at all**, whatever an
+            # operator put in `agent.settings`.
+            #
+            # `GranadaAgent.settings` is a real JSON column, defaulted to `{}` at provisioning. It was
+            # read by nothing on this path. The result was the exact failure this project keeps
+            # recording: a capability that is built, tested in isolation, and unreachable in
+            # production - and here it was unreachable by ONE ABSENT DICT KEY.
+            #
+            # Empty stays the default, so an agent with no settings still reads as disabled and
+            # nothing is enabled by this change alone.
+            "settings": dict(getattr(agent, "settings", None) or {}),
         }
         activity = spec.load(job.job_type)(self.db, context)
 
