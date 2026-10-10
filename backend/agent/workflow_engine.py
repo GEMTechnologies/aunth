@@ -2338,6 +2338,21 @@ def _browser_scope_for(package: Any, settings: dict[str, Any]) -> Any:
 
     EXACT HOSTS ONLY. browser_boundary.validate_task refuses a wildcard, because suffix matching
     lets `notfunder.example` match `funder.example`, and this builds the value it checks.
+
+    THE LOOPBACK OPT-IN WAS UNREACHABLE FROM HERE, WHICH IS THE SAME DEFECT ONE LAYER UP.
+
+    `ActionScope.allow_loopback` defaults to False and `validate_task` reads it, and the controlled
+    test portal is only reachable on `127.0.0.1` - so the opt-in has to be settable or the fixture
+    cannot be driven through the job system at all. It was not settable: this function is the only
+    place production builds an `ActionScope`, and it never passed the field. A commit already fixed
+    exactly this shape one layer down (`browser_worker` dropped `allow_loopback` in transit, so "the
+    refusal named a switch nothing could set"); this is the other half of that same switch.
+
+    It stays an explicit opt-in rather than a default, which is what the field's own comment asks
+    for: a production task must not inherit loopback permission merely by being constructed the same
+    way as a fixture. Defaulting to absent means off, so an agent that does not ask for it cannot
+    reach loopback however its hosts are written - and `_truthy` is used rather than a bare truth
+    test so a settings file containing the string "false" cannot turn it on.
     """
     from agent.browser_boundary import ActionScope
 
@@ -2346,4 +2361,5 @@ def _browser_scope_for(package: Any, settings: dict[str, Any]) -> Any:
     return ActionScope(
         portal_name=str(settings.get("browser_portal_name") or "unknown"),
         allowed_hosts=hosts,
+        allow_loopback=_truthy(settings.get("browser_allow_loopback")),
     )

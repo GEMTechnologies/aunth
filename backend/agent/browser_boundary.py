@@ -153,6 +153,18 @@ class BrowserTask:
     action_scope: ActionScope
     credentials: list[CredentialRef] = field(default_factory=list)
 
+    #: WHERE TO GO. The package records the funder's portal URL, and the worker reads
+    #: `payload["target_url"]` and refuses to report completion if it is absent - "the task named no
+    #: target_url, so there was nothing to open".
+    #:
+    #: THE FIELD WAS MISSING, so the job path could never tell the worker where to go. `validate_task`
+    #: already tried to screen it with `getattr(task, "target_url", "")`, which silently yielded "" and
+    #: skipped the check; the worker already consumed it; and `build_task` already had the package in
+    #: hand. Only the field itself was absent, so every job-path invocation reached the worker with no
+    #: destination and stopped there - while the same worker driven by hand with a literal payload
+    #: worked, which is how the gap survived an end-to-end test.
+    target_url: Optional[str] = None
+
     #: Form-ready values, drawn from VERIFIED organisation facts. A worker must not be handed a value
     #: the platform could not substantiate, because it would type it into a funder's form.
     form_data: dict[str, Any] = field(default_factory=dict)
@@ -176,6 +188,10 @@ class BrowserTask:
             "job_id": self.job_id,
             "package_fingerprint": self.package_fingerprint,
             "action_scope": self.action_scope.as_dict(),
+            # THE KEY THE WORKER ACTUALLY READS. `browser_worker` looks for `payload["target_url"]`
+            # and refuses to report completion without having visited a page, so omitting it here
+            # means every job-path invocation stops before it opens anything.
+            "target_url": self.target_url,
             "credentials": [c.as_dict() for c in self.credentials],
             "form_data": self.form_data,
             "documents": self.documents,
@@ -342,6 +358,10 @@ def build_task(
         job_id=None,
         package_fingerprint=str(package.package_fingerprint),
         action_scope=action_scope,
+        # CARRIED FROM THE PACKAGE, which is where the funder's portal URL is recorded. Passing it
+        # here is what makes `validate_task`'s target check real rather than a `getattr` on a field
+        # that did not exist, and it is what the worker needs in order to open anything at all.
+        target_url=getattr(package, "target_url", None),
         credentials=list(credentials or []),
         # Verified form data only. An empty dict is the honest default: the platform does not
         # fabricate a value to make a form look complete.

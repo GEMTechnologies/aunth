@@ -142,3 +142,148 @@ def test_configured_settings_survive_into_the_handler_gate():
 
     context_settings = dict(getattr(Agent, "settings", None) or {})
     assert browser_invocation.enabled(context_settings) is True
+
+
+# ===========================================================================
+# THE DESTINATION - the field the whole path was missing
+# ===========================================================================
+def _task(**overrides):
+    from agent.browser_boundary import ActionScope, BrowserTask
+
+    fields = dict(
+        task_id="task-1",
+        org_id="org-1",
+        package_id="pkg-1",
+        workflow_id=None,
+        job_id=None,
+        package_fingerprint="fp-1",
+        action_scope=ActionScope(portal_name="fixture", allowed_hosts=("127.0.0.1",)),
+    )
+    fields.update(overrides)
+    return BrowserTask(**fields)
+
+
+def test_a_task_can_carry_a_destination_at_all():
+    """`validate_task` screened `getattr(task, "target_url", "")` and `as_dict()` omitted the key,
+    while the worker reads `payload["target_url"]` and refuses to report completion without it. The
+    field simply did not exist, so every job-path invocation had nowhere to go - and the worker
+    driven by hand with a literal payload worked, which is precisely why nothing caught it."""
+    from agent.browser_boundary import BrowserTask
+
+    assert "target_url" in BrowserTask.__dataclass_fields__, (
+        "BrowserTask still has no target_url field, so no job can tell the worker where to open"
+    )
+
+
+def test_the_serialised_payload_carries_the_key_the_worker_reads():
+    """The two halves are in different files and were never checked against each other."""
+    payload = _task(target_url="https://funder.example/apply").as_dict()
+    assert payload["target_url"] == "https://funder.example/apply"
+
+    worker = (BACKEND / "tools" / "browser_worker.py").read_text(encoding="utf-8")
+    assert 'payload.get("target_url")' in worker, (
+        "the worker stopped reading target_url; the payload key is now unverified on the other side"
+    )
+
+
+def test_build_task_carries_the_target_from_the_package():
+    """The package is where the funder's portal URL is recorded, and `build_task` already had it."""
+    source = (BACKEND / "agent" / "browser_boundary.py").read_text(encoding="utf-8")
+    build = source.split("def build_task", 1)[1].split("def describe_integration", 1)[0]
+    assert "target_url=" in build, "build_task does not pass the package's target_url into the task"
+
+
+def test_validate_task_screens_the_target_now_that_the_field_exists():
+    """The check was written and then made vacuous by `getattr(task, "target_url", "")` defaulting to
+    empty, because the field did not exist. With the field present it can actually refuse something.
+
+    A LITERAL link-local address is refused even with `resolve=False`, so this is a real refusal and
+    not a DNS-dependent one.
+    """
+    from agent.browser_boundary import ActionScope, BrowserTaskRefused, validate_task
+
+    allowed = ActionScope(portal_name="funder", allowed_hosts=("funder.example",))
+
+    # A permitted destination is permitted.
+    validate_task(
+        _task(action_scope=allowed, target_url="https://funder.example/apply"),
+        org_document_ids=set(),
+    )
+
+    # A permitted HOST with a metadata-endpoint target is refused - the allow-list names the host,
+    # not the address the browser is actually sent to.
+    with pytest.raises(BrowserTaskRefused):
+        validate_task(
+            _task(action_scope=allowed, target_url="http://169.254.169.254/latest/meta-data/"),
+            org_document_ids=set(),
+        )
+
+
+def test_a_loopback_HOST_is_refused_unless_the_task_opts_in():
+    """The other half of the same screen: `screen_hosts` runs over `allowed_hosts` at build time."""
+    from agent.browser_boundary import ActionScope, BrowserTaskRefused, validate_task
+
+    with pytest.raises(BrowserTaskRefused):
+        validate_task(
+            _task(action_scope=ActionScope(portal_name="fixture", allowed_hosts=("127.0.0.1",))),
+            org_document_ids=set(),
+        )
+
+    # The same task, with the opt-in the scope now actually receives from configuration.
+    validate_task(
+        _task(
+            action_scope=ActionScope(
+                portal_name="fixture", allowed_hosts=("127.0.0.1",), allow_loopback=True
+            ),
+            target_url="http://127.0.0.1:8099/",
+        ),
+        org_document_ids=set(),
+    )
+
+
+# ===========================================================================
+# THE LOOPBACK OPT-IN - reachable from the job path at last
+# ===========================================================================
+def test_the_scope_does_not_permit_loopback_by_default():
+    from agent.workflow_engine import _browser_scope_for
+
+    scope = _browser_scope_for(None, {"browser_allowed_hosts": ["127.0.0.1"]})
+    assert scope.allow_loopback is False, (
+        "a production task must not inherit loopback permission by being built the same way as a "
+        "fixture"
+    )
+
+
+def test_the_scope_honours_an_explicit_loopback_opt_in():
+    """`ActionScope.allow_loopback` existed, `validate_task` read it, and the ONLY place production
+    builds a scope never set it - so the controlled fixture could not be driven through the job
+    system at all. That is the same defect already fixed one layer down in `browser_worker`, which
+    dropped the value in transit: a refusal naming a switch nothing can set."""
+    from agent.workflow_engine import _browser_scope_for
+
+    scope = _browser_scope_for(None, {
+        "browser_allowed_hosts": ["127.0.0.1"],
+        "browser_allow_loopback": True,
+    })
+    assert scope.allow_loopback is True
+
+
+@pytest.mark.parametrize("value", ["false", "0", "no", "off", "", None])
+def test_a_recognised_false_word_does_not_permit_loopback(value):
+    """`bool("false")` is True. A settings file that says "false" must not open loopback."""
+    from agent.workflow_engine import _browser_scope_for
+
+    scope = _browser_scope_for(None, {
+        "browser_allowed_hosts": ["127.0.0.1"],
+        "browser_allow_loopback": value,
+    })
+    assert scope.allow_loopback is False
+
+
+def test_the_opt_in_is_collected_from_settings_not_from_the_package():
+    """It is per-task configuration. Reading it off the package would let package data grant itself
+    permission to reach the internal network."""
+    source = (BACKEND / "agent" / "workflow_engine.py").read_text(encoding="utf-8")
+    scope_fn = source.split("def _browser_scope_for", 1)[1].split("\n\n\ndef ", 1)[0]
+    assert "browser_allow_loopback" in scope_fn
+    assert "_truthy(" in scope_fn, "a bare truth test would turn 'false' into True"
