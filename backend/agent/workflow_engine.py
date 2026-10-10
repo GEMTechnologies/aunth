@@ -2295,6 +2295,7 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
         invoker=invoker,
         settings=settings,
         submission_authorised=False,   # never granted here; submission_authority owns that decision
+        org_document_ids=_org_document_ids(db, agent.org_id),
     )
 
     return {
@@ -2373,6 +2374,37 @@ def _verified_form_data(package: Any) -> dict[str, str]:
         if question and answer:
             values[question] = answer
     return values
+
+
+def _org_document_ids(db: Any, org_id: str) -> set[str]:
+    """The document ids this organisation actually owns, resolved AT THE CALLER.
+
+    WHY THIS FUNCTION EXISTS, AND WHY THE UPLOAD PATH COULD NEVER RUN WITHOUT IT.
+
+    `browser_invocation.invoke` ends with `validate_task(task, org_document_ids=org_document_ids or
+    set())`, and `browser_boundary.validate_task` refuses any document whose id is not in that set -
+    "document X does not belong to organisation Y; refusing to build the task". `validate_task`'s own
+    docstring explains that it CANNOT look the ids up itself, because doing so would need the
+    cross-tenant privilege the worker must not have, and that the CALLER resolves them through the
+    authorised vault.
+
+    `_handle_browser_task` is that caller, and it never passed them. So the set was always empty and
+    **every document reference was refused as belonging to somebody else**. The isolation check was
+    not lax; it was absolute, which is the failure mode that looks like correctness. A package with
+    no documents - like every fixture used so far - ran fine, and a package with documents could not
+    upload anything, so the upload requirement in §4 read as untested rather than unreachable.
+
+    Read under RLS, and ALSO narrowed by `org_id` explicitly. The two checks are independent on
+    purpose, exactly as `credential_store._row` does it: RLS is the boundary, and the explicit filter
+    is what makes a caller that guessed another organisation's id get its own rows rather than an
+    error that leaks whether the id exists.
+    """
+    return {
+        str(row)
+        for row in db.execute(
+            select(models.Document.id).where(models.Document.org_id == org_id)
+        ).scalars().all()
+    }
 
 
 def _browser_scope_for(package: Any, settings: dict[str, Any]) -> Any:

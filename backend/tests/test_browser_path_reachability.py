@@ -396,3 +396,94 @@ def test_the_handler_PASSES_the_verified_values_it_resolves():
         "every form with nothing to type - and refuses honestly, which is why it looked like a data "
         "gap rather than a wiring one"
     )
+
+
+# ===========================================================================
+# THE DOCUMENT IDS - without which every upload is refused as foreign
+# ===========================================================================
+class _Scalars:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return list(self._rows)
+
+
+class _Result:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def scalars(self):
+        return _Scalars(self._rows)
+
+
+class _Db:
+    """Returns a fixed set of ids for the document query."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.calls = []
+
+    def execute(self, statement):
+        self.calls.append(str(statement))
+        return _Result(self._rows)
+
+
+def test_the_organisations_document_ids_are_resolved():
+    from agent.workflow_engine import _org_document_ids
+
+    db = _Db(["d1", "d2"])
+    assert _org_document_ids(db, "org-A") == {"d1", "d2"}
+    assert "documents" in db.calls[0]
+
+
+def test_the_handler_PASSES_the_document_ids_it_resolves():
+    """`validate_task` refuses a document id it was not told the organisation owns, and its own
+    docstring says the CALLER must resolve them. The handler never did, so the set was always empty
+    and EVERY document reference was refused as belonging to somebody else - an isolation check
+    that is absolute rather than lax, which is why it read as correctness."""
+    source = (BACKEND / "agent" / "workflow_engine.py").read_text(encoding="utf-8")
+    handler = source.split("def _handle_browser_task", 1)[1].split("def _browser_summary", 1)[0]
+    assert "org_document_ids=_org_document_ids(db, agent.org_id)" in handler, (
+        "the handler invokes the worker without the organisation's document ids, so a package that "
+        "has documents can never upload one"
+    )
+
+
+def test_a_document_reference_is_refused_when_the_set_is_empty():
+    """The behaviour that was reached unconditionally. Pinned so the fix is visibly a change."""
+    from agent.browser_boundary import ActionScope, BrowserTaskRefused, validate_task
+
+    task = _task(
+        action_scope=ActionScope(portal_name="funder", allowed_hosts=("funder.example",)),
+        documents=[{"document_id": "doc-1", "doc_type": "audited_accounts",
+                    "checksum_sha256": "c" * 64}],
+    )
+    with pytest.raises(BrowserTaskRefused):
+        validate_task(task, org_document_ids=set())
+
+
+def test_the_same_reference_is_accepted_once_ownership_is_resolved():
+    """The other half: with the id supplied, the isolation check passes on the merits rather than
+    being bypassed."""
+    from agent.browser_boundary import ActionScope, validate_task
+
+    task = _task(
+        action_scope=ActionScope(portal_name="funder", allowed_hosts=("funder.example",)),
+        documents=[{"document_id": "doc-1", "doc_type": "audited_accounts",
+                    "checksum_sha256": "c" * 64}],
+    )
+    validate_task(task, org_document_ids={"doc-1"})
+
+
+def test_another_organisations_document_is_still_refused():
+    """THE PROPERTY THAT MUST SURVIVE THE FIX. Resolving ownership must not become trusting."""
+    from agent.browser_boundary import ActionScope, BrowserTaskRefused, validate_task
+
+    task = _task(
+        action_scope=ActionScope(portal_name="funder", allowed_hosts=("funder.example",)),
+        documents=[{"document_id": "someone-elses-doc",
+                    "doc_type": "audited_accounts", "checksum_sha256": "c" * 64}],
+    )
+    with pytest.raises(BrowserTaskRefused):
+        validate_task(task, org_document_ids={"doc-1", "doc-2"})
