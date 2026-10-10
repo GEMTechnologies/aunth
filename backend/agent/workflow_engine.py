@@ -547,6 +547,12 @@ class FleetDispatcher:
                     )
                     scheduled += 1
 
+                # FLUSH INSIDE THE SCOPE, for the same reason `dispatch_once` does: a flush that
+                # happens after the binding is cleared writes with `app.current_org_id` empty, matches
+                # zero rows under RLS, and SQLAlchemy raises StaleDataError. The scheduler's writes are
+                # subject to the same policy as the dispatcher's.
+                self.db.flush()
+
         if scheduled:
             metrics.inc("fleet.discovered_opportunity_work", scheduled)
         return scheduled
@@ -657,7 +663,22 @@ class FleetDispatcher:
                 workflow.last_run_at = moment
                 workflow.attempts += 1
 
-        self.db.flush()
+                # FLUSH INSIDE THE SCOPE. THIS IS LOAD-BEARING, and the first version got it wrong.
+                #
+                # SQLAlchemy flushes pending changes when asked - and the method ended with a single
+                # `self.db.flush()` AFTER the loop, by which point every `tenant_scope` had cleared the
+                # binding. The UPDATE then ran with `app.current_org_id` empty, matched zero rows under
+                # RLS, and SQLAlchemy raised:
+                #
+                #     StaleDataError: UPDATE statement on table 'agent_workflows' expected to
+                #     update 1 row(s); 0 were matched.
+                #
+                # Seen in production within seconds of revoking BYPASSRLS, then rolled back. The SELECT
+                # had succeeded - the row was loaded under the binding - so the fault was specific to
+                # the WRITE path, which is exactly the path a candidate-set equivalence check does not
+                # cover. Flushing per workflow is also better on its own terms: one row's failure no
+                # longer abandons the rows before it in the same flush.
+                self.db.flush()
         metrics.inc("fleet.dispatched", result.dispatched)
         metrics.set_gauge("queue.dispatch_batch", float(result.scanned))
         return result

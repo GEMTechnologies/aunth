@@ -342,6 +342,76 @@ def test_tenant_scope_is_used_around_the_row_load():
 
 
 # ===========================================================================
+# THE WRITE PATH - the bug the candidate-set equivalence check did NOT catch
+# ===========================================================================
+def test_the_flush_happens_inside_the_tenant_scope():
+    """THE PRODUCTION BUG, and the most important test in this file.
+
+    The first version ended `dispatch_once` with a single `self.db.flush()` AFTER the loop. By then
+    every `tenant_scope` had cleared the binding, so the UPDATE ran with `app.current_org_id` empty,
+    matched zero rows under RLS, and raised:
+
+        StaleDataError: UPDATE statement on table 'agent_workflows' expected to update 1 row(s);
+        0 were matched.
+
+    It appeared within seconds of revoking BYPASSRLS on the live fleet. The SELECT had succeeded - the
+    row loaded fine under the binding - so the equivalence check over candidate sets passed while the
+    WRITE was broken. Reads and writes are different paths and both need their own assertion.
+
+    The flush must therefore appear INSIDE the `with self.tenant_scope(...)` block.
+    """
+    source = (BACKEND / "agent" / "workflow_engine.py").read_text(encoding="utf-8")
+    dispatch = source.split("def dispatch_once", 1)[1].split("def _enqueue", 1)[0]
+
+    scope_at = dispatch.index("with self.tenant_scope(org_id):")
+    scope_body = dispatch[scope_at:]
+
+    # Indentation is how Python marks the block: the scope's body is indented one level deeper than
+    # the `with`. Find the flush that sits at that depth and require it before the loop ends.
+    scope_line = dispatch[scope_at:].splitlines()[0]
+    body_indent = len(scope_line) - len(scope_line.lstrip()) + 4
+    assert "self.db.flush()" in scope_body, (
+        "no flush inside the tenant scope; pending writes would flush after the binding is cleared"
+    )
+    for line in scope_body.splitlines()[1:]:
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent < body_indent:
+            break  # left the scope body
+        if "self.db.flush()" in line:
+            assert indent >= body_indent, "the flush is not inside the scope"
+            return
+    raise AssertionError("the flush is outside the tenant scope block")
+
+
+def test_discovery_flushes_inside_the_agent_scope_too():
+    """`discover_opportunity_work` writes through `GranadaAgentService.schedule()`. Those rows are
+    subject to the same policy as the dispatcher's UPDATE, so they need the same treatment."""
+    source = (BACKEND / "agent" / "workflow_engine.py").read_text(encoding="utf-8")
+    discovery = source.split("def discover_opportunity_work", 1)[1].split("def dispatch_once", 1)[0]
+    scope_at = discovery.index("with self.tenant_scope(org_id):")
+    assert "self.db.flush()" in discovery[scope_at:], (
+        "discovery never flushes inside the agent scope; its writes would flush unbound"
+    )
+
+
+def test_no_bare_flush_remains_at_the_end_of_dispatch_once():
+    """Guards the exact regression: a trailing `self.db.flush()` dedented to method level."""
+    source = (BACKEND / "agent" / "workflow_engine.py").read_text(encoding="utf-8")
+    dispatch = source.split("def dispatch_once", 1)[1].split("def _enqueue", 1)[0]
+    lines = dispatch.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() != "self.db.flush()":
+            continue
+        indent = len(line) - len(line.lstrip())
+        assert indent > 8, (
+            f"line {index}: a method-level flush remains in dispatch_once - it runs after the "
+            "tenant binding is cleared and will fail under RLS"
+        )
+
+
+# ===========================================================================
 # THE SECOND CROSS-TENANT SWEEP: mail reconciliation
 # ===========================================================================
 def test_mail_sync_accepts_an_org_scope():
