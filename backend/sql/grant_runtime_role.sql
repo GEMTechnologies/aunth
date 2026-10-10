@@ -124,7 +124,20 @@ BEGIN
         -- Phase 10 notification evidence. DELETE is revoked on all three; UPDATE only on
         -- the delivery records, because a notification's OWN status must advance from
         -- UNREAD to READ to ACTIONED while its delivery evidence must not change at all.
-        'notification_deliveries', 'notifications', 'notification_preferences'
+        'notification_deliveries', 'notifications', 'notification_preferences',
+        -- Phase 11 credentials. THE TENTH OCCURRENCE, and the first for a table whose rows are
+        -- SECRETS rather than history.
+        --
+        -- DELETE is withheld because a credential is revoked by destroying its ciphertext, not by
+        -- deleting the row: the row is what answers "when did this connection stop working". UPDATE is
+        -- deliberately NOT withheld - rotating a credential is an UPDATE, and a store that could not
+        -- rotate would force operators to delete and recreate, losing that history.
+        --
+        -- Caught by verifying the DEPLOYED posture: `has_table_privilege('granada_app',
+        -- 'credential_secrets','DELETE')` returned TRUE immediately after migration 019 revoked it,
+        -- because the blanket grant at line 36 is additive and runs after every migration. The same
+        -- trap has now fired ten times, and it has never once been caught by reading this file.
+        'credential_secrets'
     ]
     LOOP
         IF EXISTS (
