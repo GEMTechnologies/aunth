@@ -2299,7 +2299,7 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
             db,
             package,
             action_scope=_browser_scope_for(package, settings),
-            form_data=_verified_form_data(package),
+            form_data=_browser_form_values(db, package),
             # Navigation steps, when an operator supplied a sequence. Absent means the legacy
             # form-fill path, which is what every existing job uses.
             steps=settings.get("browser_steps") or (),
@@ -2388,6 +2388,43 @@ def _browser_summary(outcome: Any) -> str:
     if outcome.status == "UNAVAILABLE":
         return "the browser worker is not available on this host"
     return f"the browser reported {outcome.status}"
+
+
+def _browser_form_values(db: Any, package: Any) -> dict[str, Any]:
+    """Verified answers, PLUS the organisation's own Granada address.
+
+    WHY THE ADDRESS IS ADDED. Every portal registration begins by asking for an email address, and
+    the UN Partner Portal's step is literally "Enter your email address to access" followed by Next.
+    With only the package's verified answers - which hold nothing about email - Granada reached that
+    step and clicked Next without filling it, so the flow could not advance and the verification
+    message it needed to wait for was never triggered. Measured live.
+
+    This is verified data in the strictest sense: Granada PROVISIONED the address, it belongs to this
+    organisation, and it is the mailbox that can actually receive the portal's confirmation. Nothing
+    is invented and nothing is guessed - an organisation with no address simply gains no keys.
+
+    Offered under the names portals actually use, so a field called `email` is filled and one called
+    `organisation_website` is not.
+    """
+    values: dict[str, Any] = dict(_verified_form_data(package) or {})
+    try:
+        identity = (
+            db.query(models.MailIdentity)
+            .filter(
+                models.MailIdentity.org_id == package.org_id,
+                models.MailIdentity.is_primary.is_(True),
+            )
+            .first()
+        )
+        address = getattr(identity, "address", None)
+        if address:
+            for key in ("email", "Email", "EMAIL", "email_address", "emailAddress",
+                        "user_email", "userEmail", "contact_email", "primary_email",
+                        "HRS_APPL_WRK_EMAILID"):
+                values.setdefault(key, address)
+    except Exception:  # noqa: BLE001 - a missing address must not stop the run
+        pass
+    return values
 
 
 def _verified_form_data(package: Any) -> dict[str, str]:

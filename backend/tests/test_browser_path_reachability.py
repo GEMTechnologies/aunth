@@ -388,14 +388,71 @@ def test_blank_questions_and_answers_are_dropped():
 
 def test_the_handler_PASSES_the_verified_values_it_resolves():
     """THE WIRING. The resolver existing is not the same as the handler using it - which is the
-    exact shape of every other defect this file records."""
+    exact shape of every other defect this file records.
+
+    The handler now passes `_browser_form_values`, which is the verified answers PLUS the
+    organisation's own Granada address. The address has to be there: every portal registration opens
+    by asking for an email, and without it Granada reached that step and clicked Next without
+    filling it - so the flow could not advance and the verification message it needed to wait for was
+    never sent. Measured live on the UN Partner Portal.
+    """
     source = (BACKEND / "agent" / "workflow_engine.py").read_text(encoding="utf-8")
     handler = source.split("def _handle_browser_task", 1)[1].split("def _browser_summary", 1)[0]
-    assert "form_data=_verified_form_data(package)" in handler, (
+    assert "form_data=_browser_form_values(db, package)" in handler, (
         "the handler builds a task without the package's verified values, so the browser reaches "
         "every form with nothing to type - and refuses honestly, which is why it looked like a data "
         "gap rather than a wiring one"
     )
+    assert "_browser_form_values" in source, "the resolver the handler calls must exist"
+
+
+def test_the_organisations_own_address_is_offered_to_email_fields():
+    """Granada provisioned the address, so it is verified data - not an invented value."""
+    from agent.workflow_engine import _browser_form_values
+
+    class _Identity:
+        address = "globalmotion@granadac.com"
+
+    class _Query:
+        def filter(self, *a, **k):
+            return self
+
+        def first(self):
+            return _Identity()
+
+    class _Db:
+        def query(self, *a, **k):
+            return _Query()
+
+    class _Package:
+        org_id = "org-1"
+
+    values = _browser_form_values(_Db(), _Package())
+    assert values.get("email") == "globalmotion@granadac.com"
+    assert values.get("email_address") == "globalmotion@granadac.com"
+
+
+def test_an_organisation_with_no_address_gains_no_keys():
+    """Nothing is invented: no address means the verified answers stand alone."""
+    from agent.workflow_engine import _browser_form_values
+
+    class _Query:
+        def filter(self, *a, **k):
+            return self
+
+        def first(self):
+            return None
+
+    class _Db:
+        def query(self, *a, **k):
+            return _Query()
+
+    class _Package:
+        org_id = "org-1"
+        manifest = {"answers": []}
+
+    values = _browser_form_values(_Db(), _Package())
+    assert "email" not in values
 
 
 # ===========================================================================
