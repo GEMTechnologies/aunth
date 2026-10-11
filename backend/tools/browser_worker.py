@@ -1286,11 +1286,23 @@ def _page_fingerprint(provider: Any) -> str:
                  buttons: document.querySelectorAll('button').length,
                  links: document.querySelectorAll('a').length,
                  forms: document.querySelectorAll('form').length,
+                 // CHECKBOX STATE IS PROGRESS. MEASURED: ticking the registration consent changes no
+                 // visible text, no url and no element count - so a fingerprint built only from those
+                 // reported "no change", the bounded-recovery guard fired, the second click UNTICKED
+                 // the box, and the run stopped having done the right thing twice.
+                 //
+                 // Only CHECKED state is included, never text-field VALUES: typing must still not
+                 // look like progress, or a form that rejects an entry would be mistaken for one that
+                 // advanced - which is what this guard exists to prevent.
+                 checked: document.querySelectorAll('input:checked').length,
                })"""
         ) or {}
         # Whitespace collapsed so a re-render with different spacing is not mistaken for progress.
         normalised = " ".join(text.split())[:20000]
-        material = f"{page.url}|{normalised}|{counts.get('inputs')}|{counts.get('buttons')}|{counts.get('forms')}"
+        material = (
+            f"{page.url}|{normalised}|{counts.get('inputs')}|{counts.get('buttons')}|"
+            f"{counts.get('forms')}|{counts.get('checked')}"
+        )
         return hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()[:32]
     except Exception:
         # A page that cannot be read falls back to the URL: the guard then behaves as it did before
