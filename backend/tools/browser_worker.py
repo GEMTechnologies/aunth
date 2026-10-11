@@ -578,6 +578,7 @@ def _run_goal(
     planner_url: str,
     planner_key: str,
     org_id: str,
+    values: Optional[dict[str, Any]] = None,
     verification_url: str = "",
 ) -> tuple[str, list[str], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     """Pursue a high-level objective by choosing actions from what the page actually shows.
@@ -701,6 +702,29 @@ def _run_goal(
 
     unchanged_streak = 0
     for step_index in range(max_steps):
+        # FILL BEFORE ASKING. The planner chooses among clickable controls, so an empty email field on
+        # a registration page is invisible to it - the model sees only "Next" and clicks it, and the
+        # flow cannot advance. Measured live on the UN Partner Portal: two 'Next' clicks, no fill, and
+        # the verification message Granada needed to wait for was never triggered.
+        #
+        # Only VERIFIED values reach this, and only into a field whose name or id matches one, so a
+        # registration form gets the organisation's own address and an unrelated field gets nothing.
+        filled = _fill_from_verified(provider, values)
+        if filled:
+            entry = {"step": step_index, "action": "fill", "field": filled,
+                     "url_before": _safe_url(provider)}
+            result = provider.act(Step.FILL, filled, str(values.get(filled) or _case_get(values, filled)))
+            entry["result"] = "ok" if result.ok else f"failed: {getattr(result, 'detail', '')[:160]}"
+            trace.append(entry)
+            completed.append(f"FILL:{filled}")
+            shoot(f"goal-{step_index}-fill")
+            if not result.ok:
+                return ("BLOCKED", completed,
+                        [{"kind": "EXECUTION_FAILED",
+                          "detail": f"could not fill {filled!r} with the organisation's verified value"}],
+                        shots, trace)
+            continue
+
         inventory = _control_inventory(provider)
         if not inventory:
             return ("BLOCKED", completed,
@@ -938,6 +962,50 @@ def _first_text_input(provider: Any) -> str:
         ) or "")
     except Exception:
         return ""
+
+
+def _case_get(values: dict[str, Any], field: str) -> Any:
+    """Look a field up in the verified values, ignoring case.
+
+    Portals name the same field `email`, `Email` and `EMAIL`; the container offers several spellings,
+    but a page can use a capitalisation neither of us listed and a case-sensitive miss would look
+    exactly like having no value at all.
+    """
+    if field in values:
+        return values[field]
+    lowered = field.strip().lower()
+    for key, value in values.items():
+        if key.strip().lower() == lowered:
+            return value
+    return None
+
+
+def _fill_from_verified(provider: Any, values: dict[str, Any]) -> str:
+    """The name of ONE empty visible field Granada holds a verified value for, or "".
+
+    Returns a single field rather than doing them all, so every fill is observed on its own: a site
+    that reacts to the first field (revealing or clearing others) is handled on the next turn instead
+    of having stale names filled into it.
+    """
+    if not values:
+        return ""
+    try:
+        names = list(provider._page.evaluate(
+            """() => Array.from(document.querySelectorAll('input'))
+                 .filter(e => {
+                   const t = (e.type || 'text').toLowerCase();
+                   return ['text','email','tel','number',''].includes(t)
+                     && e.offsetParent !== null && !e.disabled && !e.readOnly && !e.value;
+                 })
+                 .map(e => e.name || e.id || '')
+                 .filter(Boolean)"""
+        ) or [])
+    except Exception:
+        return ""
+    for name in names:
+        if _case_get(values, name) not in (None, ""):
+            return str(name)
+    return ""
 
 
 def _sweep_stale_profiles(*, keep: str | None, now: float | None = None) -> list[str]:
@@ -1184,6 +1252,7 @@ def main() -> int:
                 planner_url=str(payload.get("planner_url") or ""),
                 planner_key=str(payload.get("planner_key") or ""),
                 org_id=str(payload.get("org_id") or ""),
+                values=values,
                 verification_url=str(payload.get("verification_url") or ""),
             )
             _emit({
