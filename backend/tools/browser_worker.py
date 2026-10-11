@@ -611,6 +611,10 @@ def _control_inventory(provider: Any) -> list[dict[str, Any]]:
                      e.setAttribute('data-granada-ref', 'g' + i);
                      return {ref: 'g' + i, tag: e.tagName, type: e.type||'', name: e.name||'',
                              id: e.id||'', role: e.getAttribute('role')||'',
+                             // ALREADY-DONE STATE. A ticked consent is finished work; without this the
+                             // model re-chose it on every turn, toggling it on and off until the step
+                             // budget ran out - measured, five identical clicks.
+                             checked: !!(e.checked || e.getAttribute('aria-checked') === 'true'),
                              text: nameOf(e).slice(0,80)};
                    })
                    .filter(c => c.text)
@@ -864,21 +868,45 @@ def _run_goal(
             or str(c.get("role") or "").lower() in ("button", "checkbox", "link", "tab")
             or c.get("type") in ("submit", "button", "checkbox", "radio")
         ]
-        options = []
+        # A TICKED CONTROL IS FINISHED WORK, so it is not offered again. Without this the model
+        # re-chose the registration consent every turn, toggling it on and off until the budget ran
+        # out - measured, five identical clicks that each registered as progress.
+        offered: list[dict[str, Any]] = []
         for c in actionable[:20]:
             label = c.get("text") or c.get("name") or c.get("id") or ""
             if not label.strip():
                 continue
+            if c.get("checked") and str(c.get("type") or "").lower() in ("checkbox", "radio"):
+                continue
             if _is_forbidden_control(label, c.get("tag", "")) and not submission_authorised:
                 continue  # refused, not offered
-            options.append({"id": c.get("id") or "", "text": label, "tag": c.get("tag"),
+            offered.append({"id": c.get("id") or "", "text": label, "tag": c.get("tag"),
                             "ref": c.get("ref") or ""})
 
-        if not options:
+        if not offered:
+            # EVERY REMAINING CONTROL IS ONE THE POLICY REFUSES. Report it as a human gate with the
+            # control NAMED, rather than offering nothing and letting the loop spend its budget:
+            # an operator needs to be told which control needs them, not that the run stopped.
+            gated = [
+                (c.get("text") or "").strip() for c in actionable[:20]
+                if (c.get("text") or "").strip()
+                and _is_forbidden_control(str(c.get("text")), c.get("tag", ""))
+            ]
+            if gated:
+                return ("BLOCKED", completed,
+                        [{"kind": "AWAITING_HUMAN",
+                          "detail": (f"the only controls left are consequential and submission is not "
+                                     f"authorised: {', '.join(sorted(set(gated))[:5])}"),
+                          "prompt": (f"Review and activate {', '.join(sorted(set(gated))[:3])} in the "
+                                     f"browser, or authorise this submission, then resume."),
+                          "resumable": True}],
+                        shots, trace)
             return ("BLOCKED", completed,
                     [{"kind": "NO_ACTION_SELECTED",
-                      "detail": "every visible control is blank or consequential; refusing to guess"}],
+                      "detail": "every visible control is blank or already handled; refusing to guess"}],
                     shots, trace)
+
+        options = offered
 
         try:
             decision = ask_planner(
