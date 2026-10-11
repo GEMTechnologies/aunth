@@ -191,6 +191,16 @@ class BrowserTask:
     #: Opaque progress token from a previous attempt, if this is a resume.
     checkpoint: Optional[str] = None
     max_attempts: int = 3
+
+    #: ORDERED NAVIGATION OPERATIONS, or empty for the legacy form-fill behaviour.
+    #:
+    #: The set `browser_worker._run_explicit_steps` executes: navigate, observe, click, fill, select,
+    #: wait, extract, stop. `steps=()` MUST reproduce the previous behaviour exactly - every existing
+    #: job relies on the form-fill path, so that is a compatibility contract and not a courtesy.
+    #:
+    #: Each step targets a VISIBLE control (by its text) or a named field. No CSS selector is
+    #: accepted, because a selector is a guess about a layout Granada has not seen.
+    steps: tuple[dict[str, Any], ...] = ()
     created_at: Optional[datetime] = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -206,6 +216,8 @@ class BrowserTask:
             # and refuses to report completion without having visited a page, so omitting it here
             # means every job-path invocation stops before it opens anything.
             "target_url": self.target_url,
+            # THE KEY THE WORKER READS FOR NAVIGATION. Omitted, every task falls back to form-fill.
+            "steps": [dict(s) for s in self.steps],
             "credentials": [c.as_dict() for c in self.credentials],
             "form_data": self.form_data,
             "documents": self.documents,
@@ -338,6 +350,7 @@ def build_task(
     credentials: Optional[list[CredentialRef]] = None,
     checkpoint: Optional[str] = None,
     max_attempts: int = 3,
+    steps: Any = (),
 ) -> BrowserTask:
     """Assemble a task for one package.
 
@@ -376,6 +389,7 @@ def build_task(
         # here is what makes `validate_task`'s target check real rather than a `getattr` on a field
         # that did not exist, and it is what the worker needs in order to open anything at all.
         target_url=getattr(package, "target_url", None),
+        steps=tuple(dict(s) for s in (steps or ()) if isinstance(s, dict)),
         credentials=list(credentials or []),
         # Verified form data only. An empty dict is the honest default: the platform does not
         # fabricate a value to make a form look complete.

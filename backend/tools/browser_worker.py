@@ -340,6 +340,194 @@ class PlaywrightProvider:
 STALE_PROFILE_SECONDS = 6 * 60 * 60
 
 
+def _run_explicit_steps(
+    provider: Any,
+    steps: list[Any],
+    *,
+    evidence: Any,
+    max_steps: int,
+) -> tuple[str, list[str], list[dict[str, Any]], list[str]]:
+    """Execute an ordered list of navigation operations against the LIVE page.
+
+    WHY THIS EXISTS. `plan_next` is a form-fill planner: it walks the page's fields, fills what
+    Granada holds verified values for, and returns BLOCKED on anything it cannot answer. It has no
+    way to express "activate the control labelled X", so a task with no form values produced zero
+    steps - reported honestly as NOTHING_ACHIEVED, and misread as a broken browser. This is the
+    missing operation set.
+
+    The sequence is supplied by the caller, so nothing here is site-specific: the worker is told
+    *which visible control* to activate, never a CSS selector, and every action is recorded with the
+    page it was taken on and the page it produced.
+
+    Returns (status, completed, trace, evidence_refs). Status is COMPLETED only when every step ran;
+    a step that fails stops the run with its classification rather than being retried blindly.
+    """
+    from agent.browser_runtime import Step
+
+    completed: list[str] = []
+    trace: list[dict[str, Any]] = []
+    shots: list[str] = []
+
+    def shoot(label: str) -> None:
+        """Persist a screenshot through the EXISTING evidence store, or record that it failed.
+
+        `provider.screenshot()` returns a path; the store takes a Path and a name. Failure is
+        swallowed deliberately - losing a screenshot must not abort a run that is otherwise
+        succeeding, but the reference is then simply absent rather than fabricated.
+        """
+        if evidence is None:
+            return
+        try:
+            import pathlib as _pathlib
+
+            raw = provider.screenshot()
+            if not raw:
+                return
+            stored = evidence.store(
+                kind="screenshot", source=_pathlib.Path(raw), name=f"{label}.png"
+            )
+            ref = getattr(stored, "reference", None) or getattr(stored, "name", None)
+            if ref:
+                shots.append(str(ref))
+        except Exception:
+            return
+
+    if len(steps) > max_steps:
+        return (
+            "FAILED",
+            completed,
+            [{"kind": "RESOURCE_LIMIT",
+              "detail": f"{len(steps)} steps exceeds the budget of {max_steps}"}],
+            shots,
+        )
+
+    for index, raw in enumerate(steps):
+        if not isinstance(raw, dict):
+            return ("FAILED", completed,
+                    [{"kind": "BAD_STEP", "detail": f"step {index} is not an object"}], shots)
+
+        op = str(raw.get("op") or "").strip().lower()
+        before = _safe_url(provider)
+        entry: dict[str, Any] = {"index": index, "op": op, "url_before": before}
+
+        try:
+            if op == "navigate":
+                url = str(raw.get("url") or "")
+                if not url:
+                    return ("FAILED", completed,
+                            [{"kind": "BAD_STEP", "detail": "navigate requires url"}], shots)
+                provider.goto(url)
+                entry["target"] = url
+
+            elif op == "observe":
+                state = provider.observe()
+                entry["title"] = getattr(state, "title", "")
+                entry["controls"] = _control_inventory(provider)
+
+            elif op == "click":
+                target = str(raw.get("text") or raw.get("target") or "")
+                if not target:
+                    return ("FAILED", completed,
+                            [{"kind": "BAD_STEP", "detail": "click requires a visible text or target"}], shots)
+                result = provider.act(Step.CLICK, target)
+                if not result.ok:
+                    failure = getattr(result, "failure", None)
+                    failure_name = getattr(failure, "value", str(failure))
+                    # A human-verification wall is an ANSWER, not an obstacle to retry around.
+                    kind = ("ACCESS_DENIED" if failure_name == "ACCESS_DENIED"
+                            else "HUMAN_VERIFICATION" if failure_name == "HUMAN_VERIFICATION"
+                            else "EXECUTION_FAILED")
+                    return ("BLOCKED", completed,
+                            [{"kind": kind, "detail": f"click {target!r} failed: {getattr(result, 'detail', '')}",
+                              "classification": failure_name}], shots)
+                entry["target"] = target
+
+            elif op == "fill":
+                field = str(raw.get("name") or raw.get("target") or "")
+                value = str(raw.get("value") or "")
+                if not field:
+                    return ("FAILED", completed,
+                            [{"kind": "BAD_STEP", "detail": "fill requires a field name"}], shots)
+                result = provider.act(Step.FILL, field, value)
+                if not result.ok:
+                    return ("BLOCKED", completed,
+                            [{"kind": "EXECUTION_FAILED",
+                              "detail": f"fill {field!r} failed: {getattr(result, 'detail', '')}"}], shots)
+                entry["target"] = field
+
+            elif op == "select":
+                field = str(raw.get("name") or raw.get("target") or "")
+                value = str(raw.get("value") or "")
+                provider.select_option(field, value)
+                entry["target"] = field
+
+            elif op == "wait":
+                provider.wait_for(str(raw.get("condition") or "load"))
+                entry["condition"] = raw.get("condition")
+
+            elif op == "extract":
+                state = provider.observe()
+                entry["fields"] = sorted((getattr(state, "fields", {}) or {}).keys())
+                entry["title"] = getattr(state, "title", "")
+
+            elif op == "stop":
+                reason = str(raw.get("reason") or "the task asked to stop here")
+                entry["reason"] = reason
+                trace.append(entry)
+                shoot(f"step-{index}-stop")
+                return ("BLOCKED", completed, [{"kind": "STOPPED", "detail": reason}], shots)
+
+            else:
+                return ("FAILED", completed,
+                        [{"kind": "UNSUPPORTED_OP", "detail": f"unsupported operation {op!r}"}], shots)
+
+        except Exception as exc:
+            return ("FAILED", completed,
+                    [{"kind": "EXECUTION_FAILED",
+                      "detail": f"{op} raised {type(exc).__name__}: {str(exc)[:200]}"}], shots)
+
+        entry["url_after"] = _safe_url(provider)
+        entry["changed"] = entry["url_after"] != before
+        trace.append(entry)
+        completed.append(op if op != "click" else f"CLICK:{entry.get('target', '')}")
+        shoot(f"step-{index}-{op}")
+
+    return ("COMPLETED", completed, [], shots)
+
+
+def _safe_url(provider: Any) -> str:
+    try:
+        return str(provider._page.url)
+    except Exception:
+        return ""
+
+
+def _safe_title(provider: Any) -> str:
+    try:
+        return str(provider._page.title())
+    except Exception:
+        return ""
+
+
+def _control_inventory(provider: Any) -> list[dict[str, Any]]:
+    """The VISIBLE controls, as the plan is allowed to choose from.
+
+    Read from the live document rather than from a selector list, so a site Granada has never seen is
+    still describable. Only offsetParent-visible elements are returned: an invisible control cannot
+    be activated, and offering one invites a plan that cannot be executed.
+    """
+    try:
+        return provider._page.evaluate(
+            """() => Array.from(document.querySelectorAll('input,button,a,select'))
+                 .filter(e => e.offsetParent !== null)
+                 .slice(0, 60)
+                 .map(e => ({tag: e.tagName, type: e.type||'', name: e.name||'', id: e.id||'',
+                             text: (e.innerText||e.value||'').trim().slice(0,80)}))"""
+        )
+    except Exception:
+        return []
+
+
 def _sweep_stale_profiles(*, keep: str | None, now: float | None = None) -> list[str]:
     """Remove abandoned profile directories. Best-effort, bounded, and never fatal.
 
@@ -557,6 +745,26 @@ def main() -> int:
             })
             return 0
         provider.goto(target_url)
+
+        # EXPLICIT NAVIGATION STEPS TAKE PRECEDENCE, and leave the legacy path untouched when
+        # absent: `steps=()` must reproduce the form-fill behaviour byte-for-byte, because every
+        # existing job depends on it.
+        explicit = payload.get("steps") or []
+        if explicit:
+            status, completed, problems, shots = _run_explicit_steps(
+                provider, explicit, evidence=evidence, max_steps=int(payload.get("max_steps") or 12)
+            )
+            _emit({
+                "status": status,
+                "outcome_certain": True,
+                "completed_steps": completed,
+                "problems": problems,
+                "evidence": shots,
+                "final_url": _safe_url(provider),
+                "final_title": _safe_title(provider),
+            })
+            return 0
+
         report = runtime.run(
             task, skip_launch=True,
             values=values,

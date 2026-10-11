@@ -2278,6 +2278,9 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
             package,
             action_scope=_browser_scope_for(package, settings),
             form_data=_verified_form_data(package),
+            # Navigation steps, when an operator supplied a sequence. Absent means the legacy
+            # form-fill path, which is what every existing job uses.
+            steps=settings.get("browser_steps") or (),
         )
     except Exception as exc:
         # build_task refuses an unready package. That refusal is the readiness engine doing its job,
