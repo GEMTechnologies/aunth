@@ -921,6 +921,12 @@ def _run_goal(
             shots, trace)
 
 
+#: Secrets that exist only for the length of THIS run, registered so the output scrubber can remove
+#: them. Portals often echo a rejected value back into an error message, and a password that reaches
+#: stdout would be written into the job's outcome, its activity record and its trace - permanently.
+_RUN_SECRETS: set[str] = set()
+
+
 def _log(message: str) -> None:
     """Diagnostics to stderr. The worker's stdout is a JSON contract; nothing may pollute it."""
     print(f"browser_worker: {message}", file=sys.stderr, flush=True)
@@ -1078,7 +1084,7 @@ def _emit(outcome: dict) -> None:
         from agent.output_scrub import OutputScrubber
 
         scrubber = OutputScrubber(
-            [os.environ.get("GRANADA_PORTAL_PASSWORD", ""), os.environ.get("GRANADA_PORTAL_USER", "")]
+            [os.environ.get("GRANADA_PORTAL_PASSWORD", ""), os.environ.get("GRANADA_PORTAL_USER", ""), *_RUN_SECRETS]
         )
         out = dict(scrubber.scrub(outcome))
         out["scrub"] = scrubber.report()
@@ -1174,6 +1180,18 @@ def main() -> int:
         return 0
 
     values = {k: str(v) for k, v in (payload.get("form_data") or {}).items() if v not in (None, "")}
+
+    # REGISTER THE GENERATED PASSWORD BEFORE ANYTHING CAN PRINT IT. A portal that rejects a password
+    # routinely echoes it back, and that string would otherwise be written into the job outcome, the
+    # activity record and the trace - permanently, in tables other people can read.
+    try:
+        from agent.portal_accounts import PASSWORD_FIELD_NAMES as _PASSWORD_NAMES
+
+        for _name in _PASSWORD_NAMES:
+            if values.get(_name):
+                _RUN_SECRETS.add(str(values[_name]))
+    except Exception:  # noqa: BLE001 - scrubbing must never be able to stop a run
+        pass
     uploads = {
         d.get("field") or d.get("doc_type") or "file": d.get("path", "")
         for d in (payload.get("documents") or [])
@@ -1340,7 +1358,7 @@ def main() -> int:
         from agent.output_scrub import OutputScrubber
 
         scrubber = OutputScrubber(
-            [os.environ.get("GRANADA_PORTAL_PASSWORD", ""), os.environ.get("GRANADA_PORTAL_USER", "")]
+            [os.environ.get("GRANADA_PORTAL_PASSWORD", ""), os.environ.get("GRANADA_PORTAL_USER", ""), *_RUN_SECRETS]
         )
         out = scrubber.scrub(out)
         out["scrub"] = scrubber.report()

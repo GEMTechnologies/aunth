@@ -2424,6 +2424,35 @@ def _browser_form_values(db: Any, package: Any) -> dict[str, Any]:
                 values.setdefault(key, address)
     except Exception:  # noqa: BLE001 - a missing address must not stop the run
         pass
+
+    # THE ACCOUNT'S PASSWORD, created once and read back on every later run.
+    #
+    # A registration that cannot set a password stops at the password page - measured live: the UN
+    # Partner Portal reached it and no progress was possible. The credential is generated and stored
+    # BEFORE the run uses it, because a password that exists only in the worker's memory is one a
+    # crash loses along with the account it opens. `ensure_account` is idempotent, so a later login
+    # reuses the same password rather than orphaning the account with a new one.
+    #
+    # A store that cannot be built (no encryption key configured) leaves the values untouched: the
+    # run then stops at the password page and says so, which is honest, instead of inventing one.
+    try:
+        from config import settings as _settings
+        from agent.credential_store import store_from_settings
+        from agent.portal_accounts import ensure_account
+        from urllib.parse import urlparse
+
+        host = urlparse(getattr(package, "target_url", "") or "").hostname
+        if host and values.get("email"):
+            store = store_from_settings(db, _settings)
+            account = ensure_account(
+                store, org_id=package.org_id, portal_host=host, email=str(values["email"]),
+            )
+            values.update(account.values())
+    except Exception as exc:  # noqa: BLE001
+        logger.info(
+            "portal_account_unavailable",
+            extra={"org_id": getattr(package, "org_id", None), "reason": f"{type(exc).__name__}"},
+        )
     return values
 
 
