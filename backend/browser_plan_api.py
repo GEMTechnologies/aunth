@@ -260,6 +260,68 @@ def verification_status(request_id: str, org_id: str) -> dict[str, Any]:
         db.close()
 
 
+class AccountIn(BaseModel):
+    org_id: str
+    portal_host: str
+    email: str
+
+
+class AccountOut(BaseModel):
+    ok: bool = False
+    email: str = ""
+    password: str = ""
+    field_names: list[str] = Field(default_factory=list)
+    created_now: bool = False
+    detail: str = ""
+
+
+@router.post("/account", response_model=AccountOut, summary="The portal account for this org")
+def account(payload: AccountIn, _: str = Depends(require_plan_key)) -> AccountOut:
+    """Create or return the account Granada registers with, at the APPLICATION boundary.
+
+    WHY THIS IS NOT DONE IN THE EXECUTOR. `credential_secrets` carries ADR-0011's RESTRICTIVE policy
+    `credential_secrets_fleet_denied`, which denies `granada_fleet` ALL access on purpose - a
+    compromised worker must never read an organisation's credentials. The browser handler runs on the
+    fleet credential, so inserting there violates the policy; measured live it crash-looped the
+    executor. That restriction is not weakened to make this convenient.
+
+    So the privileged side acts and the sandboxed side asks - the same split as the planner. This runs
+    on `SessionLocal`, the application role, where the credential store already works.
+
+    The password is returned over the authenticated internal call and held ONLY in the worker's memory
+    for the length of one run. It is never written to a job payload, an activity record or a log; the
+    worker registers it with its output scrubber before anything can print it.
+    """
+    from database import SessionLocal
+    from agent.credential_store import store_from_settings
+    from agent.portal_accounts import PASSWORD_FIELD_NAMES, ensure_account
+
+    if not payload.org_id:
+        return AccountOut(detail="org_id is required; tenant unknown is a deny")
+    if not payload.portal_host or not payload.email:
+        return AccountOut(detail="a portal account needs both a host and an address")
+
+    db = SessionLocal()
+    try:
+        store = store_from_settings(db, settings)
+        created = ensure_account(
+            store, org_id=payload.org_id,
+            portal_host=payload.portal_host, email=payload.email,
+        )
+        db.commit()
+        return AccountOut(
+            ok=True, email=created.email, password=created.password,
+            field_names=list(PASSWORD_FIELD_NAMES), created_now=created.created_now,
+        )
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        # The reason is returned, never the secret.
+        logger.warning("portal account unavailable: %s: %s", type(exc).__name__, str(exc)[:200])
+        return AccountOut(detail=f"{type(exc).__name__}: {str(exc)[:200]}")
+    finally:
+        db.close()
+
+
 @router.post("/plan", response_model=PlanOut, summary="Choose the next browser action")
 def plan(
     payload: PlanIn,

@@ -580,6 +580,8 @@ def _run_goal(
     org_id: str,
     values: Optional[dict[str, Any]] = None,
     verification_url: str = "",
+    account_url: str = "",
+    portal_host: str = "",
 ) -> tuple[str, list[str], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     """Pursue a high-level objective by choosing actions from what the page actually shows.
 
@@ -615,6 +617,28 @@ def _run_goal(
     # Derived from the planner URL when not given, so a deployment configures one endpoint.
     if not verification_url:
         verification_url = planner_url.rsplit("/", 1)[0] + "/verification"
+    if not account_url:
+        account_url = planner_url.rsplit("/", 1)[0] + "/account"
+
+    # THE PORTAL ACCOUNT, fetched once per run from the application boundary. Its password joins the
+    # verified values under the names portals use, and is registered as a run secret so it can never
+    # reach stdout - a portal that rejects a password routinely echoes it back.
+    if values is None:
+        values = {}
+    fetched = _fetch_portal_account(
+        account_url=account_url, planner_key=planner_key, org_id=org_id,
+        portal_host=portal_host, email=str(values.get("email") or ""),
+    )
+    if fetched.get("ok") and fetched.get("password"):
+        for name in (fetched.get("field_names") or []):
+            values.setdefault(str(name), str(fetched["password"]))
+        _RUN_SECRETS.add(str(fetched["password"]))
+        trace_account = {"account_created_now": bool(fetched.get("created_now")),
+                         "account_email": fetched.get("email")}
+    else:
+        # No account means the run will stop at the password page. Recorded rather than hidden: the
+        # operator needs to know that is why, and it is not a browser failure.
+        trace_account = {"account_unavailable": str(fetched.get("detail") or "no account endpoint")[:200]}
 
     def ask_planner(*, url: str, title: str, controls: list[dict[str, Any]], page_text: str = "") -> dict[str, Any]:
         """One authenticated planning request. Bounded by a timeout so a wedged planner cannot hang
@@ -701,6 +725,9 @@ def _run_goal(
             trace.append({"evidence_error": f"screenshot returned nothing for {label}"})
 
     unchanged_streak = 0
+    # The account outcome is the first trace entry, so an operator can see immediately whether this
+    # run had a password at all before reading the steps that follow.
+    trace.append({"step": -1, "action": "account", **trace_account})
     for step_index in range(max_steps):
         # FILL BEFORE ASKING. The planner chooses among clickable controls, so an empty email field on
         # a registration page is invisible to it - the model sees only "Next" and clicks it, and the
@@ -925,6 +952,39 @@ def _run_goal(
 #: them. Portals often echo a rejected value back into an error message, and a password that reaches
 #: stdout would be written into the job's outcome, its activity record and its trace - permanently.
 _RUN_SECRETS: set[str] = set()
+
+
+def _fetch_portal_account(
+    *, account_url: str, planner_key: str, org_id: str, portal_host: str, email: str
+) -> dict[str, Any]:
+    """Ask the CONTAINER for the portal account, at the application boundary.
+
+    The executor cannot read credentials: ADR-0011's RESTRICTIVE policy denies the fleet role all
+    access to `credential_secrets`, and doing it there was measured as a policy violation that
+    crash-looped the executor. The api role can, so the privileged side creates and returns it over
+    this authenticated call and the worker holds it only in memory for the length of one run.
+
+    The returned password is registered with the output scrubber by the caller, so a portal echoing a
+    rejected value cannot write it into the job outcome or the activity record.
+    """
+    import urllib.request
+
+    if not account_url or not email:
+        return {}
+    body = json.dumps(
+        {"org_id": org_id, "portal_host": portal_host, "email": email}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        account_url, data=body,
+        headers={"Content-Type": "application/json", "X-Plan-Key": planner_key},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        _log(f"account: {type(exc).__name__}: {exc}")
+        return {}
 
 
 def _log(message: str) -> None:
@@ -1272,6 +1332,10 @@ def main() -> int:
                 org_id=str(payload.get("org_id") or ""),
                 values=values,
                 verification_url=str(payload.get("verification_url") or ""),
+                account_url=str(payload.get("account_url") or ""),
+                portal_host=__import__("urllib.parse", fromlist=["urlparse"]).urlparse(
+                    target_url or ""
+                ).hostname or "",
             )
             _emit({
                 "status": g_status,
