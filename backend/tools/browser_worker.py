@@ -613,12 +613,6 @@ def _run_goal(
             # produced `EVIDENCE: []` and no way to find out why.
             _log(f"evidence: screenshot failed for {label}: {type(exc).__name__}: {exc}")
 
-    try:
-        gateway = DecisionGateway()
-    except Exception as exc:
-        return ("FAILED", completed, [{"kind": "PLANNER_UNAVAILABLE",
-                                       "detail": f"{type(exc).__name__}: {exc}"}], shots, trace)
-
     unchanged_streak = 0
     for step_index in range(max_steps):
         inventory = _control_inventory(provider)
