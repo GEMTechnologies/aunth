@@ -575,11 +575,18 @@ def _control_inventory(provider: Any) -> list[dict[str, Any]]:
                    } catch (_) {}
                    const aria = (e.getAttribute('aria-label') || e.title || '').trim();
                    if (aria) return aria;
-                   // A NEARBY LABEL. MEASURED IN THE JOB: the registration consent is a checkbox whose
-                   // wording sits in a sibling <label> with NO for=/id linkage, so `e.labels` is empty
-                   // and the control had no name at all - it was dropped and the model was never
-                   // offered the one control that would let the wizard continue. A standalone probe
-                   // showed the label existed; only the job's own inventory showed it was unlinked.
+                   // A NEARBY LABEL, FOR FORM CONTROLS ONLY.
+                   //
+                   // MEASURED IN THE JOB: the registration consent is a checkbox whose wording sits in
+                   // a sibling <label> with NO for=/id linkage, so `e.labels` is empty and the control
+                   // had no name at all - it was dropped and the model was never offered the one
+                   // control that would let the wizard continue.
+                   //
+                   // Scoped to INPUT deliberately. Applied to every element, this fallback walked up
+                   // and named the Next BUTTON after its sibling field, so the planner was offered
+                   // "Email" and clicked it - a bug I introduced and the next job run caught. A
+                   // button or link carries its own text; only a bare form control needs a neighbour.
+                   if (e.tagName !== 'INPUT') return '';
                    let node = e.parentElement;
                    for (let i = 0; i < 3 && node; i++, node = node.parentElement) {
                      const lab = node.querySelector('label');
