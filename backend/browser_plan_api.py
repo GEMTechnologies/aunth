@@ -41,17 +41,26 @@ CONSEQUENTIAL = (
 NAVIGATIONAL = ("create account", "register", "sign up", "signup", "apply")
 
 
-def _is_consequential(text: str, tag: str = "") -> bool:
-    """Whether activating this control would make a commitment.
+def _is_consequential(text: str, tag: str = "", ctype: str = "") -> bool:
+    """Whether activating this control could make a consequential COMMITMENT.
 
-    Tag-aware on purpose: `<a>Create account here</a>` opens a registration form, whereas
-    `<button>Register</button>` on that form submits it. Treating both as forbidden is not caution,
-    it is a policy that prevents the task from being done at all.
+    MECHANISM FIRST, WORDING SECOND - and it must agree with the worker's guard, because both are
+    enforced and either one refusing is enough to stop the flow. They disagreed: the worker was taught
+    that a `type="button"` cannot submit, this one still refused REGISTER on its label alone, and the
+    run stopped with "every observed control was blank or consequential" one step past the consent.
+
+    A link navigates. A non-submit button does not submit. Only a submit control commits, and then its
+    wording decides whether it matters.
     """
     lowered = (text or "").strip().lower()
-    if tag.upper() == "A":
-        return any(t in lowered for t in CONSEQUENTIAL if t not in NAVIGATIONAL)
-    return any(t in lowered for t in CONSEQUENTIAL)
+    kind = (tag or "").upper()
+    itype = (ctype or "").strip().lower()
+
+    if kind == "A" or itype in ("checkbox", "radio"):
+        return False
+    if not (itype in ("submit", "") and kind in ("BUTTON", "INPUT")):
+        return False
+    return any(term in lowered for term in CONSEQUENTIAL)
 
 MAX_CONTROLS = 25
 
@@ -410,7 +419,7 @@ def plan(
         label = (control.text or control.name or control.id or "").strip()
         if not label:
             continue
-        if not payload.submission_authorised and _is_consequential(label, control.tag):
+        if not payload.submission_authorised and _is_consequential(label, control.tag, control.type):
             logger.info("planner refused a consequential control: %s", label[:60])
             continue
         offered.append({"tag": control.tag, "id": control.id, "text": label})
