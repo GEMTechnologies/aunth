@@ -573,7 +573,21 @@ def _control_inventory(provider: Any) -> list[dict[str, Any]]:
                    try {
                      if (e.labels && e.labels.length) return (e.labels[0].innerText || '').trim();
                    } catch (_) {}
-                   return (e.getAttribute('aria-label') || e.title || '').trim();
+                   const aria = (e.getAttribute('aria-label') || e.title || '').trim();
+                   if (aria) return aria;
+                   // A NEARBY LABEL. MEASURED IN THE JOB: the registration consent is a checkbox whose
+                   // wording sits in a sibling <label> with NO for=/id linkage, so `e.labels` is empty
+                   // and the control had no name at all - it was dropped and the model was never
+                   // offered the one control that would let the wizard continue. A standalone probe
+                   // showed the label existed; only the job's own inventory showed it was unlinked.
+                   let node = e.parentElement;
+                   for (let i = 0; i < 3 && node; i++, node = node.parentElement) {
+                     const lab = node.querySelector('label');
+                     if (lab && (lab.innerText || '').trim()) return lab.innerText.trim();
+                     const txt = (node.innerText || '').trim();
+                     if (txt && txt.length <= 60) return txt;
+                   }
+                   return '';
                  };
                  return Array.from(document.querySelectorAll('input,button,a,select'))
                    .filter(vis)
