@@ -841,9 +841,14 @@ def _run_goal(
                     shots, trace)
 
         # Only controls that could be activated, and only ones the policy permits.
+        #
+        # CHECKBOXES AND RADIOS ARE ACTIVATABLE. They are not buttons and have no text of their own,
+        # which is exactly why the registration consent was invisible twice over: first unnamed, then
+        # excluded here. Ticking one is how a wizard's consent step is completed.
         actionable = [
             c for c in inventory
-            if c.get("tag") in ("A", "BUTTON") or c.get("type") in ("submit", "button")
+            if c.get("tag") in ("A", "BUTTON")
+            or c.get("type") in ("submit", "button", "checkbox", "radio")
         ]
         options = []
         for c in actionable[:20]:
