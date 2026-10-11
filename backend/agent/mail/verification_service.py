@@ -176,6 +176,11 @@ class VerificationService:
                 matched_any = True
                 row.examined = (row.examined or 0) + 1
                 row.last_reason = outcome.reason[:500]
+                # KEEP THE REAL REASON. Returning the initial placeholder ("no request was waiting")
+                # after a request HAD matched and rejected the message told the operator nothing -
+                # measured live: the API said "no request was waiting" while the row recorded
+                # "the sender 'mail.unpartnerportal.org' is not the portal ...".
+                best = Examination(outcome, request_id=row.id)
             elif not matched_any:
                 best = Examination(outcome, request_id=row.id)
 

@@ -109,6 +109,28 @@ def test_a_subdomain_sender_is_accepted():
     assert out.kind is VerificationKind.CODE
 
 
+def test_portal_mail_from_a_mail_subdomain_is_accepted():
+    """MEASURED LIVE FAILURE. The page is `www.unpartnerportal.org` and the message comes from
+    `mail.unpartnerportal.org`. Comparing full hosts refused a genuine verification email, and the
+    run then waited out its whole window for a code that had already arrived."""
+    out = call(sender="no-reply@mail.unpartnerportal.org",
+               request=request(portal_host="www.unpartnerportal.org"))
+    assert out.kind is VerificationKind.CODE
+
+
+def test_the_bare_domain_matches_the_www_host():
+    out = call(sender="no-reply@unpartnerportal.org",
+               request=request(portal_host="www.unpartnerportal.org"))
+    assert out.kind is VerificationKind.CODE
+
+
+def test_a_lookalike_registered_domain_is_still_refused():
+    """Reducing to the registrable domain must not let an unrelated host through."""
+    out = call(sender="no-reply@unpartnerportal.org.evil.com",
+               request=request(portal_host="www.unpartnerportal.org"))
+    assert out.kind is VerificationKind.NONE
+
+
 # ---------------------------------------------------------------------------
 # Refused - these are the ones that protect the account
 # ---------------------------------------------------------------------------

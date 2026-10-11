@@ -122,18 +122,39 @@ def _host_of(sender: str) -> str:
     return sender.rsplit("@", 1)[-1].strip().lower() if "@" in sender else ""
 
 
+def _registrable(host: str) -> str:
+    """The registrable domain, so `mail.`, `no-reply.` and `www.` subdomains compare equal.
+
+    Portals do not send from the host you are browsing: the page is `www.unpartnerportal.org` and the
+    mail is from `mail.unpartnerportal.org`. Comparing full hosts REFUSED a genuine verification
+    message - measured live - and the run then waited out its whole window for a code that had
+    already arrived.
+    """
+    parts = [p for p in (host or "").strip(".").lower().split(".") if p]
+    if len(parts) <= 2:
+        return ".".join(parts)
+    # Two-label public suffixes (co.uk, com.au, org.za, ...) need three labels kept, or
+    # `ngo.co.ug` and `evil.co.ug` would both reduce to `co.ug` and match each other.
+    if len(parts[-1]) == 2 and parts[-2] in {
+        "co", "com", "org", "net", "gov", "ac", "edu", "or", "ne", "go"
+    }:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
 def _host_matches(sender_host: str, portal_host: str) -> bool:
     """Whether the mail plausibly came from the portal.
 
-    Exact or subdomain, in either direction: a portal often sends from `no-reply@mail.portal.org` or
-    `verify@portal.org`. Deliberately NOT a suffix test on arbitrary strings - `evil-portal.org`
-    ending in `portal.org` would pass a naive `endswith`, so labels are compared.
+    Compared at the REGISTRABLE DOMAIN, not the full host, because portals send from a mail
+    subdomain. That is still strict enough: `evil-unpartnerportal.org` and
+    `unpartnerportal.org.evil.com` both reduce to domains that differ from `unpartnerportal.org`, so
+    an impersonator is still refused - which a naive `endswith` would have allowed.
     """
-    a = sender_host.strip(".").lower()
-    b = portal_host.strip(".").lower()
+    a = _registrable(sender_host)
+    b = _registrable(portal_host)
     if not a or not b:
         return False
-    return a == b or a.endswith("." + b) or b.endswith("." + a)
+    return a == b
 
 
 def _find_code(subject: str, body: str) -> Optional[str]:
