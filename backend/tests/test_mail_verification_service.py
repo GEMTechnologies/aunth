@@ -14,7 +14,15 @@ import models
 from agent.mail.verification_service import VerificationService
 from conftest import make_sqlite_db
 
-NOW = datetime.now(timezone.utc)
+# TIME IS READ PER CALL, NOT ONCE AT IMPORT.
+#
+# It was a module-level constant, and `svc.request()` stamps `requested_at` with the real clock. In a
+# full suite this module is imported during collection and its tests run minutes later, so every
+# `received_at=_now()` fell BEFORE the request was made - outside the window, refused, and the test
+# failed. It passed in isolation and failed in the suite for exactly that reason: a time-dependent
+# test that only holds when the suite is fast.
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @pytest.fixture
@@ -62,7 +70,7 @@ def test_a_matching_message_satisfies_the_request(db):
                       purpose="ngo registration")
     db.commit()
 
-    result = svc.examine(**MAIL, received_at=NOW)
+    result = svc.examine(**MAIL, received_at=_now())
     db.commit()
 
     assert result.satisfied
@@ -83,7 +91,7 @@ def test_the_result_is_readable_by_the_waiting_task(db):
     req = svc.request(address="globalmotion@granadac.com", portal_host="unpartnerportal.org",
                       purpose="ngo registration", browser_task_id="task-123")
     db.commit()
-    svc.examine(**MAIL, received_at=NOW)
+    svc.examine(**MAIL, received_at=_now())
     db.commit()
 
     out = svc.result_for(req.id)
@@ -118,7 +126,7 @@ def test_a_message_to_another_mailbox_does_not_satisfy(db):
                       purpose="ngo registration")
     db.commit()
 
-    result = svc.examine(**{**MAIL, "recipients": ["other-ngo@granadac.com"]}, received_at=NOW)
+    result = svc.examine(**{**MAIL, "recipients": ["other-ngo@granadac.com"]}, received_at=_now())
     db.commit()
 
     assert not result.satisfied
@@ -132,7 +140,7 @@ def test_a_message_from_another_portal_does_not_satisfy(db):
                       purpose="ngo registration")
     db.commit()
 
-    result = svc.examine(**{**MAIL, "sender": "no-reply@evil-unpartnerportal.org"}, received_at=NOW)
+    result = svc.examine(**{**MAIL, "sender": "no-reply@evil-unpartnerportal.org"}, received_at=_now())
     db.commit()
 
     assert not result.satisfied
@@ -149,7 +157,7 @@ def test_a_message_arriving_after_the_window_does_not_satisfy(db):
                       purpose="ngo registration", ttl=timedelta(seconds=1))
     db.commit()
 
-    result = svc.examine(**MAIL, received_at=NOW + timedelta(minutes=10))
+    result = svc.examine(**MAIL, received_at=_now() + timedelta(minutes=10))
     db.commit()
 
     assert not result.satisfied
@@ -164,7 +172,7 @@ def test_a_request_past_its_expiry_is_marked_expired(db):
     svc = _service(db, org)
     req = svc.request(address="globalmotion@granadac.com", portal_host="unpartnerportal.org",
                       purpose="ngo registration")
-    req.expires_at = NOW - timedelta(minutes=1)
+    req.expires_at = _now() - timedelta(minutes=1)
     db.commit()
 
     assert svc.pending() == []
@@ -185,7 +193,7 @@ def test_a_second_organisation_is_not_satisfied_by_the_first_ones_code(db):
                           purpose="ngo registration")
     db.commit()
 
-    svc_a.examine(**MAIL, received_at=NOW)
+    svc_a.examine(**MAIL, received_at=_now())
     db.commit()
 
     assert db.query(models.MailVerificationRequest).filter_by(id=req_a.id).first().status == "SATISFIED"
@@ -200,9 +208,9 @@ def test_a_duplicate_delivery_is_not_a_second_satisfaction(db):
                       purpose="ngo registration")
     db.commit()
 
-    first = svc.examine(**MAIL, received_at=NOW)
+    first = svc.examine(**MAIL, received_at=_now())
     db.commit()
-    second = svc.examine(**MAIL, received_at=NOW + timedelta(seconds=5))
+    second = svc.examine(**MAIL, received_at=_now() + timedelta(seconds=5))
     db.commit()
 
     assert first.satisfied
@@ -219,7 +227,7 @@ def test_a_code_arriving_before_the_request_is_refused(db):
                       purpose="ngo registration")
     db.commit()
 
-    result = svc.examine(**MAIL, received_at=NOW - timedelta(minutes=20))
+    result = svc.examine(**MAIL, received_at=_now() - timedelta(minutes=20))
     db.commit()
 
     assert not result.satisfied
@@ -236,7 +244,7 @@ def test_an_unusable_message_records_what_was_seen(db):
                       purpose="ngo registration")
     db.commit()
 
-    svc.examine(**{**MAIL, "subject": "Newsletter", "body": "No code here."}, received_at=NOW)
+    svc.examine(**{**MAIL, "subject": "Newsletter", "body": "No code here."}, received_at=_now())
     db.commit()
 
     row = db.query(models.MailVerificationRequest).filter_by(id=req.id).first()
