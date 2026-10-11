@@ -657,6 +657,9 @@ def _run_goal(
             "page_text": page_text[:8000],
             "controls": controls,
             "submission_authorised": submission_authorised,
+            # The FLOW STATE, which the objective alone cannot convey: a page mid-form must be
+            # continued, not navigated away from.
+            "has_empty_form": bool(_first_text_input(provider)),
         }).encode("utf-8")
         request = urllib.request.Request(
             planner_url,
@@ -740,17 +743,21 @@ def _run_goal(
         # registration form gets the organisation's own address and an unrelated field gets nothing.
         filled = _fill_from_verified(provider, values)
         if filled:
-            entry = {"step": step_index, "action": "fill", "field": filled,
+            field, value = filled
+            entry = {"step": step_index, "action": "fill", "field": field,
                      "url_before": _safe_url(provider)}
-            result = provider.act(Step.FILL, filled, str(values.get(filled) or _case_get(values, filled)))
+            result = provider.act(Step.FILL, field, value)
             entry["result"] = "ok" if result.ok else f"failed: {getattr(result, 'detail', '')[:160]}"
             trace.append(entry)
-            completed.append(f"FILL:{filled}")
+            # The VALUE is never traced. A password that reached the activity record would be
+            # readable by anyone who can read the database, which is the whole reason the output
+            # scrubber exists.
+            completed.append(f"FILL:{field}")
             shoot(f"goal-{step_index}-fill")
             if not result.ok:
                 return ("BLOCKED", completed,
                         [{"kind": "EXECUTION_FAILED",
-                          "detail": f"could not fill {filled!r} with the organisation's verified value"}],
+                          "detail": f"could not fill {field!r} with the organisation's verified value"}],
                         shots, trace)
             continue
 
@@ -1050,32 +1057,49 @@ def _case_get(values: dict[str, Any], field: str) -> Any:
     return None
 
 
-def _fill_from_verified(provider: Any, values: dict[str, Any]) -> str:
-    """The name of ONE empty visible field Granada holds a verified value for, or "".
+def _password_value(values: dict[str, Any]) -> str:
+    """The portal account's password, if this run holds one."""
+    for name in ("password", "Password", "PASSWORD"):
+        value = values.get(name)
+        if value:
+            return str(value)
+    return ""
+
+
+def _fill_from_verified(provider: Any, values: dict[str, Any]) -> Optional[tuple[str, str]]:
+    """ONE empty visible field Granada can fill, as (field, value), or None.
 
     Returns a single field rather than doing them all, so every fill is observed on its own: a site
     that reacts to the first field (revealing or clearing others) is handled on the next turn instead
     of having stale names filled into it.
+
+    A PASSWORD FIELD IS FILLED WITH THE PASSWORD, whatever it is called. Matching on the field's name
+    alone meant a portal that names it `pass` or `HRS_APPL_WRK_HRS_CONFMPSWD` got nothing, and the run
+    stopped at the password page with the credential in hand. Field TYPE is the semantic signal here,
+    and it is the portal's own declaration rather than a guess of ours.
     """
     if not values:
-        return ""
+        return None
+    password = _password_value(values)
     try:
-        names = list(provider._page.evaluate(
+        candidates = list(provider._page.evaluate(
             """() => Array.from(document.querySelectorAll('input'))
                  .filter(e => {
                    const t = (e.type || 'text').toLowerCase();
-                   return ['text','email','tel','number',''].includes(t)
+                   return ['text','email','tel','number','password',''].includes(t)
                      && e.offsetParent !== null && !e.disabled && !e.readOnly && !e.value;
                  })
-                 .map(e => e.name || e.id || '')
-                 .filter(Boolean)"""
+                 .map(e => ({name: e.name || e.id || '', type: (e.type || 'text').toLowerCase()}))"""
         ) or [])
     except Exception:
-        return ""
-    for name in names:
-        if _case_get(values, name) not in (None, ""):
-            return str(name)
-    return ""
+        return None
+    for entry in candidates:
+        name = str(entry.get("name") or "")
+        if entry.get("type") == "password" and password:
+            return (name, password)
+        if name and _case_get(values, name) not in (None, ""):
+            return (name, str(_case_get(values, name)))
+    return None
 
 
 def _page_fingerprint(provider: Any) -> str:

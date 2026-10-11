@@ -96,6 +96,12 @@ class PlanIn(BaseModel):
     page_text: str = ""
     controls: list[ControlIn] = Field(default_factory=list)
     submission_authorised: bool = False
+    #: True when the page is showing a form with at least one empty, required-looking field.
+    #: MEASURED NEED: the UN Partner Portal's registration wizard offered "Next" and "Learn more"
+    #: after the email step, and the model chose "Learn more" - which navigated to /landing/about and
+    #: abandoned the registration entirely. The objective alone does not tell a planner that it is in
+    #: the middle of a FLOW, so the flow state is supplied explicitly.
+    has_empty_form: bool = False
 
 
 class PlanOut(BaseModel):
@@ -431,7 +437,18 @@ def plan(
                         f"Current page: {payload.title} ({payload.url})\n"
                         "Choose the single control that best advances the objective, by its exact "
                         "text. Choose 'stop' if the objective is already met, or if no offered "
-                        "control can advance it."
+                        "control can advance it.\n"
+                        + (
+                            # THE FLOW CONSTRAINT. Without it the model reasonably reads "Learn more"
+                            # as a way to learn how to register, and leaves the wizard.
+                            "THIS PAGE HAS AN UNFILLED FORM. You are part way through a flow. "
+                            "Prefer the control that CONTINUES THIS FORM (Next, Continue, Proceed, "
+                            "Save and continue). Do NOT choose a link that leaves the flow - About, "
+                            "Learn more, Resources, News, Help, Contact, Privacy, Terms - unless no "
+                            "control continues the form. Do not choose a control that submits, "
+                            "registers or accepts a declaration.\n"
+                            if payload.has_empty_form else ""
+                        )
                     ),
                     options=tuple(options),
                 ),
