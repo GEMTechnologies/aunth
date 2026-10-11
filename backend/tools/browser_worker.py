@@ -568,6 +568,9 @@ def _run_goal(
     evidence: Any,
     max_steps: int,
     submission_authorised: bool,
+    planner_url: str,
+    planner_key: str,
+    org_id: str,
 ) -> tuple[str, list[str], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     """Pursue a high-level objective by choosing actions from what the page actually shows.
 
@@ -594,10 +597,6 @@ def _run_goal(
     # model credentials and no database - so a chain built here could only ever be `rules -> local`,
     # which are evidence engines and cannot answer a navigation question. We ask Granada instead, over
     # an authenticated call, and the host never holds the key that pays for a decision.
-    planner_url = str(payload.get("planner_url") or "")
-    planner_key = str(payload.get("planner_key") or "")
-    org_id = str(payload.get("org_id") or "")
-
     if not planner_url or not planner_key:
         return ("FAILED", completed,
                 [{"kind": "PLANNER_UNAVAILABLE",
@@ -999,6 +998,9 @@ def main() -> int:
                 evidence=evidence,
                 max_steps=int(payload.get("max_steps") or 8),
                 submission_authorised=bool(payload.get("submission_authorised")),
+                planner_url=str(payload.get("planner_url") or ""),
+                planner_key=str(payload.get("planner_key") or ""),
+                org_id=str(payload.get("org_id") or ""),
             )
             _emit({
                 "status": g_status,
