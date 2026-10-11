@@ -948,6 +948,49 @@ class SendService:
         intent.reconciliation_state = models.MailSendAttempt.RECON_ACCEPTED
         self.db.flush()
 
+        # THE SENT COPY. This was missing entirely: `intent.status = SENT` was recorded and NOTHING
+        # was written to the organisation's mailbox, so a delivered message left no trace of itself.
+        # Measured: mail_messages = 0 while a real message had been accepted by SES with a
+        # submission id. A send that leaves no retained copy has failed the requirement even when the
+        # message arrives - the organisation cannot see what was written on its behalf, and a later
+        # reply has no thread to attach to.
+        #
+        # `provider_message_id` is NOT NULL on this table, so the submission id is the fallback: an
+        # accepted send always has one, and a Sent copy with no provider reference is not worth
+        # keeping.
+        provider_ref = (
+            getattr(result, "provider_message_id", None)
+            or getattr(result, "provider_submission_id", None)
+            or getattr(result, "internet_message_id", None)
+        )
+        if provider_ref:
+            body_text = str(getattr(intent, "body_snapshot", "") or "")
+            self.db.add(models.MailMessage(
+                id=str(uuid.uuid4()),
+                org_id=intent.org_id,
+                agent_id=intent.agent_id,
+                mail_account_id=getattr(intent, "mail_account_id", None),
+                thread_id=getattr(intent, "thread_id", None),
+                provider_message_id=str(provider_ref),
+                internet_message_id=getattr(result, "internet_message_id", None),
+                in_reply_to=getattr(intent, "reply_to_message_id", None),
+                direction=models.MailMessage.DIRECTION_OUTBOUND,
+                sender=getattr(intent, "from_address", None),
+                recipients=list(getattr(intent, "to_addresses", None) or []),
+                subject=getattr(intent, "subject", None),
+                body_preview=body_text[:500] or None,
+                sent_at=intent.sent_at,
+                processing_status="SENT",
+                correlation_id=getattr(intent, "correlation_id", None),
+                created_at=_now(),
+            ))
+            # A Sent copy with no event would be invisible to the audit trail that explains it.
+            self._stage_event(
+                event_type="mail.sent_copy_stored",
+                payload={"send_intent_id": intent.id, "provider_message_id": str(provider_ref)},
+            )
+            self.db.flush()
+
         self._stage_event(
             event_type="mail.send_accepted",
             payload={
