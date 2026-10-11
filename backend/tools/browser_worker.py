@@ -926,7 +926,12 @@ def _run_goal(
         moved = _settle(provider)
         entry = {"step": step_index, "url_before": before, "title_before": _safe_title(provider),
                  "options_offered": [o["text"] for o in options], "chosen": chosen,
-                 "confidence": confidence, "planner_provider": provider_name}
+                 "confidence": confidence, "planner_provider": provider_name,
+                 # THE RAW INVENTORY AND PAGE TEXT, recorded at the exact moment the planner is asked.
+                 # A standalone probe and the job disagreed about what was on the page, and the only
+                 # way to settle which is right is to capture it from inside the run that disagrees.
+                 "inventory_raw": list(inventory),
+                 "page_tail": page_text()[-240:]}
 
         if not chosen or chosen.lower() == "stop":
             entry["result"] = "planner chose to stop"
