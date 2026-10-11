@@ -661,19 +661,48 @@ FORBIDDEN_CLICK = (
 NAVIGATIONAL = ("create account", "register", "sign up", "signup", "apply")
 
 
-def _is_forbidden_control(text: str, tag: str = "") -> bool:
-    """Whether activating this control would make a consequential commitment.
+def _is_forbidden_control(text: str, tag: str = "", ctype: str = "") -> bool:
+    """Whether activating this control could make a consequential COMMITMENT.
 
-    Checked against the control's VISIBLE TEXT and its tag, because that is what the planner chooses
-    from. The model is not trusted to police itself: a disallowed action is refused here even when
-    the planner proposes it, which is the difference between a policy and a prompt.
+    THE GUARD ACTS ON THE MECHANISM, NOT ON THE WORDING.
 
-    Tag-aware: `<a>Create account here</a>` opens a registration form; `<button>Register</button>`
-    on that form submits it. Blocking the link would forbid the planner from reaching the page the
-    objective is about.
+    It used to block any control whose label contained "register", "submit", "confirm" and so on. On
+    the UN Partner Portal that refused the interstitial's `REGISTER`, which is
+    `<button type="button">` - a control that CANNOT submit anything. Measured from the inventory. The
+    label said "register"; the mechanism navigates to a signup form, and the commitment is the control
+    on the page beyond it. Refusing on the word cost the whole flow while protecting nothing.
+
+    So the test is now: can this element actually submit?
+      * `type="submit"` (button or input) - YES, and the wording then decides whether it is
+        consequential.
+      * `<a>` - a link navigates. The commitment is on the destination, which is guarded there.
+      * `type="button"`, checkbox, radio - these do not submit by construction. A script behind them
+        could, but then the destination page's own submit control is the gate, and this guard cannot
+        see through a script anyway; pretending otherwise only blocks navigation.
+      * A control with no type inside a form - treated as a submit, because that IS the HTML default.
+
+    This is the SYSTEM deciding by rule rather than the operator deciding per page: mechanism first,
+    wording second, and every real submission still refused.
     """
     lowered = (text or "").strip().lower()
-    if (tag or "").upper() == "A":
+    kind = (tag or "").upper()
+    itype = (ctype or "").strip().lower()
+
+    # A LINK NEVER COMMITS. It navigates; the page it leads to is judged on its own controls.
+    if kind == "A":
+        return False
+
+    # SELECTION IS NOT SUBMISSION.
+    if itype in ("checkbox", "radio"):
+        return False
+
+    # THE MECHANISM. Only a submit control can commit; an explicit non-submit button cannot, and a
+    # button with no type at all defaults to submit and is treated as one.
+    can_submit = itype in ("submit", "") and kind in ("BUTTON", "INPUT")
+    if not can_submit:
+        return False
+
+    if kind == "A":
         return any(term in lowered for term in FORBIDDEN_CLICK if term not in NAVIGATIONAL)
     return any(term in lowered for term in FORBIDDEN_CLICK)
 
@@ -902,7 +931,7 @@ def _run_goal(
                 continue
             if c.get("checked") and str(c.get("type") or "").lower() in ("checkbox", "radio"):
                 continue
-            if _is_forbidden_control(label, c.get("tag", "")) and not submission_authorised:
+            if _is_forbidden_control(label, c.get("tag", ""), c.get("type", "")) and not submission_authorised:
                 # NOT OFFERED, BUT REMEMBERED. When the run later stalls, the reason is usually that
                 # every remaining way forward is one the policy refuses - and "no page change" tells
                 # the operator nothing compared with "REGISTER needs your approval".
@@ -918,7 +947,7 @@ def _run_goal(
             gated = [
                 (c.get("text") or "").strip() for c in actionable[:20]
                 if (c.get("text") or "").strip()
-                and _is_forbidden_control(str(c.get("text")), c.get("tag", ""))
+                and _is_forbidden_control(str(c.get("text")), c.get("tag", ""), c.get("type", ""))
             ]
             if gated:
                 return ("BLOCKED", completed,
@@ -1064,7 +1093,7 @@ def _run_goal(
                           "detail": f"planner chose {chosen!r}, which was not an observed control"}],
                         shots, trace)
 
-        if _is_forbidden_control(match["text"], match.get("tag", "")) and not submission_authorised:
+        if _is_forbidden_control(match["text"], match.get("tag", ""), match.get("type", "")) and not submission_authorised:
             entry["result"] = "REFUSED: consequential control"
             trace.append(entry)
             return ("BLOCKED", completed,
