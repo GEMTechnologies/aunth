@@ -596,9 +596,12 @@ def _control_inventory(provider: Any) -> list[dict[str, Any]]:
                    }
                    return '';
                  };
-                 return Array.from(document.querySelectorAll('input,button,a,select'))
+                 return Array.from(document.querySelectorAll(
+                     "input,button,a,select,[role=button],[role=checkbox],[role=link],[role=tab],label"
+                   ))
                    .filter(vis)
                    .map(e => ({tag: e.tagName, type: e.type||'', name: e.name||'', id: e.id||'',
+                               role: e.getAttribute('role')||'',
                                text: nameOf(e).slice(0,80)}))
                    .filter(c => c.text)
                    .slice(0, 60);
@@ -847,7 +850,8 @@ def _run_goal(
         # excluded here. Ticking one is how a wizard's consent step is completed.
         actionable = [
             c for c in inventory
-            if c.get("tag") in ("A", "BUTTON")
+            if c.get("tag") in ("A", "BUTTON", "LABEL")
+            or str(c.get("role") or "").lower() in ("button", "checkbox", "link", "tab")
             or c.get("type") in ("submit", "button", "checkbox", "radio")
         ]
         options = []
