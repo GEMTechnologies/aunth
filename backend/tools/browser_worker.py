@@ -895,6 +895,7 @@ def _run_goal(
         # re-chose the registration consent every turn, toggling it on and off until the budget ran
         # out - measured, five identical clicks that each registered as progress.
         offered: list[dict[str, Any]] = []
+        gated: list[str] = []
         for c in actionable[:20]:
             label = c.get("text") or c.get("name") or c.get("id") or ""
             if not label.strip():
@@ -902,7 +903,11 @@ def _run_goal(
             if c.get("checked") and str(c.get("type") or "").lower() in ("checkbox", "radio"):
                 continue
             if _is_forbidden_control(label, c.get("tag", "")) and not submission_authorised:
-                continue  # refused, not offered
+                # NOT OFFERED, BUT REMEMBERED. When the run later stalls, the reason is usually that
+                # every remaining way forward is one the policy refuses - and "no page change" tells
+                # the operator nothing compared with "REGISTER needs your approval".
+                gated.append(label.strip())
+                continue
             offered.append({"id": c.get("id") or "", "text": label, "tag": c.get("tag"),
                             "type": c.get("type") or "", "ref": c.get("ref") or ""})
 
@@ -1101,6 +1106,24 @@ def _run_goal(
         if unchanged_streak >= 2:
             # Bounded recovery: two actions with no observable effect means the plan is not working.
             # Retrying a third time is the unbounded clicking the directive forbids.
+            #
+            # WHEN A GATED CONTROL IS PRESENT, SAY SO. On the UN Partner Portal's registration
+            # interstitial the consent gets ticked, the only control that continues is REGISTER, and
+            # REGISTER is refused - so the planner falls back to a Next the overlay blocks and the run
+            # stops. Reporting "no page change" there hides the actual situation: Granada finished
+            # everything it is permitted to do and needs a human for the last control. The operator
+            # gets the name and a prompt instead of a symptom.
+            if gated:
+                names = ", ".join(sorted(set(gated))[:4])
+                return ("BLOCKED", completed,
+                        [{"kind": "AWAITING_HUMAN",
+                          "detail": (f"the flow cannot advance without a control the policy refuses: "
+                                     f"{names}"),
+                          "prompt": (f"Granada completed everything it is authorised to do. Review and "
+                                     f"activate {names} in the browser, or authorise this submission, "
+                                     f"then resume."),
+                          "resumable": True}],
+                        shots, trace)
             return ("BLOCKED", completed,
                     [{"kind": "NO_ACTION_SELECTED",
                       "detail": "two consecutive actions produced no page change; stopping rather "
