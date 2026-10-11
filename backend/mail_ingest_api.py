@@ -29,6 +29,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 
 from config import settings
 
@@ -127,23 +128,30 @@ def ingest(
         db = _session()
 
         # The address is resolved WITHOUT a tenant binding, because that is the question being
-        # asked: whose mailbox is this? Only the address column is read. Everything after this point
-        # runs inside the resolved organisation's scope.
-        identity = (
-            db.query(models.MailIdentity)
-            .filter(models.MailIdentity.address == recipient)
-            .first()
-        )
-        if identity is None:
+        # asked: whose mailbox is this? It goes through a SECURITY DEFINER function rather than a
+        # plain query, because `mail_identities` is RLS-protected and with no binding
+        # `app.current_org()` is NULL - so a direct query returns zero rows and EVERY delivery would
+        # be rejected as "no such mailbox". Measured live before this was added.
+        #
+        # The function is narrowly scoped: one address in, its org/agent/status out. No message
+        # content, no list, no wildcard.
+        resolved = db.execute(
+            text("SELECT identity_id, org_id, agent_id, identity_status "
+                 "FROM mail_org_for_address(:addr)"),
+            {"addr": recipient},
+        ).first()
+
+        if resolved is None:
             # UNKNOWN RECIPIENT. Reported as a rejection so Cloudflare bounces it, rather than being
             # dropped silently: a legitimate sender who mistyped must find out.
             logger.info("mail_ingest_unknown_recipient", extra={"recipient": recipient[:120]})
             return InboundOut(action="reject", reason="no such mailbox on this domain")
 
-        org_id = str(identity.org_id)
+        identity_id, org_id, agent_id, identity_status = resolved
+        org_id = str(org_id)
         set_tenant(db, org_id, None)
 
-        if (identity.status or "").upper() != "ACTIVE":
+        if (identity_status or "").upper() != "ACTIVE":
             # A known but disabled mailbox. Same instruction to Cloudflare, different reason - the
             # operator can see which of the two happened.
             return InboundOut(action="reject", reason="this mailbox is not active")
@@ -157,7 +165,7 @@ def ingest(
         message = models.MailMessage(
             id=str(_uuid.uuid4()),
             org_id=org_id,
-            agent_id=str(identity.agent_id) if identity.agent_id else None,
+            agent_id=str(agent_id) if agent_id else None,
             provider_message_id=(payload.message_id or f"cf:{received.timestamp()}")[:255],
             direction=models.MailMessage.DIRECTION_INBOUND,
             sender=payload.sender or None,
