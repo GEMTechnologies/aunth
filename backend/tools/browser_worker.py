@@ -745,6 +745,10 @@ def _run_goal(
     # run had a password at all before reading the steps that follow.
     trace.append({"step": -1, "action": "account", **trace_account})
     for step_index in range(max_steps):
+        # LET THE PAGE FINISH BEFORE ASKING ABOUT IT. A click that triggers an asynchronous render
+        # returns before the new step exists, and planning the old page is how the model ended up
+        # choosing a footer link on a page that was asking to be acknowledged.
+        _settle(provider)
         # FILL BEFORE ASKING. The planner chooses among clickable controls, so an empty email field on
         # a registration page is invisible to it - the model sees only "Next" and clicks it, and the
         # flow cannot advance. Measured live on the UN Partner Portal: two 'Next' clicks, no fill, and
@@ -883,6 +887,7 @@ def _run_goal(
                     shots, trace)
 
         before = _page_fingerprint(provider)
+        moved = _settle(provider)
         entry = {"step": step_index, "url_before": before, "title_before": _safe_title(provider),
                  "options_offered": [o["text"] for o in options], "chosen": chosen,
                  "confidence": confidence, "planner_provider": provider_name}
@@ -1134,6 +1139,40 @@ def _click_control(page: Any, target: str) -> bool:
         except Exception:
             continue
     return False
+
+
+def _settle(provider: Any, *, timeout_ms: int = 4000, interval_ms: int = 250) -> str:
+    """Wait until the page STOPS changing, then return its fingerprint.
+
+    WHY. The UN Partner Portal renders its next step asynchronously after a click. Planning was asked
+    the moment the click returned, so it saw the PREVIOUS page's text and controls - which is why the
+    model kept choosing the footer's "Learn more" instead of the acknowledgement the new page was
+    actually asking for. The click had worked; the observation was simply too early.
+
+    Bounded and condition-based rather than a fixed sleep: it returns as soon as the page holds still
+    for two consecutive reads, and gives up after the timeout so a page with a live clock or an
+    animation cannot hang the run.
+
+    THE DISTINCTION THAT MATTERS: this waits for the DOM to settle, which is not the same as assuming
+    it changed. A page that never changes returns the same digest and the caller still sees no
+    progress - the guard against blind clicking is untouched.
+    """
+    import time
+
+    deadline = time.time() + (timeout_ms / 1000.0)
+    last = ""
+    stable = 0
+    while time.time() < deadline:
+        current = _page_fingerprint(provider)
+        if current == last:
+            stable += 1
+            if stable >= 2:
+                return current
+        else:
+            stable = 0
+            last = current
+        time.sleep(interval_ms / 1000.0)
+    return _page_fingerprint(provider)
 
 
 def _page_fingerprint(provider: Any) -> str:
