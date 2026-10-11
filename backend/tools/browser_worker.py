@@ -901,6 +901,35 @@ def _run_goal(
         #
         # Only VERIFIED values reach this, and only into a field whose name or id matches one, so a
         # registration form gets the organisation's own address and an unrelated field gets nothing.
+        # A SIGN-IN FORM IS NOT THE FORM TO FILL WHILE REGISTERING. The page says so itself, and
+        # filling it puts credentials into the wrong form and changes the page underneath the run.
+        #
+        # TAKEN DETERMINISTICALLY rather than offered to the model. The page names the link and the
+        # goal is registration, so there is nothing to decide - and a model asked to choose may
+        # reasonably pick the Email Address field in front of it.
+        take_signup = _should_take_signup_link(provider, goal)
+        if take_signup:
+            link = _signup_link(provider)
+            if link:
+                entry = {"step": step_index, "action": "take_signup_link",
+                         "target": link["text"], "url_before": _safe_url(provider)}
+                result = _act_on_ref(provider, link["ref"], link["text"], link.get("type", ""))
+                entry["result"] = "ok" if result.ok else f"failed: {getattr(result, 'detail', '')[:160]}"
+                entry["url_after"] = _safe_url(provider)
+                trace.append(entry)
+                completed.append(f"SIGNUP:{link['text']}")
+                shoot(f"goal-{step_index}-signup")
+                if not result.ok:
+                    return ("BLOCKED", completed,
+                            [{"kind": "EXECUTION_FAILED",
+                              "detail": f"could not open the signup form via {link['text']!r}"}],
+                            shots, trace)
+                _settle(provider)
+                # A page change here IS progress by definition: we left a sign-in form for the signup
+                # form the page pointed at.
+                unchanged_streak = 0
+                continue
+
         filled = _fill_from_verified(provider, values)
         if filled:
             field, value = filled
@@ -1090,7 +1119,8 @@ def _run_goal(
                  # A standalone probe and the job disagreed about what was on the page, and the only
                  # way to settle which is right is to capture it from inside the run that disagrees.
                  "inventory_raw": list(inventory),
-                 "page_tail": page_text()[-240:]}
+                 "page_tail": page_text()[-240:],
+                 "taking_signup_link": bool(take_signup)}
 
         if not chosen or chosen.lower() == "stop":
             entry["result"] = "planner chose to stop"
@@ -1493,6 +1523,57 @@ def _act_on_ref(provider: Any, ref: str, label: str, ctype: str = "") -> Any:
     if kind in ("checkbox", "radio"):
         return provider.act(Step.DECLARE, label)
     return provider.act(Step.CLICK, label)
+
+
+#: The page's own wording that means "this is a SIGN-IN form and the signup form is behind a link".
+#: Generic template copy, not site logic.
+_SIGNIN_PROMPT = (
+    "don't have an account", "do not have an account", "no account yet",
+    "create an account", "sign up now", "register now", "new to ",
+)
+
+#: Controls that lead TO the signup form rather than submitting one.
+_SIGNUP_CONTROL = ("sign up", "signup", "register", "create an account", "create account", "join")
+
+
+def _should_take_signup_link(provider: Any, goal: str) -> bool:
+    """Whether to LEAVE this form via a signup link instead of filling it.
+
+    MEASURED on the UN Partner Portal. The UN's B2C page presents a SIGN-IN form - Email Address,
+    Password, Sign in - with the line "Don't have an account? Sign up now". Granada filled the
+    Password box and then clicked the link, so the password went into a sign-in form, the page
+    changed underneath it, and the following email fill hit a field that no longer existed. The
+    registration never happened.
+
+    Filling a sign-in form while registering is always the wrong move; the page says so itself in
+    plain words. The link it offers is the continuation, and the form behind it is the one that
+    should be filled.
+    """
+    if "regist" not in (goal or "").lower() and "sign" not in (goal or "").lower():
+        return False
+    try:
+        text = str(provider._page.evaluate(
+            "() => document.body ? document.body.innerText : ''"
+        ) or "").lower()
+    except Exception:
+        return False
+    if not any(p in text for p in _SIGNIN_PROMPT):
+        return False
+    # Only if the link is actually there to take - otherwise the prompt is just marketing copy.
+    for control in _control_inventory(provider):
+        label = (control.get("text") or "").strip().lower()
+        if control.get("tag") == "A" and any(s in label for s in _SIGNUP_CONTROL):
+            return True
+    return False
+
+
+def _signup_link(provider: Any) -> Optional[dict[str, Any]]:
+    """The link that opens the signup form, from the page's own inventory."""
+    for control in _control_inventory(provider):
+        label = (control.get("text") or "").strip().lower()
+        if control.get("tag") == "A" and any(s in label for s in _SIGNUP_CONTROL):
+            return control
+    return None
 
 
 def _sweep_stale_profiles(*, keep: str | None, now: float | None = None) -> list[str]:
