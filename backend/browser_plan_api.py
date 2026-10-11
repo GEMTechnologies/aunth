@@ -454,15 +454,27 @@ def plan(
                         "text. Choose 'stop' if the objective is already met, or if no offered "
                         "control can advance it.\n"
                         + (
-                            # THE FLOW CONSTRAINT. Without it the model reasonably reads "Learn more"
-                            # as a way to learn how to register, and leaves the wizard.
-                            "THIS PAGE HAS AN UNFILLED FORM. You are part way through a flow. "
-                            "Prefer the control that CONTINUES THIS FORM (Next, Continue, Proceed, "
-                            "Save and continue). Do NOT choose a link that leaves the flow - About, "
-                            "Learn more, Resources, News, Help, Contact, Privacy, Terms - unless no "
-                            "control continues the form. Do not choose a control that submits, "
-                            "registers or accepts a declaration.\n"
-                            if payload.has_empty_form else ""
+                            # THE FLOW CONSTRAINT IS NOW UNCONDITIONAL.
+                            #
+                            # It used to be sent only when an unfilled field was present, so on the
+                            # registration interstitial - where the consent is already handled and no
+                            # field is empty - the model had no guidance and chose the footer's
+                            # "Learn more", leaving the wizard for /landing/about. Measured across
+                            # runs: the same page produced REGISTER NOW, Next, and Learn more on
+                            # different attempts.
+                            #
+                            # Staying in the flow is the default on ANY page of a multi-step task;
+                            # leaving it needs a reason, not the absence of one.
+                            "THIS IS A MULTI-STEP FLOW. Prefer the control that CONTINUES the current "
+                            "step (Next, Continue, Proceed, Save and continue, or the control the "
+                            "page's own instructions name). Do NOT choose a link that leaves the flow "
+                            "- About, Learn more, Resources, News, Help, Contact, Privacy, Terms - "
+                            "unless nothing on the page continues it. Do not choose a control that "
+                            "submits, registers or accepts a declaration.\n"
+                            + (
+                                "THIS PAGE HAS AN UNFILLED FORM: continuing it is the priority.\n"
+                                if payload.has_empty_form else ""
+                            )
                         )
                     ),
                     options=tuple(options),
