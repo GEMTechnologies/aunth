@@ -17,6 +17,7 @@ from oauth import router as oauth_router
 from agent_api import router as agent_router
 from ingestion_api import router as ingestion_router
 from browser_plan_api import router as browser_plan_router
+from mail_ingest_api import router as mail_ingest_router
 from config import settings
 
 #: Named log formats, so `LOG_FORMAT` can be a word rather than a printf expression.
@@ -327,6 +328,9 @@ app.include_router(ingestion_router, prefix="/api/v1")
 # The browser host's doorway for DECISIONS. Its own credential, because the sandboxed executor is a
 # machine identity that may ask Granada what to do but must never hold the model key or a DSN.
 app.include_router(browser_plan_router, prefix="/api/v1")
+# The Cloudflare Email Worker's doorway. Every message for every NGO on the domain arrives here, which
+# is why thousands of mailboxes need no per-mailbox provisioning anywhere.
+app.include_router(mail_ingest_router, prefix="/api/v1")
 
 # ---------------------------------------------------------------------------
 # Liveness, readiness and metrics

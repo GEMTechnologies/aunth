@@ -206,6 +206,11 @@ class Settings(BaseSettings):
     #: a decision without ever holding the credential that pays for one.
     browser_plan_key: str = ""
 
+    #: The key the Cloudflare Email Worker presents as X-Ingest-Key when delivering inbound mail.
+    #: Empty DISABLES the ingestion endpoint rather than leaving an open door that writes into every
+    #: organisation's mailbox. A service credential, like the planner key.
+    mail_ingest_key: str = ""
+
     # -- API documentation --------------------------------------------------
     #
     # The interactive docs (/docs, /redoc) used to be gated on debug alone:
