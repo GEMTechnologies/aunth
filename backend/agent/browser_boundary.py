@@ -201,6 +201,12 @@ class BrowserTask:
     #: Each step targets a VISIBLE control (by its text) or a named field. No CSS selector is
     #: accepted, because a selector is a guess about a layout Granada has not seen.
     steps: tuple[dict[str, Any], ...] = ()
+
+    #: A HIGH-LEVEL OBJECTIVE for goal-driven navigation, e.g. "determine how this portal registers
+    #: an organisation". When present the worker observes, chooses from the controls it actually
+    #: sees, executes, verifies and repeats - no click sequence is supplied or permitted to stand in
+    #: for it. Mutually exclusive with `steps`; `goal` wins.
+    goal: Optional[str] = None
     created_at: Optional[datetime] = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -218,6 +224,7 @@ class BrowserTask:
             "target_url": self.target_url,
             # THE KEY THE WORKER READS FOR NAVIGATION. Omitted, every task falls back to form-fill.
             "steps": [dict(s) for s in self.steps],
+            "goal": self.goal,
             "credentials": [c.as_dict() for c in self.credentials],
             "form_data": self.form_data,
             "documents": self.documents,
@@ -351,6 +358,7 @@ def build_task(
     checkpoint: Optional[str] = None,
     max_attempts: int = 3,
     steps: Any = (),
+    goal: Optional[str] = None,
 ) -> BrowserTask:
     """Assemble a task for one package.
 
@@ -390,6 +398,7 @@ def build_task(
         # that did not exist, and it is what the worker needs in order to open anything at all.
         target_url=getattr(package, "target_url", None),
         steps=tuple(dict(s) for s in (steps or ()) if isinstance(s, dict)),
+        goal=(str(goal).strip() or None) if goal else None,
         credentials=list(credentials or []),
         # Verified form data only. An empty dict is the honest default: the platform does not
         # fabricate a value to make a form look complete.

@@ -2281,6 +2281,7 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
             # Navigation steps, when an operator supplied a sequence. Absent means the legacy
             # form-fill path, which is what every existing job uses.
             steps=settings.get("browser_steps") or (),
+            goal=settings.get("browser_goal") or None,
         )
     except Exception as exc:
         # build_task refuses an unready package. That refusal is the readiness engine doing its job,

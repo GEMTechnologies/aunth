@@ -376,12 +376,14 @@ def _run_explicit_steps(
         succeeding, but the reference is then simply absent rather than fabricated.
         """
         if evidence is None:
+            _log(f"evidence: no store for {label}")
             return
         try:
             import pathlib as _pathlib
 
             raw = provider.screenshot()
             if not raw:
+                _log(f"evidence: screenshot returned nothing for {label}")
                 return
             stored = evidence.store(
                 kind="screenshot", source=_pathlib.Path(raw), name=f"{label}.png"
@@ -389,7 +391,8 @@ def _run_explicit_steps(
             ref = getattr(stored, "reference", None) or getattr(stored, "name", None)
             if ref:
                 shots.append(str(ref))
-        except Exception:
+        except Exception as exc:
+            _log(f"evidence: screenshot failed for {label}: {type(exc).__name__}: {exc}")
             return
 
     if len(steps) > max_steps:
@@ -526,6 +529,212 @@ def _control_inventory(provider: Any) -> list[dict[str, Any]]:
         )
     except Exception:
         return []
+
+
+#: Controls a goal-driven run may NEVER activate without explicit authorisation. These are
+#: consequential: they submit, commit or accept on the organisation's behalf.
+FORBIDDEN_CLICK = (
+    "submit", "register", "sign up", "signup", "create account", "apply",
+    "i agree", "i accept", "accept", "declare", "confirm", "pay", "purchase",
+)
+
+
+def _is_forbidden_control(text: str) -> bool:
+    """Whether activating this control would make a consequential commitment.
+
+    Checked against the control's VISIBLE TEXT, because that is what the planner chooses from. The
+    model is not trusted to police itself: a disallowed action is refused here even when the planner
+    proposes it, which is the difference between a policy and a prompt.
+    """
+    lowered = (text or "").strip().lower()
+    return any(term in lowered for term in FORBIDDEN_CLICK)
+
+
+def _run_goal(
+    provider: Any,
+    goal: str,
+    *,
+    evidence: Any,
+    max_steps: int,
+    submission_authorised: bool,
+) -> tuple[str, list[str], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+    """Pursue a high-level objective by choosing actions from what the page actually shows.
+
+    THE POINT OF THIS FUNCTION. Nothing here is specific to a portal. Each turn it observes the live
+    page, hands the VISIBLE CONTROLS to Granada's existing `DecisionGateway`, and executes whichever
+    one the model selects. There is no click sequence for Inspira or the Partner Portal anywhere in
+    this file, and adding one would defeat the exercise.
+
+    Everything the model may choose from is a control that was actually observed, so it cannot invent
+    a selector for an element that is not on the page. Consequential controls are refused here even
+    if chosen.
+
+    Returns (status, completed, problems, shots, trace). The trace is returned rather than only
+    logged so the caller can PERSIST it - a job that cannot show its own reasoning is not auditable.
+    """
+    from agent.decision.gateway import DecisionGateway
+    from agent.decision.models import DecisionQuestion, DecisionRequest
+
+    completed: list[str] = []
+    trace: list[dict[str, Any]] = []
+    shots: list[str] = []
+    problems: list[dict[str, Any]] = []
+
+    def shoot(label: str) -> None:
+        if evidence is None:
+            _log(f"evidence: no store for {label}")
+            return
+        try:
+            import pathlib as _pathlib
+
+            raw = provider.screenshot()
+            if not raw:
+                _log(f"evidence: screenshot returned nothing for {label}")
+                return
+            stored = evidence.store(
+                kind="screenshot", source=_pathlib.Path(raw), name=f"{label}.png"
+            )
+            ref = getattr(stored, "reference", None) or getattr(stored, "name", None)
+            if ref:
+                shots.append(str(ref))
+        except Exception as exc:
+            # REPORTED, not swallowed. A swallowed screenshot failure is why the last live run
+            # produced `EVIDENCE: []` and no way to find out why.
+            _log(f"evidence: screenshot failed for {label}: {type(exc).__name__}: {exc}")
+
+    try:
+        gateway = DecisionGateway()
+    except Exception as exc:
+        return ("FAILED", completed, [{"kind": "PLANNER_UNAVAILABLE",
+                                       "detail": f"{type(exc).__name__}: {exc}"}], shots, trace)
+
+    unchanged_streak = 0
+    for step_index in range(max_steps):
+        inventory = _control_inventory(provider)
+        if not inventory:
+            return ("BLOCKED", completed,
+                    [{"kind": "EMPTY_DOM",
+                      "detail": "no visible controls on the page; nothing the planner may act on"}],
+                    shots, trace)
+
+        # Only controls that could be activated, and only ones the policy permits.
+        actionable = [
+            c for c in inventory
+            if c.get("tag") in ("A", "BUTTON") or c.get("type") in ("submit", "button")
+        ]
+        options = []
+        for c in actionable[:20]:
+            label = c.get("text") or c.get("name") or c.get("id") or ""
+            if not label.strip():
+                continue
+            if _is_forbidden_control(label) and not submission_authorised:
+                continue  # refused, not offered
+            options.append({"id": c.get("id") or "", "text": label, "tag": c.get("tag")})
+
+        if not options:
+            return ("BLOCKED", completed,
+                    [{"kind": "NO_ACTION_SELECTED",
+                      "detail": "every visible control is blank or consequential; refusing to guess"}],
+                    shots, trace)
+
+        request = DecisionRequest(
+            decision_type="browser.next_action",
+            questions=(
+                DecisionQuestion(
+                    key="next_action",
+                    type="choice",
+                    instructions=(
+                        f"Objective: {goal}\n"
+                        f"Current page: {_safe_title(provider)} ({_safe_url(provider)})\n"
+                        "Choose the single control that best advances the objective. "
+                        "Choose 'stop' if the objective is met or cannot be advanced safely."
+                    ),
+                    options=tuple([o["text"] for o in options] + ["stop"]),
+                ),
+            ),
+            state={"goal": goal, "url": _safe_url(provider),
+                   "title": _safe_title(provider), "controls": options},
+        )
+
+        try:
+            decision = gateway.decide(request)
+            answer = decision.answers.get("next_action")
+            chosen = str(getattr(answer, "value", "") or "").strip()
+            confidence = getattr(answer, "confidence", None)
+        except Exception as exc:
+            return ("FAILED", completed,
+                    [{"kind": "EXECUTION_FAILED",
+                      "detail": f"planner call failed: {type(exc).__name__}: {str(exc)[:200]}"}],
+                    shots, trace)
+
+        before = _safe_url(provider)
+        entry = {"step": step_index, "url_before": before, "title_before": _safe_title(provider),
+                 "options_offered": [o["text"] for o in options], "chosen": chosen,
+                 "confidence": confidence}
+
+        if not chosen or chosen.lower() == "stop":
+            entry["result"] = "planner chose to stop"
+            trace.append(entry)
+            shoot(f"goal-{step_index}-stop")
+            return ("BLOCKED", completed,
+                    [{"kind": "STOPPED",
+                      "detail": f"the planner stopped: objective reported as met or unadvanceable "
+                                f"(chose {chosen!r})"}],
+                    shots, trace)
+
+        match = next((o for o in options if o["text"].strip() == chosen.strip()), None)
+        if match is None:
+            entry["result"] = "chosen control was not among the observed options"
+            trace.append(entry)
+            return ("BLOCKED", completed,
+                    [{"kind": "NO_ACTION_SELECTED",
+                      "detail": f"planner chose {chosen!r}, which was not an observed control"}],
+                    shots, trace)
+
+        if _is_forbidden_control(match["text"]) and not submission_authorised:
+            entry["result"] = "REFUSED: consequential control"
+            trace.append(entry)
+            return ("BLOCKED", completed,
+                    [{"kind": "REFUSED_CONSEQUENTIAL",
+                      "detail": f"activating {match['text']!r} would make a commitment and "
+                                f"submission is not authorised"}],
+                    shots, trace)
+
+        result = provider.act(Step.CLICK, match["text"])
+        entry["result"] = "ok" if result.ok else f"failed: {getattr(result, 'detail', '')[:160]}"
+        entry["url_after"] = _safe_url(provider)
+        entry["changed"] = entry["url_after"] != before
+        trace.append(entry)
+        shoot(f"goal-{step_index}-click")
+
+        if not result.ok:
+            failure = getattr(getattr(result, "failure", None), "value", None)
+            kind = ("ACCESS_DENIED" if failure == "ACCESS_DENIED"
+                    else "HUMAN_VERIFICATION" if failure == "HUMAN_VERIFICATION"
+                    else "EXECUTION_FAILED")
+            return ("BLOCKED", completed,
+                    [{"kind": kind, "detail": f"click {match['text']!r} failed",
+                      "classification": failure}], shots, trace)
+
+        completed.append(f"CLICK:{match['text']}")
+        unchanged_streak = unchanged_streak + 1 if not entry["changed"] else 0
+        if unchanged_streak >= 2:
+            # Bounded recovery: two actions with no observable effect means the plan is not working.
+            # Retrying a third time is the unbounded clicking the directive forbids.
+            return ("BLOCKED", completed,
+                    [{"kind": "NO_ACTION_SELECTED",
+                      "detail": "two consecutive actions produced no page change; stopping rather "
+                                "than clicking blindly"}], shots, trace)
+
+    return ("BLOCKED", completed,
+            [{"kind": "RESOURCE_LIMIT",
+              "detail": f"reached the {max_steps}-step budget without meeting the objective"}],
+            shots, trace)
+
+
+def _log(message: str) -> None:
+    """Diagnostics to stderr. The worker's stdout is a JSON contract; nothing may pollute it."""
+    print(f"browser_worker: {message}", file=sys.stderr, flush=True)
 
 
 def _sweep_stale_profiles(*, keep: str | None, now: float | None = None) -> list[str]:
@@ -749,6 +958,31 @@ def main() -> int:
         # EXPLICIT NAVIGATION STEPS TAKE PRECEDENCE, and leave the legacy path untouched when
         # absent: `steps=()` must reproduce the form-fill behaviour byte-for-byte, because every
         # existing job depends on it.
+        # GOAL-DRIVEN PLANNING comes first: an objective is a higher-level instruction than a
+        # supplied step list, and only one of the two may drive a run.
+        goal = str(payload.get("goal") or "").strip()
+        if goal:
+            g_status, g_completed, g_problems, g_shots, g_trace = _run_goal(
+                provider, goal,
+                evidence=evidence,
+                max_steps=int(payload.get("max_steps") or 8),
+                submission_authorised=bool(payload.get("submission_authorised")),
+            )
+            _emit({
+                "status": g_status,
+                "outcome_certain": True,
+                "completed_steps": g_completed,
+                "problems": g_problems,
+                # THE TRACE TRAVELS WITH THE REPORT so the job can persist its own reasoning. A job
+                # that cannot show what it observed and why it chose is not auditable.
+                "trace": g_trace,
+                "evidence": g_shots,
+                "final_url": _safe_url(provider),
+                "final_title": _safe_title(provider),
+                "goal": goal,
+            })
+            return 0
+
         explicit = payload.get("steps") or []
         if explicit:
             status, completed, problems, shots = _run_explicit_steps(
