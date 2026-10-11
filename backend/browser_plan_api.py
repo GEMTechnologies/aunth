@@ -479,7 +479,8 @@ def plan(
                             "page's own instructions name). Do NOT choose a link that leaves the flow "
                             "- About, Learn more, Resources, News, Help, Contact, Privacy, Terms - "
                             "unless nothing on the page continues it. Do not choose a control that "
-                            "submits, registers or accepts a declaration.\n"
+                            "SUBMITS A FORM or accepts a declaration; a control that merely moves you "
+                            "to the next page is how the flow continues and is the right choice.\n"
                             + (
                                 "THIS PAGE HAS AN UNFILLED FORM: continuing it is the priority.\n"
                                 if payload.has_empty_form else ""
