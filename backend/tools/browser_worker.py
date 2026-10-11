@@ -104,22 +104,37 @@ class PlaywrightProvider:
     def launch(self, *, profile_dir: str, headless: bool = True) -> None:
         from playwright.sync_api import sync_playwright
 
-        # THE TENANT PROFILE IS THE mkdtemp DIRECTORY, NOT `profile_dir`.
+        # A STABLE PROFILE PER ORGANISATION, BECAUSE SESSIONS MUST SURVIVE THE RUN.
         #
-        # `os.makedirs(profile_dir)` used to run here and create /tmp/granada-browser/<org_id>/ - and
-        # NOTHING REMOVED IT. `close()` removes `self._profile`, which is the mkdtemp directory, so
-        # every organisation that ever ran left a directory named after itself, forever. On a host
-        # serving thousands of NGOs that is both an unbounded leak and a directory listing of which
-        # organisations have been active.
+        # This used to be an unconditional `mkdtemp`, on the reasoning that creating `profile_dir`
+        # would leak one directory per organisation forever. That reasoning was right about the leak
+        # and wrong about the consequence: a fresh profile every run means EVERY RUN STARTS LOGGED
+        # OUT, so a portal that verified an account one minute ago asks for verification again - and
+        # re-registering repeatedly is exactly what the directive forbids. Measured: the profile
+        # directory in every run was `granada-browser-<random>`.
         #
-        # The real Chromium profile is `self._profile`: launch_persistent_context uses it as
-        # `user_data_dir`, which is what actually gives each organisation its own cookie jar. The
-        # `profile_dir` argument was created and then never used - dead code that leaked.
+        # Both properties are kept:
+        #   * the path is DERIVED from the organisation, so one tenant's cookies cannot be read by
+        #     another - and it is created 0700, so no other local user can read them either;
+        #   * `profile_dir` was previously abandoned, and the caller now points it at a swept root
+        #     (`/var/lib/granada/browser-profiles/<org_id>`), so it is bounded rather than immortal.
         #
-        # `profile_dir` is kept in the signature because the runtime supplies it and a caller may
-        # want it for diagnostics, but it is NOT created. A directory that exists only to be
-        # abandoned is worse than no directory.
-        self._profile = tempfile.mkdtemp(prefix="granada-browser-")
+        # `close()` deletes only an EPHEMERAL profile. A persistent one is the whole point.
+        if profile_dir:
+            try:
+                os.makedirs(profile_dir, mode=0o700, exist_ok=True)
+                os.chmod(profile_dir, 0o700)
+                self._profile = profile_dir
+                self._ephemeral_profile = False
+            except OSError:
+                # Unwritable root: fall back rather than failing the run, but the session will not
+                # persist and that must be visible rather than assumed.
+                self._profile = tempfile.mkdtemp(prefix="granada-browser-")
+                self._ephemeral_profile = True
+                _log(f"profile: {profile_dir} unusable; this run cannot keep a session")
+        else:
+            self._profile = tempfile.mkdtemp(prefix="granada-browser-")
+            self._ephemeral_profile = True
         self._pw = sync_playwright().start()
 
         # THE LAUNCH ARGUMENTS ARE CHECKED, NOT TRUSTED.
@@ -195,14 +210,17 @@ class PlaywrightProvider:
             except Exception:
                 pass
         self._context = self._browser = self._pw = self._page = None
-        if self._profile and os.path.isdir(self._profile):
+        # ONLY AN EPHEMERAL PROFILE IS DELETED. A persistent one holds the organisation's
+        # authenticated session - deleting it here would make session preservation impossible, which
+        # is exactly what the unconditional rmtree used to do.
+        if getattr(self, "_ephemeral_profile", True) and self._profile and os.path.isdir(self._profile):
             shutil.rmtree(self._profile, ignore_errors=True)
         self._profile = None
 
-        # A CRASH LEAVES THE mkdtemp DIRECTORY BEHIND, because close() never runs. The runtime calls
-        # close() in a finally, but a SIGKILL does not reach finally. Sweep any sibling profile from a
-        # previous run of THIS process, bounded and best-effort: a leak that only appears on crashes
-        # is the one nobody notices until the disk is full.
+        # A CRASH LEAVES AN EPHEMERAL mkdtemp DIRECTORY BEHIND, because close() never runs. The
+        # runtime calls close() in a finally, but a SIGKILL does not reach finally. Sweep any sibling
+        # ephemeral profile from a previous run of THIS process, bounded and best-effort: a leak that
+        # only appears on crashes is the one nobody notices until the disk is full.
         _sweep_stale_profiles(keep=None)
 
     # -- perception ----------------------------------------------------------
@@ -1117,7 +1135,13 @@ def main() -> int:
     try:
         # Navigate FIRST. The runtime plans from what the page shows, so an unloaded page is not an
         # empty task - it is an unasked question.
-        provider.launch(profile_dir=f"/tmp/granada-browser/{task.org_id}", headless=True)
+        provider.launch(
+            # A PERSISTENT PER-ORGANISATION PROFILE, not /tmp: sessions must outlive the run, and a
+            # predictable path under a world-writable /tmp invites a symlink from another local user.
+            # This root is owned by the worker and the directory is created 0700.
+            profile_dir=f"/var/lib/granada/browser-profiles/{task.org_id}",
+            headless=True,
+        )
         creds_user = os.environ.get("GRANADA_PORTAL_USER", "")
         creds_pass = os.environ.get("GRANADA_PORTAL_PASSWORD", "")
         if creds_user and creds_pass:
