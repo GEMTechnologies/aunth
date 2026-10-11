@@ -51,6 +51,16 @@ def upgrade() -> None:
         return
 
     # BACKFILL: every mailbox that already exists becomes routable.
+    #
+    # THIS CAN SILENTLY DO NOTHING, AND DID. `mail_identities` has FORCE ROW LEVEL SECURITY with
+    # `granada_user` as its owner, so a migration running as that role reads ZERO rows and the
+    # backfill inserts nothing - with no error. Measured on production: the table was empty
+    # afterwards while the identity plainly existed.
+    #
+    # New identities are covered by the trigger below, so only pre-existing rows need this. On a
+    # fresh deployment with no identities yet, this is correctly a no-op. On an upgrade, the
+    # operator must run the same INSERT as a superuser; it is documented in
+    # docs/GRANADA_EMAIL_HANDOVER.md rather than left as a surprise.
     op.execute(
         f"""
         INSERT INTO {TABLE} (address, org_id, identity_id, is_active)
