@@ -36,6 +36,7 @@ on the command line, where it would appear in the process table.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -417,7 +418,7 @@ def _run_explicit_steps(
                     [{"kind": "BAD_STEP", "detail": f"step {index} is not an object"}], shots)
 
         op = str(raw.get("op") or "").strip().lower()
-        before = _safe_url(provider)
+        before = _page_fingerprint(provider)
         entry: dict[str, Any] = {"index": index, "op": op, "url_before": before}
 
         try:
@@ -497,7 +498,8 @@ def _run_explicit_steps(
                       "detail": f"{op} raised {type(exc).__name__}: {str(exc)[:200]}"}], shots)
 
         entry["url_after"] = _safe_url(provider)
-        entry["changed"] = entry["url_after"] != before
+        entry["after_fingerprint"] = _page_fingerprint(provider)
+        entry["changed"] = entry["after_fingerprint"] != before
         trace.append(entry)
         completed.append(op if op != "click" else f"CLICK:{entry.get('target', '')}")
         shoot(f"step-{index}-{op}")
@@ -833,7 +835,8 @@ def _run_goal(
                             shots, trace)
 
                 entry["url_after"] = _safe_url(provider)
-                entry["changed"] = entry["url_after"] != before
+                entry["after_fingerprint"] = _page_fingerprint(provider)
+                entry["changed"] = entry["after_fingerprint"] != before
                 completed.append(f"VERIFICATION:{result.get('kind')}")
                 shoot(f"goal-{step_index}-verified")
                 unchanged_streak = 0
@@ -861,7 +864,7 @@ def _run_goal(
                       "detail": f"planner call failed: {type(exc).__name__}: {str(exc)[:200]}"}],
                     shots, trace)
 
-        before = _safe_url(provider)
+        before = _page_fingerprint(provider)
         entry = {"step": step_index, "url_before": before, "title_before": _safe_title(provider),
                  "options_offered": [o["text"] for o in options], "chosen": chosen,
                  "confidence": confidence, "planner_provider": provider_name}
@@ -919,7 +922,8 @@ def _run_goal(
         result = started
         entry["result"] = "ok" if result.ok else f"failed: {getattr(result, 'detail', '')[:160]}"
         entry["url_after"] = _safe_url(provider)
-        entry["changed"] = entry["url_after"] != before
+        entry["after_fingerprint"] = _page_fingerprint(provider)
+        entry["changed"] = entry["after_fingerprint"] != before
         trace.append(entry)
         shoot(f"goal-{step_index}-click")
 
@@ -1072,6 +1076,43 @@ def _fill_from_verified(provider: Any, values: dict[str, Any]) -> str:
         if _case_get(values, name) not in (None, ""):
             return str(name)
     return ""
+
+
+def _page_fingerprint(provider: Any) -> str:
+    """A hash of what the page SHOWS, not just where it is.
+
+    WHY THE URL IS NOT ENOUGH. The UN Partner Portal is a single-page wizard: entering the email and
+    pressing Next renders the password step at the SAME url. A URL-only comparison therefore reported
+    "no change" for a page that had demonstrably advanced, the bounded-recovery guard fired after two
+    of them, and the run stopped one click short of the password field - measured live, job
+    f26d1e94: `FILL:email`, `CLICK:Next`, `CLICK:Next`, final_url unchanged.
+
+    Visible text plus the interactive counts is the cheapest signal that distinguishes "the wizard
+    moved on" from "nothing happened", and it stays honest: a page that genuinely did not change
+    produces the same digest, so blind clicking is still refused.
+
+    Deliberately NOT including input VALUES: typing into a field must not by itself look like
+    progress, or a form that rejects an entry would be mistaken for one that advanced.
+    """
+    try:
+        page = provider._page
+        text = str(page.evaluate("() => document.body ? document.body.innerText : ''") or "")
+        counts = page.evaluate(
+            """() => ({
+                 inputs: document.querySelectorAll('input').length,
+                 buttons: document.querySelectorAll('button').length,
+                 links: document.querySelectorAll('a').length,
+                 forms: document.querySelectorAll('form').length,
+               })"""
+        ) or {}
+        # Whitespace collapsed so a re-render with different spacing is not mistaken for progress.
+        normalised = " ".join(text.split())[:20000]
+        material = f"{page.url}|{normalised}|{counts.get('inputs')}|{counts.get('buttons')}|{counts.get('forms')}"
+        return hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()[:32]
+    except Exception:
+        # A page that cannot be read falls back to the URL: the guard then behaves as it did before
+        # rather than reporting change it cannot substantiate.
+        return _safe_url(provider)
 
 
 def _sweep_stale_profiles(*, keep: str | None, now: float | None = None) -> list[str]:
