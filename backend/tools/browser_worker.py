@@ -626,15 +626,21 @@ def _run_goal(
             return json.loads(response.read().decode("utf-8"))
 
     def shoot(label: str) -> None:
+        """Persist a screenshot through the EXISTING evidence store, or RECORD that it failed.
+
+        The failure is reported as a non-fatal problem rather than only logged, because the host
+        execution server relays the worker's stdout JSON and DISCARDS its stderr. Logging alone meant
+        several live runs reported `EVIDENCE: []` with the reason visible nowhere.
+        """
         if evidence is None:
-            _log(f"evidence: no store for {label}")
+            trace.append({"evidence_error": "the evidence store could not be opened; no screenshot kept"})
             return
         try:
             import pathlib as _pathlib
 
             raw = provider.screenshot()
             if not raw:
-                _log(f"evidence: screenshot returned nothing for {label}")
+                trace.append({"evidence_error": f"screenshot() returned nothing for {label}"})
                 return
             stored = evidence.store(
                 kind="screenshot", source=_pathlib.Path(raw), name=f"{label}.png"
@@ -642,10 +648,10 @@ def _run_goal(
             ref = getattr(stored, "reference", None) or getattr(stored, "name", None)
             if ref:
                 shots.append(str(ref))
+            else:
+                trace.append({"evidence_error": f"the store returned no reference for {label}"})
         except Exception as exc:
-            # REPORTED, not swallowed. A swallowed screenshot failure is why the last live run
-            # produced `EVIDENCE: []` and no way to find out why.
-            _log(f"evidence: screenshot failed for {label}: {type(exc).__name__}: {exc}")
+            trace.append({"evidence_error": f"{label}: {type(exc).__name__}: {str(exc)[:200]}"})
 
     unchanged_streak = 0
     for step_index in range(max_steps):
