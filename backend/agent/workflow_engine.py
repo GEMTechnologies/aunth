@@ -2282,6 +2282,9 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
             # form-fill path, which is what every existing job uses.
             steps=settings.get("browser_steps") or (),
             goal=settings.get("browser_goal") or None,
+            # The host asks the container; it is never given the model key or a DSN.
+            planner_url=settings.get("browser_planner_url") or None,
+            planner_key=settings.get("browser_planner_key") or None,
         )
     except Exception as exc:
         # build_task refuses an unready package. That refusal is the readiness engine doing its job,

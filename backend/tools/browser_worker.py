@@ -572,7 +572,6 @@ def _run_goal(
     Returns (status, completed, problems, shots, trace). The trace is returned rather than only
     logged so the caller can PERSIST it - a job that cannot show its own reasoning is not auditable.
     """
-    from agent.decision.gateway import build_gateway
     from agent.decision.models import DecisionQuestion, DecisionRequest
 
     completed: list[str] = []
@@ -580,16 +579,41 @@ def _run_goal(
     shots: list[str] = []
     problems: list[dict[str, Any]] = []
 
-    try:
-        # THE FACTORY, NOT THE CONSTRUCTOR. `DecisionGateway()` builds an EMPTY ProviderChain, which
-        # is why the first live goal run raised NoDecisionProvider "tried []". `build_gateway` wires
-        # rules -> local, and appends the model only when one is configured.
-        from config import settings as _settings
+    # PLANNING LIVES IN THE CONTAINER, NOT HERE. This process runs on the host, sandboxed, with no
+    # model credentials and no database - so a chain built here could only ever be `rules -> local`,
+    # which are evidence engines and cannot answer a navigation question. We ask Granada instead, over
+    # an authenticated call, and the host never holds the key that pays for a decision.
+    planner_url = str(payload.get("planner_url") or "")
+    planner_key = str(payload.get("planner_key") or "")
+    org_id = str(payload.get("org_id") or "")
 
-        gateway = build_gateway(settings=_settings)
-    except Exception as exc:
-        return ("FAILED", completed, [{"kind": "PLANNER_UNAVAILABLE",
-                                       "detail": f"{type(exc).__name__}: {exc}"}], shots, trace)
+    if not planner_url or not planner_key:
+        return ("FAILED", completed,
+                [{"kind": "PLANNER_UNAVAILABLE",
+                  "detail": "no planner_url/planner_key in the task; the host cannot plan locally"}],
+                shots, trace)
+
+    def ask_planner(*, url: str, title: str, controls: list[dict[str, Any]]) -> dict[str, Any]:
+        """One authenticated planning request. Bounded by a timeout so a wedged planner cannot hang
+        the browser run indefinitely."""
+        import urllib.request
+
+        body = json.dumps({
+            "org_id": org_id,
+            "goal": goal,
+            "url": url,
+            "title": title,
+            "controls": controls,
+            "submission_authorised": submission_authorised,
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            planner_url,
+            data=body,
+            headers={"Content-Type": "application/json", "X-Plan-Key": planner_key},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=45) as response:
+            return json.loads(response.read().decode("utf-8"))
 
     def shoot(label: str) -> None:
         if evidence is None:
@@ -642,32 +666,22 @@ def _run_goal(
                       "detail": "every visible control is blank or consequential; refusing to guess"}],
                     shots, trace)
 
-        request = DecisionRequest(
-            decision_type="browser.next_action",
-            questions=(
-                DecisionQuestion(
-                    key="next_action",
-                    # UPPERCASE, and the set is closed: the gateway accepts BOOLEAN, CHOICE, SCORE.
-                    # A lowercase "choice" raised UnknownQuestionType and killed the run as a crash.
-                    type="CHOICE",
-                    instructions=(
-                        f"Objective: {goal}\n"
-                        f"Current page: {_safe_title(provider)} ({_safe_url(provider)})\n"
-                        "Choose the single control that best advances the objective. "
-                        "Choose 'stop' if the objective is met or cannot be advanced safely."
-                    ),
-                    options=tuple([o["text"] for o in options] + ["stop"]),
-                ),
-            ),
-            state={"goal": goal, "url": _safe_url(provider),
-                   "title": _safe_title(provider), "controls": options},
-        )
-
         try:
-            decision = gateway.decide(request)
-            answer = decision.answers.get("next_action")
-            chosen = str(getattr(answer, "value", "") or "").strip()
-            confidence = getattr(answer, "confidence", None)
+            decision = ask_planner(
+                url=_safe_url(provider), title=_safe_title(provider), controls=options
+            )
+            chosen = str(decision.get("action") or "").strip()
+            confidence = decision.get("confidence")
+            provider_name = decision.get("provider") or ""
+            if decision.get("refused"):
+                trace.append({"step": step_index, "url_before": _safe_url(provider),
+                              "options_offered": [o["text"] for o in options],
+                              "chosen": "", "result": "planner refused",
+                              "detail": decision.get("detail", "")})
+                return ("BLOCKED", completed,
+                        [{"kind": "NO_ACTION_SELECTED",
+                          "detail": f"the planner declined: {decision.get('detail', '')[:200]}"}],
+                        shots, trace)
         except Exception as exc:
             return ("FAILED", completed,
                     [{"kind": "EXECUTION_FAILED",
@@ -677,7 +691,7 @@ def _run_goal(
         before = _safe_url(provider)
         entry = {"step": step_index, "url_before": before, "title_before": _safe_title(provider),
                  "options_offered": [o["text"] for o in options], "chosen": chosen,
-                 "confidence": confidence}
+                 "confidence": confidence, "planner_provider": provider_name}
 
         if not chosen or chosen.lower() == "stop":
             entry["result"] = "planner chose to stop"

@@ -207,6 +207,13 @@ class BrowserTask:
     #: sees, executes, verifies and repeats - no click sequence is supplied or permitted to stand in
     #: for it. Mutually exclusive with `steps`; `goal` wins.
     goal: Optional[str] = None
+
+    #: Where the HOST asks for the next decision, and the service credential to ask with. The host
+    #: never holds the model key or a database credential: it can request a decision, not pay for
+    #: one or read the tenant's data. Both are required for a goal-driven run, and their absence is
+    #: a refusal rather than a silent fallback to local planning.
+    planner_url: Optional[str] = None
+    planner_key: Optional[str] = None
     created_at: Optional[datetime] = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -225,6 +232,8 @@ class BrowserTask:
             # THE KEY THE WORKER READS FOR NAVIGATION. Omitted, every task falls back to form-fill.
             "steps": [dict(s) for s in self.steps],
             "goal": self.goal,
+            "planner_url": self.planner_url,
+            "planner_key": self.planner_key,
             "credentials": [c.as_dict() for c in self.credentials],
             "form_data": self.form_data,
             "documents": self.documents,
@@ -359,6 +368,8 @@ def build_task(
     max_attempts: int = 3,
     steps: Any = (),
     goal: Optional[str] = None,
+    planner_url: Optional[str] = None,
+    planner_key: Optional[str] = None,
 ) -> BrowserTask:
     """Assemble a task for one package.
 
@@ -399,6 +410,8 @@ def build_task(
         target_url=getattr(package, "target_url", None),
         steps=tuple(dict(s) for s in (steps or ()) if isinstance(s, dict)),
         goal=(str(goal).strip() or None) if goal else None,
+        planner_url=(str(planner_url).strip() or None) if planner_url else None,
+        planner_key=(str(planner_key).strip() or None) if planner_key else None,
         credentials=list(credentials or []),
         # Verified form data only. An empty dict is the honest default: the platform does not
         # fabricate a value to make a form look complete.

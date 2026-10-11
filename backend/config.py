@@ -200,6 +200,12 @@ class Settings(BaseSettings):
     # and revocation, which needs a migration - so this is the honest v1, not the finished shape.
     ingest_bot_key: str = ""
 
+    #: The key the BROWSER HOST presents as X-Plan-Key when asking the container to choose the next
+    #: navigation action. Empty DISABLES the planner endpoint rather than leaving it open. This is a
+    #: service credential and is deliberately NOT the model API key: the host must be able to ask for
+    #: a decision without ever holding the credential that pays for one.
+    browser_plan_key: str = ""
+
     # -- API documentation --------------------------------------------------
     #
     # The interactive docs (/docs, /redoc) used to be gated on debug alone:
