@@ -577,7 +577,14 @@ def _control_inventory(provider: Any) -> list[dict[str, Any]]:
                  // twice and the run stopped. Measured, after two wrong theories about the same
                  // symptom.
                  const nameOf = (e) => {
-                   const inner = (e.innerText || e.value || '').trim();
+                   // A CHECKBOX'S `value` IS NOT ITS NAME. HTML gives an unchecked checkbox the value
+                   // "on", or a template's own word - "checked" here - so reading value first named the
+                   // registration consent "checked". The model then chose the LABEL instead, whose
+                   // checked state is always false, so it was re-offered every turn and each new click
+                   // UNTICKED what the previous one had set. Measured: act on the label set
+                   // input:checked from 0 to 1, yet the label still read checked:false.
+                   const isTick = ['checkbox', 'radio'].includes((e.type || '').toLowerCase());
+                   const inner = (e.innerText || (isTick ? '' : e.value) || '').trim();
                    if (inner) return inner;
                    try {
                      if (e.labels && e.labels.length) return (e.labels[0].innerText || '').trim();
@@ -627,6 +634,13 @@ def _control_inventory(provider: Any) -> list[dict[str, Any]]:
                              text: nameOf(e).slice(0,80)};
                    })
                    .filter(c => c.text)
+                   // ONE ENTRY PER CONTROL. The checkbox and its LABEL now share a name, and both
+                   // were offered: choosing the label ticks the box, and choosing it again - because a
+                   // label's checked state is permanently false - UNTICKS it. The input is the control
+                   // that owns the state, so it wins; a label survives only when no control names it.
+                   .filter((c, i, all) =>
+                     c.tag !== 'LABEL'
+                     || !all.some(o => o.tag !== 'LABEL' && o.text === c.text))
                    .slice(0, 60);
                }"""
         )
