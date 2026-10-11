@@ -541,11 +541,31 @@ def _control_inventory(provider: Any) -> list[dict[str, Any]]:
     """
     try:
         return provider._page.evaluate(
-            """() => Array.from(document.querySelectorAll('input,button,a,select'))
-                 .filter(e => e.offsetParent !== null)
-                 .slice(0, 60)
-                 .map(e => ({tag: e.tagName, type: e.type||'', name: e.name||'', id: e.id||'',
-                             text: (e.innerText||e.value||'').trim().slice(0,80)}))"""
+            # VISIBILITY BY GEOMETRY, NOT BY offsetParent.
+            #
+            # `e.offsetParent !== null` is the common idiom and it is WRONG for `position: fixed`
+            # elements - offsetParent is null for those by specification. A modal or overlay dialog is
+            # exactly that, so the acknowledgement control inside it was filtered out and the planner
+            # was offered only the page BEHIND the overlay. Measured: the UN Partner Portal's
+            # registration interstitial offered ["Next", "Learn more"] while the modal asking to be
+            # acknowledged sat on top of it with "Yes, I understand" - invisible to this function, so
+            # the model kept clicking a Next that the overlay blocked.
+            #
+            # A non-zero box plus a visible computed style is true of both fixed overlays and ordinary
+            # in-flow controls, so it selects the same set or more, never fewer.
+            """() => {
+                 const vis = (e) => {
+                   const r = e.getBoundingClientRect();
+                   if (r.width <= 0 || r.height <= 0) return false;
+                   const s = getComputedStyle(e);
+                   return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+                 };
+                 return Array.from(document.querySelectorAll('input,button,a,select'))
+                   .filter(vis)
+                   .slice(0, 60)
+                   .map(e => ({tag: e.tagName, type: e.type||'', name: e.name||'', id: e.id||'',
+                               text: (e.innerText||e.value||'').trim().slice(0,80)}));
+               }"""
         )
     except Exception:
         return []
@@ -1050,7 +1070,12 @@ def _first_text_input(provider: Any) -> str:
                    // step was rewritten, made the fill a no-op whose only symptom was a Next button
                    // that stayed disabled and a click that did nothing.
                    if (!['text','email','search','url','number','tel',''].includes(t)) continue;
-                   if (e.offsetParent === null) continue;
+                   // Visibility by geometry, for the same reason as the control inventory: a field in
+                   // a `position: fixed` overlay has a null offsetParent and would be skipped.
+                   const r = e.getBoundingClientRect();
+                   if (r.width <= 0 || r.height <= 0) continue;
+                   const s = getComputedStyle(e);
+                   if (s.visibility === 'hidden' || s.display === 'none' || s.opacity === '0') continue;
                    if (e.disabled || e.readOnly) continue;
                    if (e.value) continue;
                    return e.name || e.id || '';
@@ -1104,13 +1129,23 @@ def _fill_from_verified(provider: Any, values: dict[str, Any]) -> Optional[tuple
     password = _password_value(values)
     try:
         candidates = list(provider._page.evaluate(
-            """() => Array.from(document.querySelectorAll('input'))
-                 .filter(e => {
-                   const t = (e.type || 'text').toLowerCase();
-                   return ['text','email','tel','number','password',''].includes(t)
-                     && e.offsetParent !== null && !e.disabled && !e.readOnly && !e.value;
-                 })
-                 .map(e => ({name: e.name || e.id || '', type: (e.type || 'text').toLowerCase()}))"""
+            # Visibility by GEOMETRY: `offsetParent` is null for `position: fixed`, so a field inside
+            # a modal overlay would have been skipped here exactly as the acknowledgement button was.
+            """() => {
+                 const vis = (e) => {
+                   const r = e.getBoundingClientRect();
+                   if (r.width <= 0 || r.height <= 0) return false;
+                   const s = getComputedStyle(e);
+                   return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+                 };
+                 return Array.from(document.querySelectorAll('input'))
+                   .filter(e => {
+                     const t = (e.type || 'text').toLowerCase();
+                     return ['text','email','tel','number','password',''].includes(t)
+                       && vis(e) && !e.disabled && !e.readOnly && !e.value;
+                   })
+                   .map(e => ({name: e.name || e.id || '', type: (e.type || 'text').toLowerCase()}));
+               }"""
         ) or [])
     except Exception:
         return None
