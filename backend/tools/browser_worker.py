@@ -341,7 +341,18 @@ class PlaywrightProvider:
                 except Exception:
                     page.click(f"text={target}")
             elif step is Step.CLICK:
-                page.click(f"text={target}")
+                # CLICK THE CONTROL, NOT A SPAN INSIDE IT.
+                #
+                # `page.click("text=Next")` matches the SMALLEST element carrying the text - here a
+                # `<span>Next</span>` inside the button - and the click did not advance the UN Partner
+                # Portal's email step. The same click through a button locator DID, measured side by
+                # side. A span carries no handler of its own, and a framework that stops propagation
+                # makes the difference invisible: the click "succeeds" and nothing happens.
+                #
+                # Role-based lookup targets the element that actually owns the behaviour, and the
+                # text= fallback keeps working for the markup that is not a real button or link.
+                if not _click_control(page, target):
+                    page.click(f"text={target}")
             elif step is Step.SUBMIT:
                 # NO retry wrapper here. An ambiguous submit is the runtime's UNCERTAIN case, and
                 # retrying inside the provider would file twice before the runtime ever saw it.
@@ -1100,6 +1111,24 @@ def _fill_from_verified(provider: Any, values: dict[str, Any]) -> Optional[tuple
         if name and _case_get(values, name) not in (None, ""):
             return (name, str(_case_get(values, name)))
     return None
+
+
+def _click_control(page: Any, target: str) -> bool:
+    """Click the BUTTON or LINK whose accessible name is `target`. False if neither matched.
+
+    Preferring the element that owns the behaviour over the innermost element containing the text is
+    the difference between a click that works and one that silently does nothing - measured on the UN
+    Partner Portal, where `text=Next` hit the button's inner span and the email step never advanced.
+    """
+    for role in ("button", "link"):
+        try:
+            locator = page.get_by_role(role, name=target, exact=False)
+            if locator.count() > 0:
+                locator.first.click(timeout=15000)
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _page_fingerprint(provider: Any) -> str:
