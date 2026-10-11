@@ -119,6 +119,15 @@ class LLMDecisionProvider(BaseDecisionProvider):
                     org_id=request.organisation_id,
                     response_schema=schema,
                     temperature=0.0,
+                    # THE REASONING MODEL SHARES THIS BUDGET WITH ITS ANSWER. The gateway's default of
+                    # 2048 was consumed entirely by reasoning on a planning prompt, so the call came
+                    # back with no content at all: "response was truncated before any content: the
+                    # token budget was consumed by reasoning" - measured live on the UN Partner Portal
+                    # password step, where the page offered more controls and the prompt grew.
+                    #
+                    # The failure is not a model refusal, it is a budget too small to think AND reply,
+                    # so the budget is raised rather than the prompt trimmed.
+                    max_output_tokens=int(getattr(self, "max_output_tokens", 0) or 8192),
                 )
             except Exception as exc:
                 # ModelGatewayError covers invalid output, budget and transport.
