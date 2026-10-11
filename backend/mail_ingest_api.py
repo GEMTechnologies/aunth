@@ -128,16 +128,15 @@ def ingest(
         db = _session()
 
         # The address is resolved WITHOUT a tenant binding, because that is the question being
-        # asked: whose mailbox is this? It goes through a SECURITY DEFINER function rather than a
-        # plain query, because `mail_identities` is RLS-protected and with no binding
-        # `app.current_org()` is NULL - so a direct query returns zero rows and EVERY delivery would
-        # be rejected as "no such mailbox". Measured live before this was added.
+        # asked: whose mailbox is this? It reads `mail_routing` rather than `mail_identities`,
+        # because the latter is RLS-protected and with no binding `app.current_org()` is NULL, so a
+        # direct query returns zero rows and EVERY delivery would be rejected as "no such mailbox".
+        # Measured live before this was added.
         #
-        # The function is narrowly scoped: one address in, its org/agent/status out. No message
-        # content, no list, no wildcard.
+        # `mail_routing` holds address, org, identity and active - no tokens, no message content -
+        # and is kept in sync by trigger, so routing never depends on application convention.
         resolved = db.execute(
-            text("SELECT identity_id, org_id, agent_id, identity_status "
-                 "FROM mail_org_for_address(:addr)"),
+            text("SELECT org_id, identity_id, is_active FROM mail_routing WHERE address = :addr"),
             {"addr": recipient},
         ).first()
 
@@ -147,14 +146,23 @@ def ingest(
             logger.info("mail_ingest_unknown_recipient", extra={"recipient": recipient[:120]})
             return InboundOut(action="reject", reason="no such mailbox on this domain")
 
-        identity_id, org_id, agent_id, identity_status = resolved
+        org_id, identity_id, active = resolved
         org_id = str(org_id)
-        set_tenant(db, org_id, None)
 
-        if (identity_status or "").upper() != "ACTIVE":
+        if not active:
             # A known but disabled mailbox. Same instruction to Cloudflare, different reason - the
             # operator can see which of the two happened.
             return InboundOut(action="reject", reason="this mailbox is not active")
+
+        set_tenant(db, org_id, None)
+
+        # NOW that the tenant is bound, the identity itself is readable - so the agent that owns this
+        # mailbox comes from `mail_identities`, not from the routing table. Routing stays free of
+        # anything but the route.
+        identity_agent = db.execute(
+            text("SELECT agent_id FROM mail_identities WHERE id = :id"),
+            {"id": identity_id},
+        ).scalar()
 
         received = payload.received_at or datetime.now(timezone.utc)
         if received.tzinfo is None:
@@ -165,7 +173,7 @@ def ingest(
         message = models.MailMessage(
             id=str(_uuid.uuid4()),
             org_id=org_id,
-            agent_id=str(agent_id) if agent_id else None,
+            agent_id=str(identity_agent) if identity_agent else None,
             provider_message_id=(payload.message_id or f"cf:{received.timestamp()}")[:255],
             direction=models.MailMessage.DIRECTION_INBOUND,
             sender=payload.sender or None,
