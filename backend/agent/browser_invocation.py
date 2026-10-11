@@ -219,6 +219,14 @@ class InvocationOutcome:
     outcome_certain: bool = True
     finished_at: Optional[datetime] = None
 
+    #: WHAT THE RUN OBSERVED, CHOSE AND REACHED. Without this the record of a goal-driven run said
+    #: only "browser.blocked" and the reasoning existed nowhere but a re-run. Kept as ordinary
+    #: serialisable data so it can be persisted on the activity row rather than only logged.
+    trace: list[dict[str, Any]] = field(default_factory=list)
+    final_url: Optional[str] = None
+    final_title: Optional[str] = None
+    goal: Optional[str] = None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
@@ -234,6 +242,10 @@ class InvocationOutcome:
             "receipt": self.receipt,
             "outcome_certain": self.outcome_certain,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+            "trace": list(self.trace),
+            "final_url": self.final_url,
+            "final_title": self.final_title,
+            "goal": self.goal,
         }
 
 
@@ -394,6 +406,10 @@ def _interpret(task: BrowserTask, raw: dict[str, Any]) -> InvocationOutcome:
         receipt=receipt,
         outcome_certain=certain,
         finished_at=datetime.now(timezone.utc),
+        trace=list(raw.get("trace") or []),
+        final_url=raw.get("final_url"),
+        final_title=raw.get("final_title"),
+        goal=raw.get("goal"),
     )
 
 

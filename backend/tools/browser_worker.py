@@ -946,10 +946,15 @@ def main() -> int:
 
     try:
         evidence = open_store(org_id=task.org_id, run_id=task.task_id)
-    except Exception:
+        _log(f"evidence: store opened for {task.task_id[:8]}")
+    except Exception as exc:
         # A store that cannot be opened must not stop the run: the browser work is still valid, and
         # the references are simply marked non-durable rather than presented as evidence.
+        #
+        # LOGGED, because swallowing this is exactly why several live runs reported `EVIDENCE: []`
+        # with no way to find out whether nothing was captured or the store never opened.
         evidence = None
+        _log(f"evidence: STORE UNAVAILABLE ({type(exc).__name__}: {exc}); no screenshot can be kept")
 
     provider = PlaywrightProvider()
     provider._evidence = evidence

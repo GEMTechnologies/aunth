@@ -973,6 +973,28 @@ class AgentWorker:
         self._record_activity(job, agent, workflow, spec, activity)
         self._stage_events(job, agent, workflow, spec, activity)
 
+        # A HANDLER THAT REPORTS ITS OWN RUN DID NOT HAPPEN MUST NOT PRODUCE A GREEN JOB.
+        # `ledger.succeed` and ExecutionResult.SUCCEEDED were unconditional, so job 7150d0ba recorded
+        # SUCCEEDED while its own outcome was BLOCKED and another recorded SUCCEEDED after the worker
+        # crashed outright. PARKED is not FAILED - a BLOCKED browser run is a correct decision to stop
+        # and must not be retried - but a CRASH is an infrastructure fault, is retryable, and has to be
+        # visible. The handler states which it was; this only honours it.
+        if str(activity.get("job_outcome", "")).upper() == "FAILED":
+            detail = str(activity.get("summary") or "the specialist reported that its run did not happen")
+            ledger.fail(attempt, category="TRANSIENT_NETWORK", error=detail[:500], retryable=True)
+            metrics.inc("fleet.execution_failed", specialist=spec.key)
+            logger.warning(
+                "fleet_execution_reported_failed",
+                extra={"job_id": job.id, "agent_id": job.agent_id, "specialist": spec.key,
+                       "detail": detail[:300]},
+            )
+            self.db.flush()
+            return ExecutionResult(
+                job_id=job.id, outcome=ExecutionResult.FAILED,
+                workflow_id=job.workflow_id, agent_id=job.agent_id,
+                specialist=spec.key, detail=detail, activity_recorded=True,
+            )
+
         ledger.succeed(attempt, output={"specialist": spec.key, "summary": activity.get("summary")})
 
         # last_active_at becomes real HERE, and only after the work is durable.
@@ -2305,6 +2327,12 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
         org_document_ids=_org_document_ids(db, agent.org_id),
     )
 
+    problems = list(getattr(outcome, "problems", None) or [])
+    crashed = any(
+        str(p.get("kind", "")).upper() in {"WORKER_CRASH", "TASK_CONSTRUCTION", "BAD_ACTION_SCOPE"}
+        for p in problems if isinstance(p, dict)
+    )
+
     return {
         "summary": _browser_summary(outcome),
         "summary_key": f"browser.{outcome.status.lower()}",
@@ -2317,6 +2345,26 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
             else models.AgentWorkflow.WAITING
         ),
         "meaningful": outcome.status == "COMPLETED",
+        # THE JOB OUTCOME, which is NOT the workflow outcome. A BLOCKED run is a correct decision to
+        # stop and the handler did its job - it must not be retried, and the workflow parks. A CRASH
+        # is different: nothing was decided, the run never happened, and reporting SUCCEEDED for it
+        # hides an infrastructure fault behind a green tick. Measured: job 7150d0ba recorded
+        # SUCCEEDED while its own outcome was BLOCKED.
+        "job_outcome": "FAILED" if crashed else "SUCCEEDED",
+        # THE ACTION TRACE, persisted so a job can show what it observed, chose and achieved. Without
+        # this the record said only "browser.blocked" and the reasoning existed nowhere but a
+        # re-run.
+        "structured_data": {
+            "browser_status": outcome.status,
+            "ran": bool(getattr(outcome, "ran", False)),
+            "completed_steps": list(getattr(outcome, "completed_steps", None) or []),
+            "final_url": getattr(outcome, "final_url", None),
+            "final_title": getattr(outcome, "final_title", None),
+            "trace": list(getattr(outcome, "trace", None) or []),
+            "evidence": list(getattr(outcome, "evidence", None) or []),
+            "problems": problems,
+            "goal": getattr(task, "goal", None),
+        },
         "outcome": outcome.to_dict(),
     }
 
