@@ -563,11 +563,30 @@ def _control_inventory(provider: Any) -> list[dict[str, Any]]:
                    // label five times and never ticked the box. The element carrying the state must be
                    // discoverable even when it is the element the portal chose not to draw.
                    const t = (e.type || '').toLowerCase();
-                   if (t === 'checkbox' || t === 'radio') return !e.disabled;
-                   const r = e.getBoundingClientRect();
-                   if (r.width <= 0 || r.height <= 0) return false;
-                   const s = getComputedStyle(e);
-                   return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+                   if (t !== 'checkbox' && t !== 'radio') {
+                     const r = e.getBoundingClientRect();
+                     if (r.width <= 0 || r.height <= 0) return false;
+                     const s = getComputedStyle(e);
+                     if (s.visibility === 'hidden' || s.display === 'none' || s.opacity === '0') {
+                       return false;
+                     }
+                   }
+                   if (e.disabled) return false;
+                   // A COVERED CONTROL CANNOT BE CLICKED, SO IT IS NOT AN OPTION.
+                   //
+                   // MEASURED: once the registration interstitial is showing, the email page's "Next"
+                   // is still in the DOM and still painted, so it was offered - and the model chose it
+                   // over the modal's REGISTER, twice, with no effect. Offering a control the page is
+                   // covering invites exactly that. The hit test asks the browser what a click would
+                   // actually land on, which is the only honest answer.
+                   try {
+                     const b = e.getBoundingClientRect();
+                     const cx = Math.min(Math.max(b.left + b.width / 2, 1), window.innerWidth - 2);
+                     const cy = Math.min(Math.max(b.top + b.height / 2, 1), window.innerHeight - 2);
+                     const top = document.elementFromPoint(cx, cy);
+                     if (top && top !== e && !e.contains(top) && !top.contains(e)) return false;
+                   } catch (_) { /* a hit test that cannot run must not hide the control */ }
+                   return true;
                  };
                  // A CONTROL'S NAME IS OFTEN ON ITS LABEL, NOT INSIDE IT. A checkbox has no inner
                  // text at all: the UN Partner Portal's registration consent is
