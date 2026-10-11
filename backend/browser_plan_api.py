@@ -303,6 +303,11 @@ def account(payload: AccountIn, _: str = Depends(require_plan_key)) -> AccountOu
 
     db = SessionLocal()
     try:
+        # BIND THE TENANT FIRST. `credential_secrets` is org-scoped, so with no binding
+        # `app.current_org()` is NULL and the INSERT violates the policy - measured live as an
+        # InsufficientPrivilege with no obvious cause. The application role was necessary but not
+        # sufficient.
+        set_tenant(db, payload.org_id, None)
         store = store_from_settings(db, settings)
         created = ensure_account(
             store, org_id=payload.org_id,
@@ -319,6 +324,7 @@ def account(payload: AccountIn, _: str = Depends(require_plan_key)) -> AccountOu
         logger.warning("portal account unavailable: %s: %s", type(exc).__name__, str(exc)[:200])
         return AccountOut(detail=f"{type(exc).__name__}: {str(exc)[:200]}")
     finally:
+        clear_tenant(db)
         db.close()
 
 
