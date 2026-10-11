@@ -642,7 +642,9 @@ def _run_goal(
             questions=(
                 DecisionQuestion(
                     key="next_action",
-                    type="choice",
+                    # UPPERCASE, and the set is closed: the gateway accepts BOOLEAN, CHOICE, SCORE.
+                    # A lowercase "choice" raised UnknownQuestionType and killed the run as a crash.
+                    type="CHOICE",
                     instructions=(
                         f"Objective: {goal}\n"
                         f"Current page: {_safe_title(provider)} ({_safe_url(provider)})\n"
