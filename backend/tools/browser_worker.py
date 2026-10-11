@@ -572,13 +572,24 @@ def _run_goal(
     Returns (status, completed, problems, shots, trace). The trace is returned rather than only
     logged so the caller can PERSIST it - a job that cannot show its own reasoning is not auditable.
     """
-    from agent.decision.gateway import DecisionGateway
+    from agent.decision.gateway import build_gateway
     from agent.decision.models import DecisionQuestion, DecisionRequest
 
     completed: list[str] = []
     trace: list[dict[str, Any]] = []
     shots: list[str] = []
     problems: list[dict[str, Any]] = []
+
+    try:
+        # THE FACTORY, NOT THE CONSTRUCTOR. `DecisionGateway()` builds an EMPTY ProviderChain, which
+        # is why the first live goal run raised NoDecisionProvider "tried []". `build_gateway` wires
+        # rules -> local, and appends the model only when one is configured.
+        from config import settings as _settings
+
+        gateway = build_gateway(settings=_settings)
+    except Exception as exc:
+        return ("FAILED", completed, [{"kind": "PLANNER_UNAVAILABLE",
+                                       "detail": f"{type(exc).__name__}: {exc}"}], shots, trace)
 
     def shoot(label: str) -> None:
         if evidence is None:
