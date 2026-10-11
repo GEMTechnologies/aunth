@@ -907,6 +907,19 @@ def _run_goal(
             entry = {"step": step_index, "action": "fill", "field": field,
                      "url_before": _safe_url(provider)}
             result = provider.act(Step.FILL, field, value)
+            if not result.ok:
+                # A STALE REFERENCE, NOT A MISSING VALUE. Measured on the UN Partner Portal's signup
+                # form: the password filled, the page re-rendered, and the email fill then hit an
+                # element that no longer existed - reported as "could not fill email with the
+                # organisation's verified value", which sounds like a data problem and is not.
+                #
+                # One re-observe and retry. The page has changed under us, so the field has to be
+                # looked up again rather than assumed.
+                _settle(provider)
+                again = _fill_from_verified(provider, values)
+                if again and again[0] == field:
+                    result = provider.act(Step.FILL, again[0], again[1])
+                    entry["retried"] = True
             entry["result"] = "ok" if result.ok else f"failed: {getattr(result, 'detail', '')[:160]}"
             trace.append(entry)
             # The VALUE is never traced. A password that reached the activity record would be
@@ -917,7 +930,8 @@ def _run_goal(
             if not result.ok:
                 return ("BLOCKED", completed,
                         [{"kind": "EXECUTION_FAILED",
-                          "detail": f"could not fill {field!r} with the organisation's verified value"}],
+                          "detail": (f"could not fill {field!r} after re-observing; the field is not "
+                                     f"present on the page")}],
                         shots, trace)
             continue
 
