@@ -29,13 +29,29 @@ logger = logging.getLogger("browser_plan_api")
 
 router = APIRouter(prefix="/internal/browser", tags=["internal-browser"])
 
-#: Controls a planner may never choose, mirrored from the worker. Enforced on BOTH sides: the worker
-#: refuses to activate them, and the planner refuses to propose them. A policy that lives in only one
-#: of the two can be bypassed by the other.
+#: Terms that mean a consequential commitment.
 CONSEQUENTIAL = (
     "submit", "register", "sign up", "signup", "create account", "apply",
     "i agree", "i accept", "declare", "confirm", "pay", "purchase",
 )
+
+#: Terms that only mean "go to the form". A LINK carrying one of these NAVIGATES; it commits
+#: nothing. The commitment is the submit control ON that form. Blocking the link made the goal
+#: unreachable - the planner was forbidden from opening the very page the objective asks about.
+NAVIGATIONAL = ("create account", "register", "sign up", "signup", "apply")
+
+
+def _is_consequential(text: str, tag: str = "") -> bool:
+    """Whether activating this control would make a commitment.
+
+    Tag-aware on purpose: `<a>Create account here</a>` opens a registration form, whereas
+    `<button>Register</button>` on that form submits it. Treating both as forbidden is not caution,
+    it is a policy that prevents the task from being done at all.
+    """
+    lowered = (text or "").strip().lower()
+    if tag.upper() == "A":
+        return any(t in lowered for t in CONSEQUENTIAL if t not in NAVIGATIONAL)
+    return any(t in lowered for t in CONSEQUENTIAL)
 
 MAX_CONTROLS = 25
 
@@ -138,7 +154,7 @@ def plan(
         label = (control.text or control.name or control.id or "").strip()
         if not label:
             continue
-        if not payload.submission_authorised and any(t in label.lower() for t in CONSEQUENTIAL):
+        if not payload.submission_authorised and _is_consequential(label, control.tag):
             logger.info("planner refused a consequential control: %s", label[:60])
             continue
         offered.append({"tag": control.tag, "id": control.id, "text": label})

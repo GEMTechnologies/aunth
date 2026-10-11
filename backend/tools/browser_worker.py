@@ -539,14 +539,25 @@ FORBIDDEN_CLICK = (
 )
 
 
-def _is_forbidden_control(text: str) -> bool:
+#: Terms that only mean "go to the form". Mirrors browser_plan_api: a LINK carrying one of these
+#: navigates; only the submit control ON the form commits.
+NAVIGATIONAL = ("create account", "register", "sign up", "signup", "apply")
+
+
+def _is_forbidden_control(text: str, tag: str = "") -> bool:
     """Whether activating this control would make a consequential commitment.
 
-    Checked against the control's VISIBLE TEXT, because that is what the planner chooses from. The
-    model is not trusted to police itself: a disallowed action is refused here even when the planner
-    proposes it, which is the difference between a policy and a prompt.
+    Checked against the control's VISIBLE TEXT and its tag, because that is what the planner chooses
+    from. The model is not trusted to police itself: a disallowed action is refused here even when
+    the planner proposes it, which is the difference between a policy and a prompt.
+
+    Tag-aware: `<a>Create account here</a>` opens a registration form; `<button>Register</button>`
+    on that form submits it. Blocking the link would forbid the planner from reaching the page the
+    objective is about.
     """
     lowered = (text or "").strip().lower()
+    if (tag or "").upper() == "A":
+        return any(term in lowered for term in FORBIDDEN_CLICK if term not in NAVIGATIONAL)
     return any(term in lowered for term in FORBIDDEN_CLICK)
 
 
@@ -656,7 +667,7 @@ def _run_goal(
             label = c.get("text") or c.get("name") or c.get("id") or ""
             if not label.strip():
                 continue
-            if _is_forbidden_control(label) and not submission_authorised:
+            if _is_forbidden_control(label, c.get("tag", "")) and not submission_authorised:
                 continue  # refused, not offered
             options.append({"id": c.get("id") or "", "text": label, "tag": c.get("tag")})
 
@@ -712,7 +723,7 @@ def _run_goal(
                       "detail": f"planner chose {chosen!r}, which was not an observed control"}],
                     shots, trace)
 
-        if _is_forbidden_control(match["text"]) and not submission_authorised:
+        if _is_forbidden_control(match["text"], match.get("tag", "")) and not submission_authorised:
             entry["result"] = "REFUSED: consequential control"
             trace.append(entry)
             return ("BLOCKED", completed,
