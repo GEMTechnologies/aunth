@@ -3069,3 +3069,62 @@ Index("ix_oauth_accounts_user", OAuthAccount.user_id)
 Index("ix_oauth_states_state", OAuthState.state)
 Index("ix_saml_providers_org", SAMLProvider.org_id)
 Index("ix_saml_assertions_provider", SAMLAssertion.provider_id)
+
+
+class MailVerificationRequest(Base):
+    """A verification Granada has TRIGGERED and is waiting to receive.
+
+    THE ANCHOR THAT MAKES EXTRACTION SAFE. Without a row here, any message containing a six-digit
+    number could satisfy any waiting workflow - which is how a code for one organisation's account
+    gets typed into another portal. A request records which mailbox the code must arrive at, which
+    portal sent it, and the window it is valid for; `agent.mail.verification.extract` refuses
+    anything that does not match all three.
+
+    A row is created when Granada initiates a registration or login that triggers verification, and
+    is marked SATISFIED exactly once - the fingerprint is unique per organisation, so applying the
+    same code twice is a database-level no-op rather than a race between two workers.
+    """
+
+    __tablename__ = "mail_verification_requests"
+
+    PENDING = "PENDING"
+    SATISFIED = "SATISFIED"
+    EXPIRED = "EXPIRED"
+    CANCELLED = "CANCELLED"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid4_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organisations.id", ondelete="CASCADE"), index=True)
+    agent_id: Mapped[Optional[str]] = mapped_column(String(36))
+
+    #: The mailbox the code must arrive at. Extraction refuses a message delivered anywhere else.
+    address: Mapped[str] = mapped_column(String(320))
+    #: The portal the registration is happening on. Extraction refuses any other sender.
+    portal_host: Mapped[str] = mapped_column(String(255))
+    purpose: Mapped[str] = mapped_column(String(120))
+    #: The browser task waiting on this, so the result reaches the right run.
+    browser_task_id: Mapped[Optional[str]] = mapped_column(String(36))
+
+    status: Mapped[str] = mapped_column(String(20), default=PENDING, index=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    satisfied_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    satisfied_message_id: Mapped[Optional[str]] = mapped_column(String(36))
+    result_kind: Mapped[Optional[str]] = mapped_column(String(12))
+    result_code: Mapped[Optional[str]] = mapped_column(String(32))
+    result_link: Mapped[Optional[str]] = mapped_column(String(2048))
+    #: Stable identity of the extracted value. UNIQUE per organisation, which is what makes
+    #: "apply this code" idempotent under concurrency rather than merely inside one process.
+    fingerprint: Mapped[Optional[str]] = mapped_column(String(200))
+    #: How many messages were examined. A request that saw twenty messages and no code tells the
+    #: operator something a bare PENDING does not.
+    examined: Mapped[int] = mapped_column(Integer, default=0)
+    last_reason: Mapped[Optional[str]] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+    __table_args__ = (
+        UniqueConstraint("org_id", "fingerprint", name="uq_mail_verification_fingerprint"),
+        Index("ix_mail_verification_pending", "org_id", "status"),
+    )
