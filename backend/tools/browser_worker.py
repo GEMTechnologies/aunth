@@ -1039,7 +1039,12 @@ def _first_text_input(provider: Any) -> str:
                  const els = Array.from(document.querySelectorAll('input'));
                  for (const e of els) {
                    const t = (e.type || 'text').toLowerCase();
-                   if (!['text','number','tel',''].includes(t)) continue;
+                   // 'email' BELONGS HERE. It was omitted, so the UN Partner Portal's email field -
+                   // type="email" - was invisible to this helper. That made has_empty_form false on
+                   // the registration page (so the flow constraint never fired) and, before the fill
+                   // step was rewritten, made the fill a no-op whose only symptom was a Next button
+                   // that stayed disabled and a click that did nothing.
+                   if (!['text','email','search','url','number','tel',''].includes(t)) continue;
                    if (e.offsetParent === null) continue;
                    if (e.disabled || e.readOnly) continue;
                    if (e.value) continue;
