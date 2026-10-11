@@ -373,6 +373,21 @@ def plan(
     if verdict.challenge.value in ("EMAIL_VERIFICATION", "EMAIL_CODE"):
         return _await_email(payload, verdict)
 
+    if verdict.challenge.value == "ACKNOWLEDGEMENT":
+        # ANSWERED DIRECTLY rather than left to the model. The interstitial's only non-committing
+        # control is its acknowledgement, and REGISTER beside it is filtered out - so handing the pair
+        # to a model invites it to pick the one it cannot have, or to stall. The wording is matched
+        # generically because these pages are template copy, not site logic.
+        for control in payload.controls:
+            label = (control.text or "").strip()
+            if any(term in label.lower() for term in ("understand", "got it", "yes,")):
+                return PlanOut(
+                    action=label, action_kind="click", confidence=1.0,
+                    detail=verdict.reason, challenge=verdict.challenge.value,
+                    disposition="HANDLE", tier=1,
+                )
+        # Nothing that reads as an acknowledgement: fall through to the model rather than guessing.
+
     if verdict.challenge.value == "SIMPLE_QUESTION" and verdict.answer:
         # Answered by FILLING the only empty text field, not by clicking. This is not meaningful bot
         # protection, so it is handled rather than handed to a human.

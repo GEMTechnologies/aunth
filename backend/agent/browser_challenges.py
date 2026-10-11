@@ -36,6 +36,10 @@ class Challenge(str, Enum):
     PAYMENT = "PAYMENT"
     RATE_LIMIT = "RATE_LIMIT"
     LOGIN_REQUIRED = "LOGIN_REQUIRED"
+    #: A page that asks only to be acknowledged before showing the next step - "Yes, I understand",
+    #: "you will be redirected". MEASURED on the UN Partner Portal: after the email step, Next reveals
+    #: exactly this, with "Yes, I understand" to proceed and REGISTER beside it.
+    ACKNOWLEDGEMENT = "ACKNOWLEDGEMENT"
     UNKNOWN_CHALLENGE = "UNKNOWN_CHALLENGE"
 
 
@@ -107,6 +111,13 @@ _LEGAL = (r"i (?:agree|accept) (?:to )?the (?:terms|conditions)", r"declaration"
 _PAYMENT = (r"application fee", r"pay(?:ment)? (?:of|now|by)", r"card number", r"billing address")
 _RATE = (r"too many requests", r"try again (?:later|in \d+)", r"rate limit", r"temporarily unavailable")
 _LOGIN = (r"sign in to continue", r"please log ?in", r"session (?:has )?expired", r"log in to your account")
+#: A page whose only real content is "acknowledge this and continue". The wording is generic because
+#: these interstitials are template copy, not site logic.
+_ACKNOWLEDGE = (
+    r"yes,? i understand", r"i understand", r"you will be redirected",
+    r"please click on .{0,40}(?:sign up|register|continue|next)",
+    r"got it", r"ok,? (?:continue|proceed)",
+)
 
 
 def _haystack(*parts: str) -> str:
@@ -192,6 +203,17 @@ def classify(
         )
 
     # --- Tier 1: handled unattended ---
+    # ACKNOWLEDGEMENT BEFORE EVERYTHING ELSE IN TIER 1. The page says "you will be redirected ...
+    # click on Sign up now", which would otherwise look like an email-verification or a navigation
+    # step. Acknowledging PROCEDES; it commits nothing - the commitment is the control on the page it
+    # leads to, which is still guarded.
+    if _matches(_ACKNOWLEDGE, hay):
+        return Classification(
+            Challenge.ACKNOWLEDGEMENT, Disposition.HANDLE, 1,
+            "the portal asks to be acknowledged before continuing; this proceeds without committing "
+            "anything, so it is answered rather than treated as a declaration",
+        )
+
     # Email BEFORE SMS: "check your email" frequently also mentions a phone fallback, and the email
     # path is the one Granada can complete.
     if _matches(_EMAIL_CODE, hay):

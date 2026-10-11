@@ -57,6 +57,35 @@ def test_an_expired_session_is_re_established_from_the_stored_one():
 
 
 # ---------------------------------------------------------------------------
+# Acknowledgement interstitials - MEASURED on the UN Partner Portal
+# ---------------------------------------------------------------------------
+def test_the_registration_interstitial_is_an_acknowledgement_not_a_declaration():
+    """Measured live: after the email step, Next reveals exactly this. It PROCEEDS; it commits
+    nothing - the commitment is the control on the page it leads to, which stays guarded."""
+    out = classify(text=(
+        "Registration Dear user, in order to register, you will be redirected to the following "
+        "page: On this page, please click on 'Sign up now' Yes, I understand REGISTER"
+    ))
+    assert out.challenge is Challenge.ACKNOWLEDGEMENT
+    assert out.disposition is Disposition.HANDLE
+    assert out.tier == 1
+
+
+def test_an_acknowledgement_is_not_mistaken_for_a_legal_declaration():
+    """'I understand' is not 'I agree' - conflating them would refuse a step that carries no
+    liability, and stall every registration on this portal."""
+    out = classify(text="Yes, I understand")
+    assert out.challenge is Challenge.ACKNOWLEDGEMENT
+    assert out.challenge is not Challenge.LEGAL_DECLARATION
+
+
+def test_a_real_declaration_is_still_refused():
+    out = classify(text="I certify that I am an authorised representative of this organisation")
+    assert out.challenge is Challenge.LEGAL_DECLARATION
+    assert out.tier == 3
+
+
+# ---------------------------------------------------------------------------
 # Tier 2 - bounded retry
 # ---------------------------------------------------------------------------
 def test_rate_limiting_is_retried_not_failed():
