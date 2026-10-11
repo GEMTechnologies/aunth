@@ -560,11 +560,27 @@ def _control_inventory(provider: Any) -> list[dict[str, Any]]:
                    const s = getComputedStyle(e);
                    return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
                  };
+                 // A CONTROL'S NAME IS OFTEN ON ITS LABEL, NOT INSIDE IT. A checkbox has no inner
+                 // text at all: the UN Partner Portal's registration consent is
+                 // `<input type=checkbox>` plus `<label>Yes, I understand</label>`, and the REGISTER
+                 // button stays DISABLED until it is ticked. Reading only innerText offered the model
+                 // two nameless entries and no way to acknowledge, so it clicked the blocked Next
+                 // twice and the run stopped. Measured, after two wrong theories about the same
+                 // symptom.
+                 const nameOf = (e) => {
+                   const inner = (e.innerText || e.value || '').trim();
+                   if (inner) return inner;
+                   try {
+                     if (e.labels && e.labels.length) return (e.labels[0].innerText || '').trim();
+                   } catch (_) {}
+                   return (e.getAttribute('aria-label') || e.title || '').trim();
+                 };
                  return Array.from(document.querySelectorAll('input,button,a,select'))
                    .filter(vis)
-                   .slice(0, 60)
                    .map(e => ({tag: e.tagName, type: e.type||'', name: e.name||'', id: e.id||'',
-                               text: (e.innerText||e.value||'').trim().slice(0,80)}));
+                               text: nameOf(e).slice(0,80)}))
+                   .filter(c => c.text)
+                   .slice(0, 60);
                }"""
         )
     except Exception:
