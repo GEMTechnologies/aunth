@@ -555,6 +555,15 @@ def _control_inventory(provider: Any) -> list[dict[str, Any]]:
             # in-flow controls, so it selects the same set or more, never fewer.
             """() => {
                  const vis = (e) => {
+                   // A VISUALLY-HIDDEN CHECKBOX OR RADIO STILL OWNS ITS STATE.
+                   //
+                   // MEASURED: the registration consent's real <input type=checkbox> is hidden behind
+                   // a custom control, so a size check excluded it - leaving only its sibling LABEL,
+                   // which has no for=/id linkage and therefore toggles nothing. The run clicked that
+                   // label five times and never ticked the box. The element carrying the state must be
+                   // discoverable even when it is the element the portal chose not to draw.
+                   const t = (e.type || '').toLowerCase();
+                   if (t === 'checkbox' || t === 'radio') return !e.disabled;
                    const r = e.getBoundingClientRect();
                    if (r.width <= 0 || r.height <= 0) return false;
                    const s = getComputedStyle(e);
@@ -881,7 +890,7 @@ def _run_goal(
             if _is_forbidden_control(label, c.get("tag", "")) and not submission_authorised:
                 continue  # refused, not offered
             offered.append({"id": c.get("id") or "", "text": label, "tag": c.get("tag"),
-                            "ref": c.get("ref") or ""})
+                            "type": c.get("type") or "", "ref": c.get("ref") or ""})
 
         if not offered:
             # EVERY REMAINING CONTROL IS ONE THE POLICY REFUSES. Report it as a human gate with the
@@ -1053,7 +1062,7 @@ def _run_goal(
         elif match.get("ref"):
             # BY REFERENCE, not by text: the model chose a specific observed control, so the click
             # lands on that element rather than on whichever element happens to carry the same words.
-            started = _act_on_ref(provider, match["ref"], match["text"])
+            started = _act_on_ref(provider, match["ref"], match["text"], match.get("type", ""))
         else:
             started = provider.act(Step.CLICK, match["text"])
         result = started
@@ -1353,27 +1362,37 @@ def _page_fingerprint(provider: Any) -> str:
         return _safe_url(provider)
 
 
-def _act_on_ref(provider: Any, ref: str, label: str) -> Any:
-    """Click the control the model chose, by the reference stamped on it during observation.
+def _act_on_ref(provider: Any, ref: str, label: str, ctype: str = "") -> Any:
+    """Activate the control the model chose, by the reference stamped on it during observation.
 
     WHY NOT BY TEXT. Measured: the UN Partner Portal's registration consent was clicked five times by
     text and never ticked - its wording lives on a LABEL that is not the element carrying the
-    behaviour. Clicking the observed element itself activates whatever the portal actually built,
-    whether that is a checkbox, a MUI div, or a label wrapping a hidden input.
+    behaviour.
+
+    WHY check() AND NOT click() FOR A TICK. The real checkbox is visually hidden behind a custom
+    control, and Playwright will not click an element it cannot see - nor should it, since a click
+    also has to land on a real point. `set_checked(force=True)` sets the state the element owns
+    without pretending to be a user's pointer, which is exactly what is needed and is honest about it.
 
     Falls back to the text click if the element is gone, which happens legitimately when a page
     re-renders between observation and action.
     """
     from agent.browser_runtime import ActionResult, Failure
 
+    kind = (ctype or "").lower()
     try:
         locator = provider._page.locator(f"[data-granada-ref='{ref}']").first
         if locator.count() > 0:
-            locator.click(timeout=15000)
+            if kind in ("checkbox", "radio"):
+                locator.set_checked(True, force=True)
+            else:
+                locator.click(timeout=15000)
             provider._page.wait_for_load_state("domcontentloaded", timeout=provider.timeout_ms)
             return ActionResult(ok=True, page=provider.observe())
     except Exception as exc:
-        _log(f"ref click {ref} ({label!r}) failed: {type(exc).__name__}: {exc}")
+        _log(f"ref action {ref} ({label!r}) failed: {type(exc).__name__}: {exc}")
+    if kind in ("checkbox", "radio"):
+        return provider.act(Step.DECLARE, label)
     return provider.act(Step.CLICK, label)
 
 
