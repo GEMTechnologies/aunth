@@ -596,13 +596,23 @@ def _control_inventory(provider: Any) -> list[dict[str, Any]]:
                    }
                    return '';
                  };
+                 // EVERY CONTROL GETS A STABLE REFERENCE.
+                 //
+                 // Clicking a custom control by its TEXT does not activate it: measured, the
+                 // registration consent was clicked five times and never ticked, because the text
+                 // lives on a LABEL that is not the element carrying the behaviour. The reference is
+                 // stamped onto the element itself so the click lands on the control the model chose,
+                 // whatever markup the portal used to build it.
                  return Array.from(document.querySelectorAll(
                      "input,button,a,select,[role=button],[role=checkbox],[role=link],[role=tab],label"
                    ))
                    .filter(vis)
-                   .map(e => ({tag: e.tagName, type: e.type||'', name: e.name||'', id: e.id||'',
-                               role: e.getAttribute('role')||'',
-                               text: nameOf(e).slice(0,80)}))
+                   .map((e, i) => {
+                     e.setAttribute('data-granada-ref', 'g' + i);
+                     return {ref: 'g' + i, tag: e.tagName, type: e.type||'', name: e.name||'',
+                             id: e.id||'', role: e.getAttribute('role')||'',
+                             text: nameOf(e).slice(0,80)};
+                   })
                    .filter(c => c.text)
                    .slice(0, 60);
                }"""
@@ -861,7 +871,8 @@ def _run_goal(
                 continue
             if _is_forbidden_control(label, c.get("tag", "")) and not submission_authorised:
                 continue  # refused, not offered
-            options.append({"id": c.get("id") or "", "text": label, "tag": c.get("tag")})
+            options.append({"id": c.get("id") or "", "text": label, "tag": c.get("tag"),
+                            "ref": c.get("ref") or ""})
 
         if not options:
             return ("BLOCKED", completed,
@@ -1011,6 +1022,10 @@ def _run_goal(
         # and then report that the page did not change.
         if kind == "fill":
             started = provider.act(Step.FILL, match["text"], chosen)
+        elif match.get("ref"):
+            # BY REFERENCE, not by text: the model chose a specific observed control, so the click
+            # lands on that element rather than on whichever element happens to carry the same words.
+            started = _act_on_ref(provider, match["ref"], match["text"])
         else:
             started = provider.act(Step.CLICK, match["text"])
         result = started
@@ -1308,6 +1323,30 @@ def _page_fingerprint(provider: Any) -> str:
         # A page that cannot be read falls back to the URL: the guard then behaves as it did before
         # rather than reporting change it cannot substantiate.
         return _safe_url(provider)
+
+
+def _act_on_ref(provider: Any, ref: str, label: str) -> Any:
+    """Click the control the model chose, by the reference stamped on it during observation.
+
+    WHY NOT BY TEXT. Measured: the UN Partner Portal's registration consent was clicked five times by
+    text and never ticked - its wording lives on a LABEL that is not the element carrying the
+    behaviour. Clicking the observed element itself activates whatever the portal actually built,
+    whether that is a checkbox, a MUI div, or a label wrapping a hidden input.
+
+    Falls back to the text click if the element is gone, which happens legitimately when a page
+    re-renders between observation and action.
+    """
+    from agent.browser_runtime import ActionResult, Failure
+
+    try:
+        locator = provider._page.locator(f"[data-granada-ref='{ref}']").first
+        if locator.count() > 0:
+            locator.click(timeout=15000)
+            provider._page.wait_for_load_state("domcontentloaded", timeout=provider.timeout_ms)
+            return ActionResult(ok=True, page=provider.observe())
+    except Exception as exc:
+        _log(f"ref click {ref} ({label!r}) failed: {type(exc).__name__}: {exc}")
+    return provider.act(Step.CLICK, label)
 
 
 def _sweep_stale_profiles(*, keep: str | None, now: float | None = None) -> list[str]:
