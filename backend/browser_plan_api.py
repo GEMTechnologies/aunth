@@ -91,17 +91,34 @@ class PlanIn(BaseModel):
     goal: str
     url: str = ""
     title: str = ""
+    #: Visible page text, so the container can classify the obstacle. The worker already has it; the
+    #: planner needs it to tell an email-verification step from an image CAPTCHA.
+    page_text: str = ""
     controls: list[ControlIn] = Field(default_factory=list)
     submission_authorised: bool = False
 
 
 class PlanOut(BaseModel):
     action: str = ""
+    #: What to do with `action`. The worker needs the KIND, not just a label: a simple arithmetic
+    #: challenge is answered by FILLING a field, whereas a navigation step is a CLICK.
+    action_kind: str = "click"
     confidence: Optional[float] = None
     provider: str = ""
     model: Optional[str] = None
     refused: bool = False
     detail: str = ""
+    #: The obstacle classification, by disposition. `WAIT_FOR_EMAIL` is the one that makes
+    #: unattended registration possible: the worker stops clicking and waits for a code instead of
+    #: reporting a dead end.
+    challenge: Optional[str] = None
+    disposition: Optional[str] = None
+    tier: Optional[int] = None
+    #: Set when the disposition is WAIT_FOR_EMAIL: the request the worker should poll.
+    verification_request_id: Optional[str] = None
+    verification_address: Optional[str] = None
+    #: Set for a hand-in, so the operator is told what to do rather than just "blocked".
+    prompt: str = ""
 
 
 def _build_planner(db: Session) -> Any:
@@ -130,6 +147,119 @@ def _build_planner(db: Session) -> Any:
     )
 
 
+def _primary_address(db: Any, org_id: str) -> Optional[str]:
+    """The organisation's own mailbox. Its permanent friendly address, if it has one."""
+    import models
+
+    row = (
+        db.query(models.MailIdentity)
+        .filter(models.MailIdentity.org_id == org_id, models.MailIdentity.is_primary.is_(True))
+        .first()
+    )
+    return getattr(row, "address", None) if row is not None else None
+
+
+def _await_email(payload: PlanIn, verdict: Any) -> PlanOut:
+    """Open a verification request and tell the worker to wait for the message.
+
+    The request is created HERE rather than by the worker, because it needs the organisation's
+    mailbox and a database - neither of which the sandboxed host has. The worker is told only the
+    request id, which is all it needs to poll.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from database import FleetSessionLocal
+    from tenant_context import clear_tenant, set_tenant
+    from agent.mail.verification_service import VerificationService
+
+    db = FleetSessionLocal()
+    request_id = None
+    address = None
+    try:
+        set_tenant(db, payload.org_id, None)
+        address = _primary_address(db, payload.org_id)
+        if not address:
+            return PlanOut(
+                refused=True,
+                detail=(
+                    "the portal has sent a verification message but this organisation has no "
+                    "Granada mailbox to receive it at; provision an address first"
+                ),
+                challenge=verdict.challenge.value, disposition="HAND_IN", tier=3,
+                prompt="Provision an @granadac.com address for this organisation, then resume.",
+            )
+        svc = VerificationService(db, org_id=payload.org_id)
+        # Reuse a live request for the same portal rather than creating a second one per page view:
+        # the portal often re-renders the same "check your email" screen, and a request per render
+        # would scatter the answer across rows.
+        host = (payload.url or "").split("//")[-1].split("/")[0].split(":")[0].lower()
+        existing = None
+        for row in svc.pending():
+            if row.portal_host == host and row.address == address:
+                existing = row
+                break
+        if existing is not None:
+            request_id = existing.id
+        else:
+            created = svc.request(
+                address=address, portal_host=host, purpose=f"browser: {payload.goal[:80]}",
+            )
+            request_id = created.id
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        logger.warning("verification request failed: %s: %s", type(exc).__name__, exc)
+        return PlanOut(
+            refused=True,
+            detail=f"could not open a verification request: {type(exc).__name__}: {str(exc)[:200]}",
+            challenge=verdict.challenge.value, disposition="HAND_IN", tier=3,
+        )
+    finally:
+        clear_tenant(db)
+        db.close()
+
+    return PlanOut(
+        action="wait_for_email",
+        action_kind="wait",
+        detail=verdict.reason,
+        challenge=verdict.challenge.value,
+        disposition="WAIT_FOR_EMAIL",
+        tier=1,
+        verification_request_id=request_id,
+        verification_address=address,
+        prompt="",
+    )
+
+
+@router.get("/verification/{request_id}", response_model=dict, summary="Poll a verification request")
+def verification_status(request_id: str, org_id: str) -> dict[str, Any]:
+    """What the waiting worker needs: the code or link, or an honest 'not yet'.
+
+    Takes `org_id` because the service refuses to act without a tenant, and because a request id
+    alone must never be enough to read another organisation's verification.
+    """
+    from database import FleetSessionLocal
+    from tenant_context import clear_tenant, set_tenant
+    from agent.mail.verification_service import VerificationService
+
+    if not org_id:
+        raise HTTPException(status_code=400, detail="org_id is required")
+
+    db = FleetSessionLocal()
+    try:
+        set_tenant(db, org_id, None)
+        svc = VerificationService(db, org_id=org_id)
+        out = svc.result_for(request_id)
+        db.commit()
+        return out
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        return {"ready": False, "status": "ERROR", "detail": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    finally:
+        clear_tenant(db)
+        db.close()
+
+
 @router.post("/plan", response_model=PlanOut, summary="Choose the next browser action")
 def plan(
     payload: PlanIn,
@@ -142,13 +272,50 @@ def plan(
     validated here as well as in the worker.
     """
     from agent.decision.models import DecisionQuestion, DecisionRequest
+    from agent.browser_challenges import Disposition, classify
 
     if not payload.org_id:
         raise HTTPException(status_code=400, detail="org_id is required; tenant unknown is a deny")
     if not payload.goal.strip():
         raise HTTPException(status_code=400, detail="goal is required")
 
-    # Only offer controls that could actually be activated, and only ones policy permits.
+    # ---- CLASSIFY FIRST. The obstacle decides whether the model is asked at all. ----
+    #
+    # An email-verification step is not a navigation choice: there is nothing on the page to click
+    # that completes it, and asking the model would produce another Next/Continue click and another
+    # unchanged page. It is recognised, turned into a verification request, and the worker is told to
+    # WAIT - which is what makes registration unattended rather than a dead end.
+    verdict = classify(url=payload.url, title=payload.title, text=payload.page_text)
+
+    if verdict.disposition is Disposition.REFUSE or verdict.disposition is Disposition.HAND_IN:
+        # Tier 3. Handed in with a prompt and WITHOUT losing the session: the worker keeps the
+        # browser alive so the operator's fix resumes the run rather than restarting it.
+        return PlanOut(
+            refused=True, detail=verdict.reason,
+            challenge=verdict.challenge.value, disposition=verdict.disposition.value,
+            tier=verdict.tier, prompt=verdict.prompt or verdict.reason,
+        )
+
+    if verdict.challenge.value in ("EMAIL_VERIFICATION", "EMAIL_CODE"):
+        return _await_email(payload, verdict)
+
+    if verdict.challenge.value == "SIMPLE_QUESTION" and verdict.answer:
+        # Answered by FILLING the only empty text field, not by clicking. This is not meaningful bot
+        # protection, so it is handled rather than handed to a human.
+        target = None
+        for control in payload.controls:
+            if control.tag.upper() == "INPUT" and (control.type or "text").lower() in ("text", "number"):
+                target = control.name or control.id
+                if target:
+                    break
+        if target:
+            return PlanOut(
+                action=target, action_kind="fill", confidence=1.0,
+                detail=verdict.reason, challenge=verdict.challenge.value,
+                disposition="HANDLE", tier=1,
+            )
+
+    # ---- Otherwise the model chooses a control, from what the browser actually saw. ----
     offered: list[dict[str, str]] = []
     for control in payload.controls[:MAX_CONTROLS]:
         label = (control.text or control.name or control.id or "").strip()

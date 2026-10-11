@@ -571,6 +571,7 @@ def _run_goal(
     planner_url: str,
     planner_key: str,
     org_id: str,
+    verification_url: str = "",
 ) -> tuple[str, list[str], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     """Pursue a high-level objective by choosing actions from what the page actually shows.
 
@@ -603,7 +604,11 @@ def _run_goal(
                   "detail": "no planner_url/planner_key in the task; the host cannot plan locally"}],
                 shots, trace)
 
-    def ask_planner(*, url: str, title: str, controls: list[dict[str, Any]]) -> dict[str, Any]:
+    # Derived from the planner URL when not given, so a deployment configures one endpoint.
+    if not verification_url:
+        verification_url = planner_url.rsplit("/", 1)[0] + "/verification"
+
+    def ask_planner(*, url: str, title: str, controls: list[dict[str, Any]], page_text: str = "") -> dict[str, Any]:
         """One authenticated planning request. Bounded by a timeout so a wedged planner cannot hang
         the browser run indefinitely."""
         import urllib.request
@@ -613,6 +618,9 @@ def _run_goal(
             "goal": goal,
             "url": url,
             "title": title,
+            # The visible text is what lets the CONTAINER classify the obstacle. The worker must not
+            # classify it itself: that decision needs the policy and the organisation's mailbox.
+            "page_text": page_text[:8000],
             "controls": controls,
             "submission_authorised": submission_authorised,
         }).encode("utf-8")
@@ -624,6 +632,45 @@ def _run_goal(
         )
         with urllib.request.urlopen(request, timeout=45) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    def page_text() -> str:
+        try:
+            return str(provider._page.evaluate("() => document.body ? document.body.innerText : ''"))
+        except Exception:
+            return ""
+
+    def await_verification(request_id: str, *, timeout_s: int = 180) -> dict[str, Any]:
+        """Poll until the portal's message has been read, or the window closes.
+
+        THIS IS THE STEP THAT MAKES REGISTRATION UNATTENDED. Without it an email-verification page is
+        a dead end: there is nothing on it to click that completes it, so the planner would click
+        Next forever and the run would stop with no page change. Here the run simply waits for the
+        mail to arrive, which the container is watching for.
+        """
+        import time
+        import urllib.parse
+        import urllib.request
+
+        deadline = time.time() + timeout_s
+        last: dict[str, Any] = {}
+        while time.time() < deadline:
+            query = urllib.parse.urlencode({"org_id": org_id})
+            url = f"{verification_url.rstrip('/')}/{urllib.parse.quote(request_id)}?{query}"
+            request = urllib.request.Request(
+                url, headers={"X-Plan-Key": planner_key}, method="GET"
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    last = json.loads(response.read().decode("utf-8"))
+            except Exception as exc:
+                last = {"ready": False, "status": "POLL_ERROR", "detail": f"{type(exc).__name__}: {exc}"}
+            if last.get("ready"):
+                return last
+            if str(last.get("status")) in ("EXPIRED", "CANCELLED", "UNKNOWN"):
+                return last
+            time.sleep(5)
+        return {"ready": False, "status": "TIMEOUT",
+                "detail": f"no verification message arrived within {timeout_s}s", **last}
 
     def shoot(label: str) -> None:
         """Persist a screenshot through the EXISTING evidence store, or RECORD that it failed.
@@ -684,19 +731,79 @@ def _run_goal(
 
         try:
             decision = ask_planner(
-                url=_safe_url(provider), title=_safe_title(provider), controls=options
+                url=_safe_url(provider), title=_safe_title(provider),
+                controls=options, page_text=page_text(),
             )
             chosen = str(decision.get("action") or "").strip()
             confidence = decision.get("confidence")
             provider_name = decision.get("provider") or ""
+            kind = str(decision.get("action_kind") or "click")
+            disposition = str(decision.get("disposition") or "")
+
+            # ---- WAIT FOR THE PORTAL'S EMAIL. The step that makes registration unattended. ----
+            if disposition == "WAIT_FOR_EMAIL" and decision.get("verification_request_id"):
+                request_id = str(decision["verification_request_id"])
+                entry = {"step": step_index, "url_before": _safe_url(provider),
+                         "action": "wait_for_email", "request_id": request_id,
+                         "address": decision.get("verification_address"),
+                         "options_offered": [o["text"] for o in options]}
+                trace.append(entry)
+                result = await_verification(request_id)
+                entry["verification_status"] = result.get("status")
+                entry["verification_ready"] = bool(result.get("ready"))
+
+                if not result.get("ready"):
+                    shoot(f"goal-{step_index}-verification-timeout")
+                    return ("BLOCKED", completed,
+                            [{"kind": "VERIFICATION_NOT_RECEIVED",
+                              "detail": f"waited for the portal's message and did not receive a "
+                                        f"usable code or link ({result.get('status')}: "
+                                        f"{str(result.get('detail'))[:160]})"}],
+                            shots, trace)
+
+                # Apply it: fill the code into the field the page is showing, or follow the link.
+                applied = False
+                if result.get("code"):
+                    code_field = _first_text_input(provider)
+                    if code_field:
+                        outcome = provider.act(Step.FILL, code_field, str(result["code"]))
+                        applied = bool(outcome.ok)
+                        entry["applied"] = f"FILL:{code_field}"
+                elif result.get("link"):
+                    provider.goto(str(result["link"]))
+                    applied = True
+                    entry["applied"] = "NAVIGATE:verification_link"
+
+                if not applied:
+                    shoot(f"goal-{step_index}-verification-unapplied")
+                    return ("BLOCKED", completed,
+                            [{"kind": "VERIFICATION_NOT_APPLIED",
+                              "detail": "the code or link arrived but there was no field to enter it "
+                                        "into and no link to follow; stopping rather than guessing"}],
+                            shots, trace)
+
+                entry["url_after"] = _safe_url(provider)
+                entry["changed"] = entry["url_after"] != before
+                completed.append(f"VERIFICATION:{result.get('kind')}")
+                shoot(f"goal-{step_index}-verified")
+                unchanged_streak = 0
+                continue
+
+            # ---- A HUMAN GATE, HANDED IN WITH THE SESSION ALIVE. ----
             if decision.get("refused"):
-                trace.append({"step": step_index, "url_before": _safe_url(provider),
-                              "options_offered": [o["text"] for o in options],
-                              "chosen": "", "result": "planner refused",
-                              "detail": decision.get("detail", "")})
+                entry = {"step": step_index, "url_before": _safe_url(provider),
+                         "options_offered": [o["text"] for o in options], "chosen": "",
+                         "result": "handed in" if disposition == "HAND_IN" else "refused",
+                         "challenge": decision.get("challenge"), "tier": decision.get("tier"),
+                         "prompt": decision.get("prompt") or decision.get("detail", "")}
+                trace.append(entry)
+                shoot(f"goal-{step_index}-handin")
+                kind_out = "AWAITING_HUMAN" if disposition == "HAND_IN" else "NO_ACTION_SELECTED"
                 return ("BLOCKED", completed,
-                        [{"kind": "NO_ACTION_SELECTED",
-                          "detail": f"the planner declined: {decision.get('detail', '')[:200]}"}],
+                        [{"kind": kind_out,
+                          "detail": f"{decision.get('challenge')}: {decision.get('detail', '')[:300]}",
+                          "prompt": decision.get("prompt", ""),
+                          "resumable": True}],
                         shots, trace)
         except Exception as exc:
             return ("FAILED", completed,
@@ -719,14 +826,29 @@ def _run_goal(
                                 f"(chose {chosen!r})"}],
                     shots, trace)
 
-        match = next((o for o in options if o["text"].strip() == chosen.strip()), None)
-        if match is None:
-            entry["result"] = "chosen control was not among the observed options"
-            trace.append(entry)
-            return ("BLOCKED", completed,
-                    [{"kind": "NO_ACTION_SELECTED",
-                      "detail": f"planner chose {chosen!r}, which was not an observed control"}],
-                    shots, trace)
+        # For a FILL the planner returns the FIELD name, which is deliberately not one of the offered
+        # controls - offering text inputs as clickable options would invite the model to "click" a
+        # field. So a fill is validated against the page's own inputs instead, and the value is the
+        # answer the planner computed.
+        if kind == "fill":
+            target_field = chosen
+            if not target_field or target_field not in (_input_names(provider) or []):
+                entry["result"] = "the field named by the planner is not on the page"
+                trace.append(entry)
+                return ("BLOCKED", completed,
+                        [{"kind": "NO_ACTION_SELECTED",
+                          "detail": f"planner named field {chosen!r}, which is not an input on this page"}],
+                        shots, trace)
+            match = {"text": target_field, "tag": "INPUT", "id": target_field}
+        else:
+            match = next((o for o in options if o["text"].strip() == chosen.strip()), None)
+            if match is None:
+                entry["result"] = "chosen control was not among the observed options"
+                trace.append(entry)
+                return ("BLOCKED", completed,
+                        [{"kind": "NO_ACTION_SELECTED",
+                          "detail": f"planner chose {chosen!r}, which was not an observed control"}],
+                        shots, trace)
 
         if _is_forbidden_control(match["text"], match.get("tag", "")) and not submission_authorised:
             entry["result"] = "REFUSED: consequential control"
@@ -737,7 +859,14 @@ def _run_goal(
                                 f"submission is not authorised"}],
                     shots, trace)
 
-        result = provider.act(Step.CLICK, match["text"])
+        # KIND decides the primitive. A simple arithmetic challenge is answered by FILLING; a
+        # navigation step is a CLICK. Defaulting everything to a click would type an answer nowhere
+        # and then report that the page did not change.
+        if kind == "fill":
+            started = provider.act(Step.FILL, match["text"], chosen)
+        else:
+            started = provider.act(Step.CLICK, match["text"])
+        result = started
         entry["result"] = "ok" if result.ok else f"failed: {getattr(result, 'detail', '')[:160]}"
         entry["url_after"] = _safe_url(provider)
         entry["changed"] = entry["url_after"] != before
@@ -772,6 +901,44 @@ def _run_goal(
 def _log(message: str) -> None:
     """Diagnostics to stderr. The worker's stdout is a JSON contract; nothing may pollute it."""
     print(f"browser_worker: {message}", file=sys.stderr, flush=True)
+
+
+def _input_names(provider: Any) -> list[str]:
+    """Names and ids of the visible, editable inputs on the page."""
+    try:
+        return list(provider._page.evaluate(
+            """() => Array.from(document.querySelectorAll('input, textarea, select'))
+                 .filter(e => e.offsetParent !== null && !e.disabled && !e.readOnly)
+                 .map(e => e.name || e.id || '')
+                 .filter(Boolean)"""
+        ) or [])
+    except Exception:
+        return []
+
+
+def _first_text_input(provider: Any) -> str:
+    """The name of the first empty visible text input, for a code that has to be entered.
+
+    Returns "" rather than guessing when there is none: entering a verification code into an
+    unrelated field, or into a hidden one, is worse than stopping and saying so.
+    """
+    try:
+        return str(provider._page.evaluate(
+            """() => {
+                 const els = Array.from(document.querySelectorAll('input'));
+                 for (const e of els) {
+                   const t = (e.type || 'text').toLowerCase();
+                   if (!['text','number','tel',''].includes(t)) continue;
+                   if (e.offsetParent === null) continue;
+                   if (e.disabled || e.readOnly) continue;
+                   if (e.value) continue;
+                   return e.name || e.id || '';
+                 }
+                 return '';
+               }"""
+        ) or "")
+    except Exception:
+        return ""
 
 
 def _sweep_stale_profiles(*, keep: str | None, now: float | None = None) -> list[str]:
@@ -1012,6 +1179,7 @@ def main() -> int:
                 planner_url=str(payload.get("planner_url") or ""),
                 planner_key=str(payload.get("planner_key") or ""),
                 org_id=str(payload.get("org_id") or ""),
+                verification_url=str(payload.get("verification_url") or ""),
             )
             _emit({
                 "status": g_status,
