@@ -369,31 +369,20 @@ def _run_explicit_steps(
     shots: list[str] = []
 
     def shoot(label: str) -> None:
-        """Persist a screenshot through the EXISTING evidence store, or record that it failed.
+        """Capture through the provider, which already stores the image and returns a durable ref.
 
-        `provider.screenshot()` returns a path; the store takes a Path and a name. Failure is
-        swallowed deliberately - losing a screenshot must not abort a run that is otherwise
-        succeeding, but the reference is then simply absent rather than fabricated.
+        The same double-store bug as the goal path: the previous version treated the ref returned by
+        `provider.screenshot()` as a file path and stored it again, so no reference was ever kept.
         """
-        if evidence is None:
-            _log(f"evidence: no store for {label}")
-            return
         try:
-            import pathlib as _pathlib
-
-            raw = provider.screenshot()
-            if not raw:
-                _log(f"evidence: screenshot returned nothing for {label}")
-                return
-            stored = evidence.store(
-                kind="screenshot", source=_pathlib.Path(raw), name=f"{label}.png"
-            )
-            ref = getattr(stored, "reference", None) or getattr(stored, "name", None)
-            if ref:
-                shots.append(str(ref))
+            ref = provider.screenshot()
         except Exception as exc:
             _log(f"evidence: screenshot failed for {label}: {type(exc).__name__}: {exc}")
             return
+        if ref:
+            shots.append(str(ref))
+        else:
+            _log(f"evidence: screenshot returned nothing for {label}")
 
     if len(steps) > max_steps:
         return (
@@ -673,32 +662,24 @@ def _run_goal(
                 "detail": f"no verification message arrived within {timeout_s}s", **last}
 
     def shoot(label: str) -> None:
-        """Persist a screenshot through the EXISTING evidence store, or RECORD that it failed.
+        """Capture through the provider, which ALREADY stores the image and returns a durable ref.
 
-        The failure is reported as a non-fatal problem rather than only logged, because the host
-        execution server relays the worker's stdout JSON and DISCARDS its stderr. Logging alone meant
-        several live runs reported `EVIDENCE: []` with the reason visible nowhere.
+        THIS IS WHY EVERY RUN REPORTED `EVIDENCE: []`. `provider.screenshot()` writes the capture and
+        copies it into the evidence store itself, returning `record.ref`. The previous version took
+        that ref, treated it as a FILE PATH and called `evidence.store(source=...)` on it a second
+        time - so the second store failed on a path that was never a file, the exception was swallowed,
+        and no reference was ever appended. The screenshot had in fact been taken and stored every
+        time.
         """
-        if evidence is None:
-            trace.append({"evidence_error": "the evidence store could not be opened; no screenshot kept"})
-            return
         try:
-            import pathlib as _pathlib
-
-            raw = provider.screenshot()
-            if not raw:
-                trace.append({"evidence_error": f"screenshot() returned nothing for {label}"})
-                return
-            stored = evidence.store(
-                kind="screenshot", source=_pathlib.Path(raw), name=f"{label}.png"
-            )
-            ref = getattr(stored, "reference", None) or getattr(stored, "name", None)
-            if ref:
-                shots.append(str(ref))
-            else:
-                trace.append({"evidence_error": f"the store returned no reference for {label}"})
+            ref = provider.screenshot()
         except Exception as exc:
             trace.append({"evidence_error": f"{label}: {type(exc).__name__}: {str(exc)[:200]}"})
+            return
+        if ref:
+            shots.append(str(ref))
+        else:
+            trace.append({"evidence_error": f"screenshot returned nothing for {label}"})
 
     unchanged_streak = 0
     for step_index in range(max_steps):
