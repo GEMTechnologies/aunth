@@ -150,6 +150,18 @@ def plan(
             detail="no control may be acted on: every observed control was blank or consequential",
         )
 
+    # OPTION LABELS ARE UPPERCASED, AND THIS IS NOT COSMETIC.
+    # `DecisionQuestion.validate` computes `value.strip().upper()` and then compares it against
+    # `self.options` VERBATIM. Mixed-case options can therefore never validate - the model does answer
+    # correctly and is rejected anyway ("'Contact us' is not one of [... 'Contact us' ...]"). Every
+    # existing CHOICE question happens to use already-uppercase options (HIGH/MEDIUM/LOW), which is
+    # why the shared validator has never had to face this. Control labels are NOT uppercase, so the
+    # mapping is made here rather than by loosening a validator that other decisions depend on.
+    option_for: dict[str, str] = {}
+    for control in offered:
+        option_for.setdefault(control["text"].upper(), control["text"])
+    options = list(option_for.keys()) + ["STOP"]
+
     db = FleetSessionLocal()
     try:
         # TENANT BINDING: the plan is made inside the organisation's own scope, so a decision can
@@ -170,7 +182,7 @@ def plan(
                         "text. Choose 'stop' if the objective is already met, or if no offered "
                         "control can advance it."
                     ),
-                    options=tuple([c["text"] for c in offered] + ["stop"]),
+                    options=tuple(options),
                 ),
             ),
             state={
@@ -184,12 +196,19 @@ def plan(
 
         result = gateway.decide(request)
         answer = result.answers.get("next_action")
-        chosen = str(getattr(answer, "value", "") or "").strip()
+        raw = str(getattr(answer, "value", "") or "").strip()
+
+        # Map the uppercased option back to the control's REAL visible text, because the worker
+        # activates a control by the text it observed, not by a normalised label.
+        if raw.upper() == "STOP":
+            chosen = "stop"
+        else:
+            chosen = option_for.get(raw.upper(), "")
 
         # A chosen control that was not offered is refused rather than passed through: the model may
         # only select from what the browser actually saw.
-        if chosen and chosen.lower() != "stop" and not any(c["text"] == chosen for c in offered):
-            logger.warning("planner chose %r which was not among the observed controls", chosen[:80])
+        if not chosen:
+            logger.warning("planner chose %r which was not among the observed controls", raw[:80])
             return PlanOut(
                 action="", refused=True, provider=getattr(result, "provider", "") or "",
                 detail="the chosen control was not among the observed controls; refusing",
