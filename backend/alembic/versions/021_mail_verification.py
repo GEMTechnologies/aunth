@@ -44,13 +44,18 @@ def upgrade() -> None:
         sa.Column("examined", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("last_reason", sa.String(500), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        # THE UNIQUENESS THAT MAKES APPLYING ONE CODE TWICE A NO-OP, declared INLINE.
+        #
+        # It was added afterwards with op.create_unique_constraint, which SQLite cannot do - SQLite
+        # has no ALTER TABLE ADD CONSTRAINT, so alembic raised NotImplementedError and the schema-drift
+        # test died at this revision. Declaring it with the table produces the same schema on both
+        # engines, which is what the drift test is for.
+        sa.UniqueConstraint("org_id", "fingerprint", name="uq_mail_verification_fingerprint"),
     )
     op.create_index("ix_mail_verification_requests_org_id", TABLE, ["org_id"])
     op.create_index("ix_mail_verification_requests_status", TABLE, ["status"])
     op.create_index("ix_mail_verification_requests_expires_at", TABLE, ["expires_at"])
     op.create_index("ix_mail_verification_pending", TABLE, ["org_id", "status"])
-    # The uniqueness that makes applying one code twice a no-op rather than a race.
-    op.create_unique_constraint("uq_mail_verification_fingerprint", TABLE, ["org_id", "fingerprint"])
 
     if not _is_postgres():
         return

@@ -3128,3 +3128,31 @@ class MailVerificationRequest(Base):
         UniqueConstraint("org_id", "fingerprint", name="uq_mail_verification_fingerprint"),
         Index("ix_mail_verification_pending", "org_id", "status"),
     )
+
+
+class MailRouting(Base):
+    """Which organisation owns an inbound address, answerable BEFORE any tenant is known.
+
+    NO RLS, DELIBERATELY, AND NOT BECAUSE IT WAS FORGOTTEN. The inbound doorway must answer "whose
+    mailbox is this?" before it can bind a tenant - and `mail_identities` is protected by
+    `org_id = app.current_org()`, so with no binding it returns nothing and every delivery is refused.
+    Measured live: a real verification email to a real provisioned address was rejected, and a
+    SECURITY DEFINER resolver did not help either, because its owner is granada_user and FORCE ROW
+    LEVEL SECURITY applies to the owner.
+
+    The alternative was a role with BYPASSRLS (which ADR-0011 deliberately removed) or a permissive
+    policy on `mail_identities`, whose `token` column IS the reply-alias secret. Neither trade is
+    worth making for a lookup.
+
+    So this table holds the route and nothing else: no tokens, no message content, no display names.
+    A table with nothing sensitive in it is not worth a policy that would only be worked around. Kept
+    in sync by trigger, so an identity inserted by onboarding, a test or a migration is routable
+    immediately and cannot drift from its route.
+    """
+
+    __tablename__ = "mail_routing"
+
+    address: Mapped[str] = mapped_column(String(320), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    identity_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

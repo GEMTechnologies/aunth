@@ -70,28 +70,45 @@ def provider_without_browser() -> bw.PlaywrightProvider:
 
 
 # ===========================================================================
-# LEAK 1: the per-tenant directory that nothing removed
+# LEAK 1: the per-tenant directory - now a FEATURE, and bounded
 # ===========================================================================
-def test_launch_does_not_create_the_profile_dir(tmp_path, monkeypatch):
-    """THE regression. `os.makedirs(profile_dir)` ran on every launch and NOTHING removed it.
+def test_launch_creates_one_persistent_profile_per_organisation(tmp_path, monkeypatch):
+    """THE CONTRACT CHANGED, DELIBERATELY, AND THIS RECORDS WHY.
 
-    The real Chromium profile is the mkdtemp directory, which launch_persistent_context uses as
-    user_data_dir - that is what gives each organisation its own cookie jar. `profile_dir` was
-    created and then never used: dead code that leaked one directory per organisation, forever.
+    The original fix removed `os.makedirs(profile_dir)` because it leaked one directory per
+    organisation that nothing ever removed. That reasoning was right about the leak and wrong about
+    the consequence: an unconditional mkdtemp means EVERY RUN STARTS LOGGED OUT, so a portal that
+    verified an account a minute ago asks for verification again - and re-registering repeatedly is
+    what the directive forbids. Measured: the profile in every run was `granada-browser-<random>`.
+
+    The directory is now created on purpose, and the leak is answered by the location rather than by
+    absence: it lives under a swept root and is bounded by the NUMBER OF ORGANISATIONS, not the number
+    of runs. Both properties are asserted here.
     """
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     monkeypatch.setattr(bw.tempfile, "mkdtemp", lambda prefix=None: _fake_mkdtemp(tmp_path, prefix))
 
-    p = provider_without_browser()
-    per_tenant = tmp_path / "granada-browser" / "org-aaaa"
-    p.launch = lambda **kw: None  # not launching Chromium in a unit test
+    calls = _makedirs_calls()
+    assert calls == ["os.makedirs(profile_dir, mode=0o700, exist_ok=True)"], (
+        "launch() must create the organisation's profile directory: without it no session survives a "
+        "run. The leak is answered by the root being swept, not by never creating it."
+    )
 
-    # Call the real makedirs decision by inspecting what launch WOULD create. We assert the source
-    # of truth directly: the string is gone from launch, so no directory appears.
-    assert _makedirs_calls() == [], (
-        "launch() creates profile_dir and nothing removes it - one directory per organisation. "
-        "A substring check would also match the COMMENT that explains the removal, so this looks at "
-        "code lines only."
+    source = (BACKEND / "tools" / "browser_worker.py").read_text(encoding="utf-8")
+    handler = source.split("def launch", 1)[1].split("def close", 1)[0]
+    assert "0o700" in handler, "an organisation's cookies must not be readable by another local user"
+    assert "_ephemeral_profile = False" in handler, (
+        "a persistent profile must be marked as such, or close() deletes the session it exists to keep"
+    )
+
+
+def test_close_deletes_only_an_ephemeral_profile():
+    """The unconditional rmtree in close() was itself what made session preservation impossible."""
+    source = (BACKEND / "tools" / "browser_worker.py").read_text(encoding="utf-8")
+    body = source.split("def close", 1)[1].split("def observe", 1)[0]
+    assert "_ephemeral_profile" in body, (
+        "close() must not delete a persistent profile: that would destroy the organisation's session "
+        "at the end of every run"
     )
 
 
@@ -143,11 +160,24 @@ def test_the_age_bound_is_generous_enough_for_a_slow_portal():
 # ===========================================================================
 # THE SPECIFIC DIRECTORY THAT LEAKED
 # ===========================================================================
-def test_no_organisation_named_directory_is_created(tmp_path, monkeypatch):
-    """Named after the organisation, which makes it a listing of which NGOs have been active as well
-    as a disk leak."""
+def test_the_profile_root_is_swept_and_not_the_working_tree(tmp_path, monkeypatch):
+    """The directory is created on purpose now, so the property that must hold is WHERE.
+
+    Under a root that is bounded and swept, never scattered through the filesystem - and the caller
+    points it at `/var/lib/granada/browser-profiles/<org_id>`, which is one directory per
+    ORGANISATION rather than one per run.
+    """
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
-    assert _makedirs_calls() == []
+    source = (BACKEND / "tools" / "browser_worker.py").read_text(encoding="utf-8")
+    assert "/var/lib/granada/browser-profiles/" in source, (
+        "the profile must live under the swept root, not in a world-writable /tmp"
+    )
+    calls = _makedirs_calls()
+    assert calls == ["os.makedirs(profile_dir, mode=0o700, exist_ok=True)"]
+    # The leak the original fix was answering is still answered: one directory per ORGANISATION,
+    # because the path is derived from the org id rather than from a per-run random suffix.
+    handler = source.split("provider.launch(", 1)[1].split(")", 1)[0]
+    assert "{task.org_id}" in handler, "a per-run path would still leak one directory per run"
 
 
 def test_close_is_idempotent():
