@@ -107,6 +107,29 @@ curl -s -X POST https://granadac.com/api/v1/internal/mail/ingest \
   -d '{"to":"a@example.org"}'                                               # expect action=reject
 ```
 
+## Browser evidence root — required, and silent when missing
+
+The browser worker stores screenshots under `/var/lib/granada/browser-evidence/<org_id>/<run_id>/`.
+**This directory must be created and owned by the worker's user**, or every screenshot silently
+degrades to a scratch path inside the Chromium profile — which is then deleted when the run ends.
+
+That failure is invisible: the run reports `evidence` references, the files existed, and afterwards
+nothing is on disk. It produced `EVIDENCE: []` on every run for a long time.
+
+```bash
+sudo mkdir -p /var/lib/granada/browser-evidence
+sudo chown -R granada:granada /var/lib/granada
+```
+
+Verify after any worker change:
+
+```bash
+find /var/lib/granada/browser-evidence -name '*.png' | wc -l     # must be non-zero after a run
+```
+
+Override the location with `GRANADA_EVIDENCE_ROOT` if the worker runs as a user that cannot write
+under `/var/lib`.
+
 ## Upgrade note
 
 Migration `023_mail_routing` backfills the routing table, but **it cannot read `mail_identities`** —
