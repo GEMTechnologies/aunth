@@ -942,10 +942,10 @@ def _run_goal(
 
         filled = _fill_from_verified(provider, values)
         if filled:
-            field, value = filled
+            field, value = filled["field"], filled["value"]
             entry = {"step": step_index, "action": "fill", "field": field,
                      "url_before": _safe_url(provider)}
-            result = provider.act(Step.FILL, field, value)
+            result = _act_fill(provider, field, value, filled.get("ref", ""))
             if not result.ok:
                 # A STALE REFERENCE, NOT A MISSING VALUE. Measured on the UN Partner Portal's signup
                 # form: the password filled, the page re-rendered, and the email fill then hit an
@@ -956,8 +956,8 @@ def _run_goal(
                 # looked up again rather than assumed.
                 _settle(provider)
                 again = _fill_from_verified(provider, values)
-                if again and again[0] == field:
-                    result = provider.act(Step.FILL, again[0], again[1])
+                if again and again["field"] == field:
+                    result = _act_fill(provider, again["field"], again["value"], again.get("ref", ""))
                     entry["retried"] = True
             entry["result"] = "ok" if result.ok else f"failed: {getattr(result, 'detail', '')[:160]}"
             trace.append(entry)
@@ -1354,8 +1354,8 @@ def _password_value(values: dict[str, Any]) -> str:
     return ""
 
 
-def _fill_from_verified(provider: Any, values: dict[str, Any]) -> Optional[tuple[str, str]]:
-    """ONE empty visible field Granada can fill, as (field, value), or None.
+def _fill_from_verified(provider: Any, values: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """ONE empty visible field Granada can fill, as {field, value, ref}, or None.
 
     Returns a single field rather than doing them all, so every fill is observed on its own: a site
     that reacts to the first field (revealing or clearing others) is handled on the next turn instead
@@ -1365,6 +1365,11 @@ def _fill_from_verified(provider: Any, values: dict[str, Any]) -> Optional[tuple
     alone meant a portal that names it `pass` or `HRS_APPL_WRK_HRS_CONFMPSWD` got nothing, and the run
     stopped at the password page with the credential in hand. Field TYPE is the semantic signal here,
     and it is the portal's own declaration rather than a guess of ours.
+
+    THE REFERENCE MATTERS AS MUCH AS THE NAME. Filling by `[name=...]` failed on the UN's B2C signup
+    form - the name it reported was not one a CSS attribute selector could find, so the fill "could
+    not fill email" while the field sat there in plain sight. The chosen element is stamped and the
+    fill targets that element, exactly as clicks do.
     """
     if not values:
         return None
@@ -1380,24 +1385,49 @@ def _fill_from_verified(provider: Any, values: dict[str, Any]) -> Optional[tuple
                    const s = getComputedStyle(e);
                    return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
                  };
-                 return Array.from(document.querySelectorAll('input'))
-                   .filter(e => {
-                     const t = (e.type || 'text').toLowerCase();
-                     return ['text','email','tel','number','password',''].includes(t)
-                       && vis(e) && !e.disabled && !e.readOnly && !e.value;
-                   })
-                   .map(e => ({name: e.name || e.id || '', type: (e.type || 'text').toLowerCase()}));
+                 const out = [];
+                 Array.from(document.querySelectorAll('input')).forEach((e, i) => {
+                   const t = (e.type || 'text').toLowerCase();
+                   if (!['text','email','tel','number','password',''].includes(t)) return;
+                   if (!vis(e) || e.disabled || e.readOnly || e.value) return;
+                   e.setAttribute('data-granada-fill', 'f' + i);
+                   out.push({ref: 'f' + i, name: e.name || e.id || '', type: t});
+                 });
+                 return out;
                }"""
         ) or [])
     except Exception:
         return None
     for entry in candidates:
         name = str(entry.get("name") or "")
+        ref = str(entry.get("ref") or "")
         if entry.get("type") == "password" and password:
-            return (name, password)
+            return {"field": name or "password", "value": password, "ref": ref}
         if name and _case_get(values, name) not in (None, ""):
-            return (name, str(_case_get(values, name)))
+            return {"field": name, "value": str(_case_get(values, name)), "ref": ref}
     return None
+
+
+def _act_fill(provider: Any, field: str, value: str, ref: str = "") -> Any:
+    """Fill the observed element, falling back to the name selector.
+
+    Same lesson as the click: act on the element that was seen. A `[name=...]` selector is a guess
+    about markup, and on the UN's B2C form it did not resolve.
+    """
+    from agent.browser_runtime import ActionResult, Failure
+
+    if ref:
+        try:
+            locator = provider._page.locator(f"[data-granada-fill='{ref}']").first
+            if locator.count() > 0:
+                locator.fill(value, timeout=15000)
+                return ActionResult(ok=True, page=provider.observe())
+        except Exception as exc:
+            _log(f"ref fill {ref} ({field!r}) failed: {type(exc).__name__}: {exc}")
+    try:
+        return provider.act(Step.FILL, field, value)
+    except Exception as exc:
+        return ActionResult(ok=False, failure=Failure.UNKNOWN, detail=str(exc)[:250])
 
 
 def _click_control(page: Any, target: str) -> bool:
