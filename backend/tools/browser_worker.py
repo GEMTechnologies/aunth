@@ -1879,7 +1879,7 @@ def main() -> int:
             g_status, g_completed, g_problems, g_shots, g_trace = _run_goal(
                 provider, goal,
                 evidence=evidence,
-                max_steps=int(payload.get("max_steps") or 8),
+                max_steps=int(payload.get("max_steps") or 25),
                 submission_authorised=bool(payload.get("submission_authorised")),
                 planner_url=str(payload.get("planner_url") or ""),
                 planner_key=str(payload.get("planner_key") or ""),
