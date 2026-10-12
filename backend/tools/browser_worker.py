@@ -911,6 +911,7 @@ def _run_goal(
         if take_signup:
             link = _signup_link(provider)
             if link:
+                _page_fingerprint_at_start = _page_fingerprint(provider)
                 entry = {"step": step_index, "action": "take_signup_link",
                          "target": link["text"], "url_before": _safe_url(provider)}
                 result = _act_on_ref(provider, link["ref"], link["text"], link.get("type", ""))
@@ -925,9 +926,18 @@ def _run_goal(
                               "detail": f"could not open the signup form via {link['text']!r}"}],
                             shots, trace)
                 _settle(provider)
-                # A page change here IS progress by definition: we left a sign-in form for the signup
-                # form the page pointed at.
-                unchanged_streak = 0
+                # PROGRESS IS JUDGED BY THE FINGERPRINT, like every other action. Forcing the guard
+                # off meant a link that did nothing was clicked eight times and the run reported
+                # RESOURCE_LIMIT instead of "no change" - measured on the landing page.
+                moved_now = _page_fingerprint(provider) != _page_fingerprint_at_start
+                entry["changed"] = moved_now
+                unchanged_streak = 0 if moved_now else unchanged_streak + 1
+                if unchanged_streak >= 2:
+                    return ("BLOCKED", completed,
+                            [{"kind": "NO_ACTION_SELECTED",
+                              "detail": (f"following {link['text']!r} did not change the page; "
+                                         f"stopping rather than clicking it again")}],
+                            shots, trace)
                 continue
 
         filled = _fill_from_verified(provider, values)
@@ -1526,10 +1536,11 @@ def _act_on_ref(provider: Any, ref: str, label: str, ctype: str = "") -> Any:
 
 
 #: The page's own wording that means "this is a SIGN-IN form and the signup form is behind a link".
-#: Generic template copy, not site logic.
+#: DELIBERATELY NARROW. A first version also matched "register now" and "create an account", which
+#: appear as marketing copy on the UN Partner Portal's LANDING page - so Granada took the landing
+#: page's Register nav link eight times in a row and burned its whole budget going nowhere.
 _SIGNIN_PROMPT = (
     "don't have an account", "do not have an account", "no account yet",
-    "create an account", "sign up now", "register now", "new to ",
 )
 
 #: Controls that lead TO the signup form rather than submitting one.
@@ -1558,6 +1569,17 @@ def _should_take_signup_link(provider: Any, goal: str) -> bool:
     except Exception:
         return False
     if not any(p in text for p in _SIGNIN_PROMPT):
+        return False
+    # IT MUST ACTUALLY BE A SIGN-IN FORM. A password field is what distinguishes one from a landing
+    # page that merely mentions accounts.
+    try:
+        has_password = bool(provider._page.evaluate(
+            "() => Array.from(document.querySelectorAll('input[type=password]'))"
+            ".some(e => e.offsetParent !== null || e.getBoundingClientRect().width > 0)"
+        ))
+    except Exception:
+        has_password = False
+    if not has_password:
         return False
     # Only if the link is actually there to take - otherwise the prompt is just marketing copy.
     for control in _control_inventory(provider):
