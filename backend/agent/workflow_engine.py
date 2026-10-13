@@ -2408,14 +2408,38 @@ def _browser_form_values(db: Any, package: Any) -> dict[str, Any]:
     """
     values: dict[str, Any] = dict(_verified_form_data(package) or {})
     try:
-        identity = (
-            db.query(models.MailIdentity)
-            .filter(
-                models.MailIdentity.org_id == package.org_id,
-                models.MailIdentity.is_primary.is_(True),
+        from urllib.parse import urlparse
+        from agent.mail.addresses import provision_mailbox
+
+        org = db.query(models.Organisation).filter(models.Organisation.id == package.org_id).first()
+        portal_host = (urlparse(getattr(package, "target_url", "") or "").hostname or "").lower()
+
+        # ONE MAILBOX PER PORTAL ACCOUNT, NOT ONE PER ORGANISATION.
+        #
+        # A single shared address mixes every portal's verification codes into one inbox, so a code
+        # for one portal can be matched against a registration on another - and an organisation
+        # running several portal accounts cannot tell their histories apart. The address is
+        # deliberately UNPREDICTABLE: it receives verification codes and recovery links, and anyone
+        # who could guess it could trigger password resets against the organisation's accounts.
+        #
+        # Only the PRIMARY address is exempt. That one is the organisation's public mailbox, published
+        # on grant applications, and guessable on purpose.
+        identity = None
+        if org is not None and portal_host and getattr(package, "agent_id", None):
+            identity = provision_mailbox(
+                db, org_id=package.org_id, agent_id=str(package.agent_id),
+                organisation_name=org.name,
+                purpose="portal-registration", portal_host=portal_host,
             )
-            .first()
-        )
+        if identity is None:
+            identity = (
+                db.query(models.MailIdentity)
+                .filter(
+                    models.MailIdentity.org_id == package.org_id,
+                    models.MailIdentity.is_primary.is_(True),
+                )
+                .first()
+            )
         address = getattr(identity, "address", None)
         if address:
             for key in ("email", "Email", "EMAIL", "email_address", "emailAddress",

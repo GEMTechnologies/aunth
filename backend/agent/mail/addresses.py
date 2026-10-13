@@ -202,6 +202,93 @@ def provision(
     return identity
 
 
+def allocate_mailbox(
+    organisation_name: str,
+    *,
+    taken: Optional[set[str]] = None,
+    domain: str = DOMAIN,
+    suffix_bytes: int = 4,
+    max_attempts: int = 50,
+) -> Allocation:
+    """An UNPREDICTABLE address, for a mailbox that receives portal mail.
+
+    WHY THIS IS NOT THE FRIENDLY SLUG. The organisation's public mailbox is published on grant
+    applications, so it is guessable on purpose. A portal-registration mailbox is different: it
+    receives verification codes and account-recovery links, and anyone who can guess it can trigger
+    password resets against the organisation's portal accounts. So it carries a random suffix.
+
+    The slug stays as the PREFIX because a human reading the mailbox list must be able to tell which
+    organisation it belongs to; the entropy is in the suffix, and `secrets` is used rather than
+    `random` because a guessable suffix defeats the point.
+    """
+    used = {t.strip().lower() for t in (taken or set())}
+    slug = slugify(organisation_name) or "org"
+    base = slug[: max(MIN_LOCAL, MAX_LOCAL - (suffix_bytes * 2) - 1)]
+    for _ in range(max_attempts):
+        candidate = f"{base}-{secrets.token_hex(suffix_bytes)}"
+        if candidate not in used and candidate not in RESERVED:
+            return Allocation(
+                f"{candidate}@{domain}", candidate,
+                "an unpredictable mailbox for portal correspondence",
+            )
+    raise ValueError(
+        f"no free mailbox for {organisation_name!r} after {max_attempts} attempts; "
+        "the random space collided unusually often and needs operator attention"
+    )
+
+
+def provision_mailbox(
+    db: Any,
+    *,
+    org_id: str,
+    agent_id: str,
+    organisation_name: str,
+    purpose: str,
+    portal_host: Optional[str] = None,
+) -> Any:
+    """Create — or return — a mailbox for ONE purpose, for this organisation.
+
+    ONE MAILBOX PER PORTAL ACCOUNT, not one per organisation. A single shared address would mix every
+    portal's verification codes into one inbox, so a code for one portal could be matched against a
+    registration on another; and an organisation running several portal accounts needs several
+    mailboxes to keep their histories, codes and recovery messages apart.
+
+    Idempotent on (organisation, purpose, portal), so re-running a registration reuses the mailbox
+    rather than creating a second one — the portal already knows the first address, and a new one
+    would receive nothing.
+    """
+    import models
+
+    marker = f"{purpose}:{(portal_host or '').lower()}"
+    existing = (
+        db.query(models.MailIdentity)
+        .filter(
+            models.MailIdentity.org_id == org_id,
+            models.MailIdentity.display_name == marker,
+        )
+        .first()
+    )
+    if existing is not None:
+        return existing
+
+    allocation = allocate_mailbox(organisation_name, taken=taken_local_parts(db))
+    identity = models.MailIdentity(
+        org_id=org_id,
+        agent_id=agent_id,
+        address=allocation.address,
+        # The marker is both the idempotency key and what an operator reads to know which portal this
+        # mailbox serves.
+        display_name=marker,
+        identity_type=models.MailIdentity.TYPE_MANAGED,
+        is_primary=False,
+        status=models.MailIdentity.ACTIVE,
+        token=secrets.token_urlsafe(24),
+    )
+    db.add(identity)
+    db.flush()
+    return identity
+
+
 def describe() -> dict[str, Any]:
     return {
         "domain": DOMAIN,

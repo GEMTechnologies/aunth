@@ -108,3 +108,40 @@ def test_a_very_long_name_is_bounded():
 def test_an_empty_name_does_not_crash():
     out = allocate("")
     assert out.address.endswith(f"@{DOMAIN}")
+
+
+# ---------------------------------------------------------------------------
+# Portal mailboxes - unpredictable on purpose
+# ---------------------------------------------------------------------------
+def test_a_portal_mailbox_is_not_guessable():
+    """A mailbox receiving verification codes and recovery links must not be derivable from the
+    organisation's name: anyone who guessed it could trigger password resets against its accounts."""
+    from agent.mail.addresses import allocate_mailbox
+
+    a = allocate_mailbox("Globalmotion")
+    assert a.address != allocate("Globalmotion").address, "the friendly slug is guessable"
+    assert a.local_part.startswith("globalmotion-"), "the org must stay identifiable in a listing"
+    assert len(a.local_part.split("-")[-1]) >= 8, "the suffix carries the entropy"
+
+
+def test_two_mailboxes_for_one_organisation_differ():
+    from agent.mail.addresses import allocate_mailbox
+
+    seen = {allocate_mailbox("Globalmotion").local_part for _ in range(20)}
+    assert len(seen) == 20, "a collision would hand one portal another portal's codes"
+
+
+def test_a_portal_mailbox_avoids_a_taken_suffix():
+    from agent.mail.addresses import allocate_mailbox
+
+    first = allocate_mailbox("Globalmotion")
+    second = allocate_mailbox("Globalmotion", taken={first.local_part})
+    assert second.local_part != first.local_part
+
+
+def test_a_portal_mailbox_is_bounded_and_reserved_safe():
+    from agent.mail.addresses import allocate_mailbox
+
+    assert len(allocate_mailbox("A" * 200).local_part) <= 48
+    for word in ("admin", "postmaster", "hostmaster"):
+        assert allocate_mailbox(word).local_part not in RESERVED
