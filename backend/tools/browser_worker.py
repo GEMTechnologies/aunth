@@ -1070,6 +1070,18 @@ def _run_goal(
                             shots, trace)
 
                 # Apply it: fill the code into the field the page is showing, or follow the link.
+                #
+                # THE CODE IS A SECRET FOR THE LENGTH OF THIS RUN, and it is registered with the
+                # output scrubber before it can be typed. A portal often echoes a rejected value back
+                # into an error message, and that would write the code into the job outcome, the
+                # activity record and the trace - all of them readable. A leaked code is one someone
+                # else can use before it expires.
+                #
+                # It is deliberately absent from the trace: the trace records that a verification
+                # arrived and what was done with it, never the value.
+                if result.get("code"):
+                    _RUN_SECRETS.add(str(result["code"]))
+
                 applied = False
                 if result.get("code"):
                     code_field = _first_text_input(provider)
