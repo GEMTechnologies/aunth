@@ -623,6 +623,19 @@ class FleetDispatcher:
                     workflow.next_run_at = moment + timedelta(hours=1)
                     result.skipped_paused += 1
                     metrics.inc("fleet.dispatch_skipped_paused")
+                    # FLUSH BEFORE CONTINUING. The flush at the end of the loop body is skipped by
+                    # this `continue`, so the parked row stayed dirty and was flushed at the OUTER
+                    # commit - by which point `tenant_scope` had cleared the binding. Under RLS the
+                    # UPDATE then matched zero rows and raised:
+                    #
+                    #     StaleDataError: UPDATE statement on table 'agent_workflows'
+                    #     expected to update 1 row(s); 0 were matched.
+                    #
+                    # Measured on production: the worker had failed 182 consecutive sweeps and
+                    # completed NONE, because `next_run_at` is recomputed on every pass and so the
+                    # row was dirty on every pass. The whole fleet was dead behind a message that
+                    # looks like a race.
+                    self.db.flush()
                     continue
 
                 if result.per_agent.get(agent.id, 0) >= self.per_agent_limit:
@@ -648,6 +661,11 @@ class FleetDispatcher:
                         workflow.waiting_on = f"no executable specialist: {exc}"[:255]
                         workflow.next_run_at = moment + timedelta(hours=6)
                         result.skipped_unhandled += 1
+                        # FLUSH BEFORE CONTINUING, for the same reason as the paused branch above:
+                        # this `continue` skips the end-of-body flush, and the row would otherwise
+                        # be written at the outer commit with no tenant binding - raising
+                        # StaleDataError and killing the entire sweep.
+                        self.db.flush()
                         continue
 
                 created = self._enqueue(workflow, agent, moment)
