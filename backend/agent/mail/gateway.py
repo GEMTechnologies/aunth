@@ -644,10 +644,20 @@ def schedule_mail_sync(
 
     queued = 0
     for account in candidates:
-        # A mailbox with no provider transport has nothing to reconcile against.
-        # Parking it would accumulate dead work, so it is skipped rather than
-        # queued - and the account's sync_status is what an operator looks at.
-        if get_transport(account.provider) is None:
+        # A mailbox with no transport has nothing to reconcile against - BUT A PER-ACCOUNT CREDENTIAL
+        # IS A TRANSPORT SOURCE, and this check used to ignore that.
+        #
+        # Measured on production: a mailbox was connected over IMAP with its own encrypted credential,
+        # and the scheduler queued NOTHING for it. `get_transport(provider)` consults the
+        # DEPLOYMENT-WIDE registry, which is empty when each organisation brings its own mailbox - so
+        # the account was skipped on every sweep, for ever, with no error. Connecting a mailbox
+        # appeared to succeed and silently did nothing.
+        #
+        # `MailGateway.transport_for_account` is the thing that builds an adapter from
+        # `credentials_ref`, and it is deliberately per-organisation: the deployment-wide transport is
+        # only the fallback for an account that has no credential of its own.
+        has_own_credential = bool(account.credentials_ref)
+        if not has_own_credential and get_transport(account.provider) is None:
             continue
         try:
             AgentWake.schedule(

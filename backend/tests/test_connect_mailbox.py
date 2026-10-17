@@ -207,3 +207,74 @@ def test_an_unavailable_credential_store_saves_nothing(client, db, world, monkey
 def test_a_missing_password_is_refused_by_the_schema(client):
     resp = client.post("/api/v1/agent/mail/accounts", json=body(imap_password=""))
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# The scheduler: a connected mailbox must actually be queued
+# ---------------------------------------------------------------------------
+def test_a_connected_mailbox_is_scheduled_for_sync(db, world):
+    """MEASURED ON PRODUCTION, and it is why this test exists.
+
+    A mailbox was connected over IMAP with its own encrypted credential, and the scheduler queued
+    NOTHING for it - on every sweep, for ever, with no error. schedule_mail_sync asked
+    get_transport(provider), which consults the DEPLOYMENT-WIDE registry and is empty when each
+    organisation brings its own mailbox. Connecting a mailbox appeared to succeed and silently did
+    nothing, which is the worst possible outcome for this feature: the operator would wait for mail
+    that was never going to be fetched.
+    """
+    from agent import mail as mail_pkg
+    from agent.mail.gateway import schedule_mail_sync, clear_transports
+
+    clear_transports()  # prove it works with NO deployment-wide transport registered
+
+    account = models.MailAccount(
+        id=str(uuid.uuid4()),
+        org_id=str(world['org'].id),
+        agent_id=str(world['agent'].id),
+        provider='imap',
+        provider_account_id='ngo@example.org',
+        connection_type=models.MailAccount.CONNECTION_CONNECTED_IMAP,
+        address='ngo@example.org',
+        status=models.MailAccount.ACTIVE,
+        credentials_ref='mail/imap/probe',
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(account)
+    db.commit()
+
+    queued = schedule_mail_sync(db, stale_seconds=60, org_id=str(world['org'].id))
+    db.commit()
+
+    assert queued == 1, (
+        'a mailbox with its own credential must be queued even when no deployment-wide transport is '
+        'registered; otherwise it never syncs and nothing says so'
+    )
+    workflow = db.query(models.AgentWorkflow).filter(
+        models.AgentWorkflow.workflow_type == 'mail_sync'
+    ).first()
+    assert workflow is not None and workflow.subject_id == account.id
+
+
+def test_a_mailbox_with_no_transport_and_no_credential_is_still_skipped(db, world):
+    """The original behaviour, kept: dead work must not accumulate for a mailbox that could never be
+    read. The exception is a mailbox that carries its own credential."""
+    from agent.mail.gateway import schedule_mail_sync, clear_transports
+
+    clear_transports()
+
+    account = models.MailAccount(
+        id=str(uuid.uuid4()),
+        org_id=str(world['org'].id),
+        agent_id=str(world['agent'].id),
+        provider='imap',
+        provider_account_id='bare@example.org',
+        connection_type=models.MailAccount.CONNECTION_CONNECTED_IMAP,
+        address='bare@example.org',
+        status=models.MailAccount.ACTIVE,
+        credentials_ref=None,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(account)
+    db.commit()
+
+    assert schedule_mail_sync(db, stale_seconds=60, org_id=str(world['org'].id)) == 0
