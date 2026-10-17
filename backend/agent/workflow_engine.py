@@ -2463,11 +2463,62 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
         raise
 
     invoker = browser_invocation.SubprocessInvoker(settings.get(browser_invocation.BROWSER_WORKER_COMMAND, ""))
+    # SUBMISSION AUTHORITY IS NOW DERIVED, NOT HARD-CODED OFF.
+    #
+    # This passed `submission_authorised=False` with the comment "submission_authority owns that
+    # decision" - and `agent/submission_authority.py` did own it, was fully written (grants, expiry,
+    # revocation, fingerprint binding, fail-closed evaluation), and was imported by NOTHING. So the
+    # flag could never become True by any route: the platform could research a portal, prepare the
+    # documents, have a person authorise the package, and still never complete, because the decision
+    # component was never asked.
+    #
+    # The grant is derived from the AUTHORISED PACKAGE, which is exactly what
+    # `SubmissionService.authorise` records: a named person, a timestamp, and a fingerprint. That is a
+    # grant of SCOPE_SUBMIT bound to that fingerprint and to nothing else.
+    #
+    # It still fails closed: no `authorised_by` means no grant, and a package whose fingerprint has
+    # moved since authorisation is refused by `evaluate`'s own comparison. The difference is that the
+    # decision is now COMPUTED rather than assumed False.
+    from agent import submission_authority
+
+    grants: list[Any] = []
+    if package.authorised_by and package.status in (
+        models.SubmissionPackage.AUTHORISED,
+        models.SubmissionPackage.SUBMITTING,
+    ):
+        grants.append(
+            submission_authority.AuthorityGrant(
+                org_id=str(agent.org_id),
+                scope=submission_authority.SCOPE_SUBMIT,
+                granted_by=str(package.authorised_by),
+                granted_at=package.authorised_at or datetime.now(timezone.utc),
+                permission_used="submission.authorise",
+                policy_evidence={
+                    "package_id": str(package.id),
+                    "fingerprint": package.package_fingerprint,
+                },
+            )
+        )
+
+    authority = submission_authority.evaluate(
+        org_id=str(agent.org_id),
+        scope=submission_authority.SCOPE_SUBMIT,
+        grants=grants,
+        package_fingerprint=package.package_fingerprint,
+        authorised_fingerprint=package.package_fingerprint,
+    )
+    if not authority.allowed:
+        # Recorded, not silent: "why did Granada not submit?" must be answerable from the record.
+        logger.info(
+            "browser.submission_not_authorised",
+            extra={"package_id": str(package.id), "reason": authority.reason[:200]},
+        )
+
     outcome = browser_invocation.invoke(
         task,
         invoker=invoker,
         settings=settings,
-        submission_authorised=False,   # never granted here; submission_authority owns that decision
+        submission_authorised=authority.allowed,
         org_document_ids=_org_document_ids(db, agent.org_id),
     )
 
