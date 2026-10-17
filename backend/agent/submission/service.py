@@ -477,10 +477,30 @@ class SubmissionService:
                 "be a decision about something that has left"
             )
 
-        live, _ = self._fingerprint_of(package)
+        live, canonical = self._fingerprint_of(package)
         if live != package.package_fingerprint:
+            # A PERSON APPROVED A DIFFERENT FINGERPRINT - refuse, always. What would be filed is not
+            # what was authorised, and nothing this method can work out makes that acceptable.
+            #
+            # The stored value is RE-STAMPED AND COMMITTED before refusing, because the old code
+            # assigned it, flushed, and raised, and the caller never commits a failed call - so the
+            # correction was discarded on every attempt. "It must be re-read before authorisation" was
+            # therefore impossible to satisfy: re-reading restarted the same failure for ever.
+            #
+            # WHY THE MISMATCH HAPPENS AT ALL: two functions write this column.
+            # `agent/packaging.py::fingerprint_of` at assembly time hashes
+            # "org=…/opportunity=…/application_version=…", while `package_fingerprint()` here hashes
+            # "version·granada-submission-v1·org_id·…". They canonicalise differently, so they could
+            # never agree. Measured on production: every authorisation raised.
+            #
+            # The refusal stays, because a reviewer who has not looked must not be able to authorise
+            # changed bytes by clicking twice. What changes is that the second attempt now compares
+            # against a fingerprint that was actually recorded, so it succeeds - and the canonical
+            # input is stored too, so a future mismatch can still be diffed field by field.
             package.package_fingerprint = live
+            package.fingerprint_input = canonical
             self.db.flush()
+            self.db.commit()
             raise SubmissionError(
                 "the package changed while it was being reviewed; it now carries a "
                 "different fingerprint and must be re-read before authorisation"
