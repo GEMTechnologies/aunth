@@ -1229,3 +1229,224 @@ def list_mail_accounts(
             for a in rows
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# The organisation profile - the Digital Twin, and the only way to fill it
+#
+# WHY THIS EXISTS. `OrganisationMemory.record_fact` was reachable only from tests and from other
+# services; there was no route an organisation could use to state its own country or registration.
+# Measured on production: `org_facts` was EMPTY, and every one of 95 opportunity matches sat at
+# NEEDS_DATA because the `country_eligible` and `registration_valid` gates could not be evaluated.
+# A platform whose matching engine is correct and whose profile has no intake reports "we cannot
+# tell" forever, and the operator reads that as a broken matcher.
+#
+# THE STATE IS NOT THE CALLER'S CHOICE. A fact written here is USER_PROVIDED with the acting user as
+# its source. This route will never write VERIFIED (which means a human with authority confirmed it)
+# and can never write AI_INFERRED (which is not submission-safe at all). Letting a request body name
+# its own provenance would defeat the one property the table exists to guarantee.
+# ---------------------------------------------------------------------------
+
+#: Permission required to state facts about the organisation. Not `mail.approve_send`: deciding what
+#: the organisation IS and deciding what it SAYS are different authorities, and an organisation may
+#: reasonably grant the first more widely than the second.
+PROFILE_WRITE_PERMISSION = "organisation.profile_write"
+
+#: The facts the matching gates read, and therefore the ones that turn a NEEDS_DATA match into a
+#: decidable one. Kept aligned with `agent/matching.py` by the contract test in
+#: `tests/test_profile_api.py` rather than by a comment, because a gate that starts reading a new key
+#: would otherwise silently keep every match parked.
+GATE_FACTS: dict[str, tuple[str, ...]] = {
+    "country_eligible": ("country",),
+    "registration_valid": ("registration_valid_until", "registration_status"),
+}
+
+#: Facts a person is most likely to supply, with the shape each should take. Documentation for the
+#: client and a sanity check for the operator - NOT a whitelist, because organisations legitimately
+#: hold facts this list has never heard of (a tax exemption date, a safeguarding lead) and refusing
+#: them would be the platform deciding what an organisation is allowed to know about itself.
+KNOWN_FACT_KEYS: dict[str, str] = {
+    "legal_name": "The registered legal name.",
+    "country": "Country of registration, e.g. 'Uganda'. Read by the country_eligible gate.",
+    "organisation_type": "NGO, charity, foundation, social enterprise, ...",
+    "registration_number": "The charity or company registration number.",
+    "registration_status": "ACTIVE, SUSPENDED, ... Read by the registration_valid gate.",
+    "registration_valid_until": "ISO-8601 date the registration expires. Read by registration_valid.",
+    "tax_exemption_valid_until": "ISO-8601 date a tax-exempt status expires.",
+    "founding_year": "Year the organisation was founded.",
+    "address": "Registered address.",
+    "contact_email": "The public contact address.",
+    "website": "The organisation's website.",
+    "minimum_grant_amount": "The smallest award worth applying for, as an integer.",
+    "annual_budget": "Most recent annual budget, as an integer.",
+}
+
+
+class FactInput(BaseModel):
+    key: str = Field(min_length=1, max_length=120)
+    value: Any = Field(description="The fact's value. Strings are the norm; integers are accepted.")
+    valid_until: Optional[datetime] = Field(
+        default=None,
+        description="When the fact stops being trusted. A lapsed certificate must not read as current.",
+    )
+
+
+class FactsWriteRequest(BaseModel):
+    facts: list[FactInput] = Field(min_length=1, max_length=100)
+
+
+def _fact_payload(fact: models.OrgFact) -> dict[str, Any]:
+    value = fact.value
+    if isinstance(value, dict) and "value" in value:
+        value = value["value"]
+    return {
+        "key": fact.key,
+        "value": value,
+        "state": fact.state,
+        "source": fact.source,
+        "version": fact.version,
+        "valid_until": _iso(fact.valid_until),
+        "created_at": _iso(fact.created_at),
+        # Whether this fact could actually be used in a submission. Computed rather than shown as a
+        # raw state, because "USER_PROVIDED" means nothing to the person filling the form.
+        "submission_usable": fact.state
+        in {
+            models.OrgFact.VERIFIED,
+            models.OrgFact.USER_PROVIDED,
+            models.OrgFact.IMPORTED,
+        },
+    }
+
+
+def _gate_readiness(facts: dict[str, Any]) -> list[dict[str, Any]]:
+    """Which matching gates the profile can currently decide, and what each one still needs.
+
+    This is the answer to "why are my matches not actionable", produced from the same keys the
+    matcher reads. Without it an operator sees a wall of NEEDS_DATA and has no way to find out that
+    two short fields are the whole cause.
+    """
+    readiness = []
+    for gate, keys in GATE_FACTS.items():
+        # The matcher treats registration_valid as satisfied by EITHER the expiry or the status, so
+        # one of them is enough. Requiring both here would send a person to fill a field the matcher
+        # is not waiting for.
+        present = [key for key in keys if facts.get(key) not in (None, "")]
+        readiness.append(
+            {
+                "gate": gate,
+                "decidable": bool(present),
+                "needs": [key for key in keys if key not in present],
+                "satisfied_by": present,
+            }
+        )
+    return readiness
+
+
+@router.get("/profile/facts", summary="The organisation's profile facts")
+def list_profile_facts(
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Every current fact, plus which matching gates remain undecidable without them.
+
+    Readable by any member of the organisation: knowing what the platform believes about the
+    organisation is not a privileged act, and a person cannot correct a wrong fact they cannot see.
+    """
+    from agent.organisation_memory import OrganisationMemory
+
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    memory = OrganisationMemory(db, org_id)
+    current = memory.current_facts()
+    usable = memory.submission_facts()
+
+    return {
+        "facts": [_fact_payload(fact) for fact in current],
+        "total": len(current),
+        # What the matcher can use, as opposed to what is merely stored.
+        "usable_fact_keys": sorted(usable),
+        "matching_gates": _gate_readiness(usable),
+        # Stated plainly, because this is the single fact that explains a NEEDS_DATA catalogue.
+        "blocks_matching": sorted(
+            gate["gate"] for gate in _gate_readiness(usable) if not gate["decidable"]
+        ),
+        "suggested_keys": KNOWN_FACT_KEYS,
+    }
+
+
+@router.put("/profile/facts", summary="State facts about the organisation")
+def write_profile_facts(
+    payload: FactsWriteRequest,
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Record one or more facts as USER_PROVIDED, superseding any earlier version.
+
+    A fact is NEVER overwritten in place. `record_fact` appends a new version and supersedes the
+    current one, so an application assembled against version 3 stays explainable after version 4
+    arrives - which is the difference between a platform that can answer "why did you say that?"
+    and one that cannot.
+
+    Partial success is deliberate. If one fact in the batch is unusable the others are still
+    recorded and the problem is reported by key: refusing the whole batch would make an operator
+    re-enter twenty good answers to fix one bad one.
+    """
+    from agent.organisation_memory import OrganisationMemory, OrganisationMemoryError, UnknownFactState
+
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    allowed, reason = has_permission(
+        db, org_id=org_id, user_id=user.id, permission=PROFILE_WRITE_PERMISSION
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"you may not change this organisation's profile: {reason}",
+        )
+
+    memory = OrganisationMemory(db, org_id, actor_id=str(user.id))
+    recorded: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+
+    for fact in payload.facts:
+        key = (fact.key or "").strip()
+        if not key:
+            rejected.append({"key": fact.key, "reason": "a fact key is required"})
+            continue
+        if fact.value is None or (isinstance(fact.value, str) and not fact.value.strip()):
+            # An empty value is not a fact. Storing "" would let a gate treat "blank" as "known" and
+            # produce a match the organisation cannot actually support.
+            rejected.append({"key": key, "reason": "an empty value is not a fact"})
+            continue
+        try:
+            row = memory.record_fact(
+                key=key,
+                value=fact.value,
+                # FIXED, never taken from the request: see the section comment.
+                state=models.OrgFact.USER_PROVIDED,
+                source=f"user:{user.id}",
+                value_type="date" if fact.valid_until is not None else "text",
+                valid_until=fact.valid_until,
+            )
+        except (OrganisationMemoryError, UnknownFactState) as exc:
+            rejected.append({"key": key, "reason": str(exc)[:200]})
+            continue
+        recorded.append({"key": key, "version": row.version, "state": row.state})
+
+    db.commit()
+
+    # Re-read after the commit so the answer describes what is durable rather than what was staged.
+    usable = OrganisationMemory(db, org_id).submission_facts()
+    return {
+        "recorded": recorded,
+        "rejected": rejected,
+        "usable_fact_keys": sorted(usable),
+        "matching_gates": _gate_readiness(usable),
+        "blocks_matching": sorted(
+            gate["gate"] for gate in _gate_readiness(usable) if not gate["decidable"]
+        ),
+    }
