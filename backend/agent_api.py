@@ -1232,6 +1232,255 @@ def list_mail_accounts(
 
 
 # ---------------------------------------------------------------------------
+# Reading mail
+#
+# THE GAP THIS FILLS. Inbound mail was being stored correctly - tenant-scoped, labelled with the
+# mailbox it arrived at - and there was no way for anybody to read it. Every route in this module
+# concerned OUTBOUND messages: `send-intents` and their approvals. So a code arriving at an NGO's
+# portal mailbox was visible only to an engineer with psql.
+#
+# VERIFICATION CODES ARE REDACTED ON THE WAY OUT. A one-time code is a credential for the length of
+# its window: anyone who reads it can complete - or hijack - the registration it belongs to. The
+# browser worker already treats a code as a per-run secret and keeps it out of the trace; this keeps
+# it out of the product surface too, so a screenshot of the inbox is not a screenshot of somebody's
+# pending account. The masked form keeps the message recognisable ("a code arrived") without
+# handing the value over.
+# ---------------------------------------------------------------------------
+
+#: Subject/body terms that make a message verification-shaped. Deliberately the same vocabulary the
+#: extractor uses, so the redaction cannot disagree with what the platform treats as a code.
+_VERIFICATION_TERMS = (
+    "verification", "verify", "confirmation code", "confirm your", "one-time",
+    "one time password", "otp", "security code", "activation code", "sign-in code",
+)
+
+#: A standalone run of 4-8 digits. Bounded so a phone number or a year is not mistaken for a code,
+#: and word-bounded so a longer number is not partially masked into nonsense.
+_CODE_PATTERN = None  # built lazily below
+
+
+def _redact_verification_code(subject: Optional[str], preview: Optional[str]) -> Optional[str]:
+    """Mask a one-time code in a message PREVIEW, and only there.
+
+    Only applied when the message already reads as a verification message. Masking every four-digit
+    number in every message would corrupt ordinary correspondence (an invoice total, a year, a grant
+    amount) and teach nobody anything.
+    """
+    import re as _re
+
+    if not preview:
+        return preview
+    haystack = f"{subject or ''}\n{preview}".lower()
+    if not any(term in haystack for term in _VERIFICATION_TERMS):
+        return preview
+    return _re.sub(r"(?<!\d)(\d{4,8})(?!\d)", "[code redacted]", preview)
+
+
+def _mailbox_purpose(identity: models.MailIdentity) -> str:
+    """What a mailbox is for, in words a person understands.
+
+    Portal mailboxes carry a marker in `display_name` of the form
+    ``portal-registration:<host>``; the public mailbox has an organisation name. Neither is
+    self-explanatory to a reader, so it is translated rather than echoed.
+    """
+    marker = (identity.display_name or "").strip()
+    if marker.startswith("portal-registration:"):
+        host = marker.split(":", 1)[1] or "a portal"
+        return f"Registration mail for {host}"
+    if identity.is_primary:
+        return "The organisation's public address"
+    if identity.identity_type == models.MailIdentity.TYPE_REPLY_ALIAS:
+        return "A reply alias for one conversation"
+    if identity.identity_type == models.MailIdentity.TYPE_CONNECTED:
+        return "A connected external mailbox"
+    return marker or "A Granada mailbox"
+
+
+class MailboxSummary(BaseModel):
+    id: str
+    address: str
+    purpose: str
+    is_primary: bool
+    status: str
+    identity_type: str
+    message_count: int
+    unread_capable: bool = True
+    last_message_at: Optional[str] = None
+
+
+class MailMessageSummary(BaseModel):
+    id: str
+    mailbox_id: Optional[str]
+    mailbox_address: Optional[str]
+    direction: str
+    sender: Optional[str]
+    sender_name: Optional[str]
+    subject: Optional[str]
+    #: REDACTED. A verification code never appears here; see `_redact_verification_code`.
+    preview: Optional[str]
+    received_at: Optional[str]
+    created_at: Optional[str]
+    processing_status: str
+    has_body: bool
+    #: True when the stored preview contained a code that was masked, so a client can say
+    #: "a verification code arrived" without ever receiving the value.
+    code_redacted: bool = False
+
+
+@router.get("/mail/mailboxes", summary="The mailboxes this organisation holds")
+def list_mailboxes(
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Every mailbox, with its purpose and how much mail it holds.
+
+    An organisation holds one mailbox PER PORTAL ACCOUNT, so this is a list rather than a single
+    inbox: keeping them distinguishable is the whole reason the mailbox is recorded on each message.
+    """
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    identities = (
+        db.query(models.MailIdentity)
+        .filter(models.MailIdentity.org_id == org_id)
+        .order_by(models.MailIdentity.is_primary.desc(), models.MailIdentity.created_at)
+        .all()
+    )
+
+    mailboxes: list[dict[str, Any]] = []
+    for identity in identities:
+        rows = (
+            db.query(models.MailMessage)
+            .filter(
+                models.MailMessage.org_id == org_id,
+                models.MailMessage.mail_identity_id == identity.id,
+            )
+            .order_by(models.MailMessage.created_at.desc())
+            .limit(1)
+            .all()
+        )
+        count = (
+            db.query(models.MailMessage)
+            .filter(
+                models.MailMessage.org_id == org_id,
+                models.MailMessage.mail_identity_id == identity.id,
+            )
+            .count()
+        )
+        mailboxes.append(
+            {
+                "id": identity.id,
+                "address": identity.address,
+                "purpose": _mailbox_purpose(identity),
+                "is_primary": bool(identity.is_primary),
+                "status": identity.status,
+                "identity_type": identity.identity_type,
+                "message_count": count,
+                "last_message_at": _iso(rows[0].created_at) if rows else None,
+            }
+        )
+
+    return {
+        "mailboxes": mailboxes,
+        "total": len(mailboxes),
+        # Named explicitly: an organisation that has provisioned no mailbox and one whose mailbox has
+        # simply received nothing are different facts, and only one of them is a problem.
+        "unassigned_messages": (
+            db.query(models.MailMessage)
+            .filter(
+                models.MailMessage.org_id == org_id,
+                models.MailMessage.mail_identity_id.is_(None),
+            )
+            .count()
+        ),
+    }
+
+
+@router.get("/mail/messages", summary="Mail held by this organisation")
+def list_messages(
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+    mailbox_id: Optional[str] = None,
+    direction: Optional[str] = None,
+    limit: int = 50,
+    before: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Newest first, optionally for one mailbox, cursor-paginated by `before`.
+
+    BODIES ARE NOT RETURNED, by design. `mail_messages` stores a reference to object storage and a
+    preview, because mail is among the largest and most sensitive things Granada holds; a list view
+    reading fifty bodies out of the object store would be both slow and a much larger exposure than
+    the list itself needs.
+    """
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    query = db.query(models.MailMessage).filter(models.MailMessage.org_id == org_id)
+    if mailbox_id:
+        query = query.filter(models.MailMessage.mail_identity_id == mailbox_id)
+    if direction:
+        wanted = direction.strip().upper()
+        if wanted not in (models.MailMessage.DIRECTION_INBOUND, models.MailMessage.DIRECTION_OUTBOUND):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="direction must be INBOUND or OUTBOUND",
+            )
+        query = query.filter(models.MailMessage.direction == wanted)
+    if before is not None:
+        # Cursor rather than offset: mail arrives while a person pages through it, and an offset
+        # would silently repeat or skip rows as the list grows at the head.
+        query = query.filter(models.MailMessage.created_at < before)
+
+    limit = max(1, min(int(limit), 200))
+    rows = query.order_by(models.MailMessage.created_at.desc()).limit(limit + 1).all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    # One lookup for the addresses, rather than a query per message.
+    mailbox_ids = {row.mail_identity_id for row in rows if row.mail_identity_id}
+    addresses: dict[str, str] = {}
+    if mailbox_ids:
+        for identity in (
+            db.query(models.MailIdentity)
+            .filter(models.MailIdentity.org_id == org_id,
+                    models.MailIdentity.id.in_(mailbox_ids))
+            .all()
+        ):
+            addresses[identity.id] = identity.address
+
+    messages = []
+    for row in rows:
+        redacted = _redact_verification_code(row.subject, row.body_preview)
+        messages.append(
+            {
+                "id": row.id,
+                "mailbox_id": row.mail_identity_id,
+                "mailbox_address": addresses.get(row.mail_identity_id or ""),
+                "direction": row.direction,
+                "sender": row.sender,
+                "sender_name": row.sender_name,
+                "subject": row.subject,
+                "preview": redacted,
+                "received_at": _iso(row.received_at),
+                "created_at": _iso(row.created_at),
+                "processing_status": row.processing_status,
+                "has_body": bool(row.body_ref),
+                "code_redacted": bool(redacted and redacted != row.body_preview),
+            }
+        )
+
+    return {
+        "messages": messages,
+        "count": len(messages),
+        "has_more": has_more,
+        # The cursor for the next page, taken from the LAST row returned.
+        "next_before": _iso(rows[-1].created_at) if has_more and rows else None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # The organisation profile - the Digital Twin, and the only way to fill it
 #
 # WHY THIS EXISTS. `OrganisationMemory.record_fact` was reachable only from tests and from other
