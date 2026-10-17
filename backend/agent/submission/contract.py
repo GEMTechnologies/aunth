@@ -133,7 +133,11 @@ class FrozenDocument:
             "mime_type": self.mime_type,
             "checksum_sha256": self.checksum_sha256,
             "storage_ref": self.storage_ref,
-            "title": self.title,
+            # `title` is DELIBERATELY NOT IN THE FINGERPRINT. It is a label, not bytes: the
+            # checksum above is what proves which artefact is filed. Including it would change the
+            # hash of every already-assembled package and force a re-freeze for a cosmetic edit -
+            # and a fingerprint that shifts when someone renames a document is not a stable
+            # statement of "this is what was authorised".
         }
 
 
