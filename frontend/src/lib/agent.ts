@@ -324,6 +324,54 @@ export interface VaultDocumentList {
 
 export const fetchDocuments = () => load<VaultDocumentList>('/agent/documents');
 
+export interface DocumentReading {
+  prompt_version?: string;
+  method?: string;
+  needed_vision?: boolean;
+  values?: Array<{ name: string; value: string | null; channel?: string }>;
+  limitation?: string | null;
+}
+
+export interface UploadResult {
+  document_id: string;
+  size_bytes: number;
+  checksum: string;
+  approval_status: string;
+  read: boolean;
+  reading: DocumentReading | null;
+  limitation: string | null;
+  note: string;
+}
+
+/**
+ * Upload a document the organisation already has — a scanned registration certificate, a photograph.
+ *
+ * The platform could generate documents and could not receive one, so the format an NGO actually holds
+ * had no way in. The reading comes back with the upload because "can you read this?" is the question
+ * asked immediately, and it is optional: an unreadable file is still a stored document.
+ */
+export async function uploadDocument(
+  file: File,
+  docType = 'registration_certificate',
+): Promise<AgentResult<UploadResult>> {
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    const response = await api.post(
+      `/agent/documents/upload?doc_type=${encodeURIComponent(docType)}`,
+      form,
+      { headers: { 'Content-Type': 'multipart/form-data' } },
+    );
+    return { ok: true, data: response.data };
+  } catch (error: any) {
+    const detail = error?.response?.data?.detail;
+    return {
+      ok: false,
+      error: typeof detail === 'string' ? detail : 'the document could not be uploaded',
+    };
+  }
+}
+
 /** Approve one document in the name of the person clicking. A WRITE, so it reports its own failure. */
 export async function approveDocument(id: string): Promise<AgentResult<{ approval_status: string }>> {
   try {

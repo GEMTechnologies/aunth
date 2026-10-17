@@ -34,7 +34,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
@@ -1539,6 +1539,83 @@ def get_evidence(
         raise HTTPException(status_code=404, detail="no such evidence file")
 
     return FileResponse(str(path), media_type="image/png")
+
+
+@router.post("/documents/upload", status_code=status.HTTP_201_CREATED, summary="Upload a document")
+async def upload_document(
+    file: UploadFile = File(...),
+    doc_type: str = "registration_certificate",
+    title: Optional[str] = None,
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Accept a document from the organisation, and read it if it can be read.
+
+    THE PLATFORM COULD GENERATE DOCUMENTS AND COULD NOT RECEIVE ONE. No upload route existed, so a
+    scanned registration certificate — the thing an NGO actually has — could not enter the system, and
+    the vision reader written for exactly that kind of document had nothing to read.
+
+    Bytes are stored content-addressed and the row is written PENDING: uploading is not approving, and
+    the gap between the two is where the wrong document would otherwise get attached.
+
+    The reading is returned WITH the upload rather than in a second call, because "can you read this?"
+    is the question an organisation asks immediately. It is optional: an unreadable file is still a
+    stored document, and the limitation says why instead of failing the upload.
+    """
+    from agent.document_intake import IntakeError, read_document, store_upload
+
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    allowed, denial = has_permission(
+        db, org_id=org_id, user_id=user.id, permission=PROFILE_WRITE_PERMISSION
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"you may not add documents to this organisation: {denial}",
+        )
+
+    data = await file.read()
+    try:
+        stored = store_upload(
+            db=db,
+            org_id=org_id,
+            filename=file.filename or "document",
+            mime_type=file.content_type or "",
+            data=data,
+            title=title,
+            doc_type=doc_type,
+            uploaded_by=str(user.id),
+        )
+    except IntakeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.commit()
+
+    read_ok, reading, limitation = read_document(
+        db=db,
+        org_id=org_id,
+        storage_key=stored.storage_key,
+        mime_type=file.content_type or "",
+    )
+    db.commit()
+
+    return {
+        "document_id": stored.document_id,
+        "size_bytes": stored.size_bytes,
+        "checksum": stored.checksum,
+        "approval_status": models.Document.PENDING,
+        "read": read_ok,
+        "reading": reading,
+        "limitation": limitation,
+        "note": (
+            "Stored and read. The reading is evidence, not fact: text taken from an image is never "
+            "used as an organisation's own claim."
+            if read_ok
+            else "Stored. " + (limitation or "It could not be read.")
+        ),
+    }
 
 
 @router.get("/documents", summary="Documents in the organisation's vault")

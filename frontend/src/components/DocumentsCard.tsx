@@ -1,11 +1,13 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   AgentResult,
+  UploadResult,
   VaultDocument,
   VaultDocumentList,
   approveDocument,
   fetchDocuments,
   rejectDocument,
+  uploadDocument,
 } from '../lib/agent';
 
 /**
@@ -32,6 +34,25 @@ const DocumentsCard: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploaded, setUploaded] = useState<UploadResult | null>(null);
+
+  const onPick = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setActionError(null);
+    setUploaded(null);
+    const result = await uploadDocument(file);
+    setUploading(false);
+    event.target.value = '';
+    if (!result.ok) {
+      setActionError(result.error);
+      return;
+    }
+    setUploaded(result.data);
+    load();
+  };
 
   const load = useCallback(async () => {
     setError(null);
@@ -101,6 +122,37 @@ const DocumentsCard: React.FC = () => {
         <span className="text-xs text-gray-500" data-testid="documents-total">
           {data.total} in the vault
         </span>
+      </div>
+
+      {/* UPLOADING: the format an NGO actually holds. A scanned certificate had no way in at all. */}
+      <div className="mb-3">
+        <label className="text-xs text-gray-600 block mb-1">
+          Upload one your organisation already has (image of a certificate)
+        </label>
+        <input
+          type="file"
+          accept="image/png,image/jpeg,image/webp,application/pdf"
+          onChange={onPick}
+          disabled={uploading}
+          className="text-xs"
+          data-testid="upload-document"
+        />
+        {uploading && <span className="text-xs text-gray-500 ml-2">reading…</span>}
+        {uploaded && (
+          <div className="mt-2 text-xs" data-testid="upload-result">
+            <p className="text-emerald-700">{uploaded.note}</p>
+            {uploaded.read && uploaded.reading?.values?.length ? (
+              <ul className="mt-1 text-gray-600 list-disc list-inside">
+                {uploaded.reading.values.slice(0, 6).map((v, i) => (
+                  <li key={i}>
+                    {v.name}
+                    {v.value ? `: ${v.value}` : ''}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        )}
       </div>
 
       {data.total === 0 ? (
