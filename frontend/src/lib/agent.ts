@@ -169,6 +169,13 @@ export interface ApplicationPackage {
   submission_mode: string;
   //: True only once an external receipt exists.
   submitted: boolean;
+  //: AUTHORISATION IS SEPARATE FROM READINESS. A package can be READY and still unauthorised - a
+  //: person has not approved the fingerprint that would be sent - and the product could not express
+  //: that difference, which is why there was no authorise button to build.
+  authorised_at?: string | null;
+  authorised_by?: string | null;
+  fingerprint?: string | null;
+  awaiting_authorisation?: boolean;
   created_at?: string | null;
 }
 
@@ -335,6 +342,39 @@ export async function rejectDocument(id: string): Promise<AgentResult<{ approval
   } catch (error: any) {
     const detail = error?.response?.data?.detail;
     return { ok: false, error: typeof detail === 'string' ? detail : 'this document could not be rejected' };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Authorising a package
+//
+// Authorisation approves a FINGERPRINT over the exact bytes that will be sent, and it is what permits
+// the browser to submit. The endpoint has existed and been permission-checked since the submission
+// service was written; what did not exist was any way for a person to reach it, so the chain stopped
+// one click from the portal.
+//
+// This reuses the existing etchPackages and ApplicationPackage rather than declaring a second,
+// quietly-diverging copy of the same shape.
+// ---------------------------------------------------------------------------
+
+/**
+ * Authorise one package. A WRITE, and the most consequential one in the product.
+ *
+ * A 409 means the package changed after it was assembled; re-reading and retrying is the intended
+ * remedy, which is why the message is surfaced rather than swallowed.
+ */
+export async function authorisePackage(
+  id: string,
+  note?: string,
+): Promise<AgentResult<{ status: string; fingerprint?: string }>> {
+  try {
+    const response = await api.post(`/agent/packages/${id}/authorise`, null, {
+      params: note ? { note } : undefined,
+    });
+    return { ok: true, data: response.data };
+  } catch (error: any) {
+    const detail = error?.response?.data?.detail;
+    return { ok: false, error: typeof detail === 'string' ? detail : 'this package could not be authorised' };
   }
 }
 

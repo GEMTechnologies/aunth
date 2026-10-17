@@ -294,6 +294,17 @@ def list_packages(
             "deadline": manifest.get("opportunity", {}).get("deadline"),
             "deadline_is_exact": manifest.get("opportunity", {}).get("deadline_is_exact"),
             "status": package.status,
+            # AUTHORISATION IS SEPARATE FROM READINESS, and an operator has to be able to see both.
+            # A package can be READY and still unauthorised - nothing may be sent until a person
+            # approves the fingerprint - and the previous payload could not express that difference,
+            # which is why there was no way to build the authorise button.
+            "authorised_at": package.authorised_at.isoformat() if package.authorised_at else None,
+            "authorised_by": package.authorised_by,
+            "fingerprint": package.package_fingerprint,
+            "awaiting_authorisation": (
+                package.status == models.SubmissionPackage.DRAFT
+                and package.authorised_at is None
+            ),
             "readiness": verdict.verdict,
             "message": verdict.message(),
             "satisfied": verdict.satisfied,

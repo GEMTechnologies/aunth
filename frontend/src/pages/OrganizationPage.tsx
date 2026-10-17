@@ -2,6 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import OrganisationFactsCard from '../components/OrganisationFactsCard';
 import DocumentsCard from '../components/DocumentsCard';
+import PackagesCard from '../components/PackagesCard';
 import { api } from '../lib/api';
 
 interface User {
@@ -333,6 +334,11 @@ const OrganizationPage: React.FC<OrganizationPageProps> = ({ user }) => {
                       profile; assembly will not freeze a package built on drafts; until this card
                       existed there was no way to approve one, so the portal step could never start. */}
                   <DocumentsCard />
+
+                  {/* THE LAST GATE A PERSON OPERATES. Approving documents queues assembly;
+                      authorising the package is what permits the browser to submit. Until this card
+                      existed the chain stopped one click from the portal. */}
+                  <PackagesCard />
                 </div>
               )}
 
