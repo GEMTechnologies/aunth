@@ -188,3 +188,61 @@ def test_a_configured_provider_passes(monkeypatch):
     assert report.checks[0].status == PASS
     assert "openai_compatible" in report.checks[0].detail
     assert "SYNTHESIS" in report.checks[0].detail
+
+
+# ---------------------------------------------------------------------------
+# Connected mailboxes: every way this fails is silent
+# ---------------------------------------------------------------------------
+def _report_for_mailboxes(monkeypatch, rows, error=None):
+    from datetime import datetime, timezone
+
+    from tools import system_check as module
+
+    monkeypatch.setattr(module, "_per_tenant", lambda *a, **k: (rows, error))
+    report = Report()
+    module.check_mailboxes(report, object(), datetime.now(timezone.utc))
+    return report.checks[0]
+
+
+def test_no_connected_mailboxes_is_a_pass_with_a_hint(monkeypatch):
+    """Not a fault - but it is the state in which Cloudflare is the only way in, so the remedy says
+    how to get a second route."""
+    from tools import system_check as module
+
+    check = _report_for_mailboxes(monkeypatch, [])
+    assert check.status == module.PASS
+    assert "Mail screen" in check.remedy
+
+
+def test_a_mailbox_the_provider_refused_is_a_warning(monkeypatch):
+    """The account row still says ACTIVE and the mailbox still appears on screen; the only signal is
+    that mail never arrives."""
+    from tools import system_check as module
+
+    check = _report_for_mailboxes(monkeypatch, [('error', 1)])
+    assert check.status == module.WARN
+    assert 'refused by the provider' in check.detail
+    assert 'app password' in check.remedy
+
+
+def test_a_mailbox_never_synced_is_a_warning(monkeypatch):
+    from tools import system_check as module
+
+    check = _report_for_mailboxes(monkeypatch, [('never', 2)])
+    assert check.status == module.WARN
+    assert 'never synced' in check.detail
+
+
+def test_healthy_mailboxes_pass(monkeypatch):
+    from tools import system_check as module
+
+    check = _report_for_mailboxes(monkeypatch, [('healthy', 3)])
+    assert check.status == module.PASS
+    assert 'all syncing' in check.detail
+
+
+def test_a_failing_query_is_a_skip_not_a_pass(monkeypatch):
+    from tools import system_check as module
+
+    check = _report_for_mailboxes(monkeypatch, None, error='permission denied')
+    assert check.status == module.SKIP

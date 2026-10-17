@@ -354,6 +354,73 @@ def check_model(report: Report) -> None:
         report.add("model routes configured", PASS, f"{provider} for tiers [{tiers}]")
 
 
+def check_mailboxes(report: Report, db, now) -> None:
+    """Are the organisation's own mailboxes actually being read?
+
+    WHY THIS EXISTS. Connecting an external mailbox is the operator's route around Cloudflare, and every
+    way it can fail is SILENT: a wrong app password, a provider that disabled IMAP, a sweep that never
+    picks the account up. The account row still says ACTIVE, the mailbox still appears on the Mail
+    screen, and mail simply never arrives. That is the exact failure this whole command exists to catch,
+    and until now nothing looked.
+
+    The classes are separated rather than collapsed into "unhealthy", because the remedy differs:
+    `error` means the provider refused (fix the credential), `never` means the sweep has not tried
+    (fix the wiring), `stale` means it worked once and stopped (fix the provider or the credential).
+    """
+    rows, error = _per_tenant(
+        db,
+        """
+        SELECT CASE
+                 WHEN last_sync_at IS NULL AND last_error IS NULL THEN 'never'
+                 WHEN last_error IS NOT NULL THEN 'error'
+                 WHEN last_sync_at > now() - interval '1 day' THEN 'healthy'
+                 ELSE 'stale'
+               END AS state,
+               count(*)
+          FROM mail_accounts
+         GROUP BY 1
+        """,
+        many=True,
+    )
+    if error:
+        report.add("mailboxes readable", SKIP, error)
+        return
+
+    counts = {key: value for key, value in (rows or [])}
+    total = sum(counts.values())
+    if not total:
+        report.add(
+            "mailboxes readable", PASS,
+            "no mailboxes connected",
+            "connect one on the Mail screen to read verification mail without Cloudflare",
+        )
+        return
+
+    problems = []
+    if counts.get("error"):
+        problems.append(f"{counts['error']} refused by the provider")
+    if counts.get("never"):
+        problems.append(f"{counts['never']} never synced")
+    if counts.get("stale"):
+        problems.append(f"{counts['stale']} not synced in a day")
+
+    if not problems:
+        report.add("mailboxes readable", PASS, f"{total} connected, all syncing")
+        return
+
+    detail = f"{total} connected: " + ", ".join(problems)
+    if counts.get("error") or counts.get("never"):
+        # A mailbox that was never read, or is being refused, is not "a bit stale" - for the operator
+        # relying on it, mail is simply not arriving.
+        report.add(
+            "mailboxes readable", WARN, detail,
+            "open the mailbox's account and re-enter the app password; IMAP must be enabled at the provider",
+        )
+    else:
+        report.add("mailboxes readable", WARN, detail,
+                   "the sweep runs every fifteen minutes; check the provider's IMAP access")
+
+
 # ---------------------------------------------------------------------------
 # HTTP checks
 # ---------------------------------------------------------------------------
@@ -434,6 +501,7 @@ def main(argv: list[str] | None = None) -> int:
 
         db = FleetSessionLocal()
         check_database(report, db)
+        check_mailboxes(report, db, datetime.now(timezone.utc))
     except Exception as exc:  # noqa: BLE001
         report.add("database reachable", FAIL, f"{type(exc).__name__}: {exc}"[:200],
                    "check the postgres container and DATABASE_URL")
