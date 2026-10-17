@@ -284,9 +284,61 @@ export interface MessagePage {
 }
 
 export const fetchMailboxes = () => load<MailboxList>('/agent/mail/mailboxes');
-
 export const fetchMailMessages = (params?: { mailbox_id?: string; direction?: string; limit?: number; before?: string }) =>
   load<MessagePage>('/agent/mail/messages', params);
+
+// ---------------------------------------------------------------------------
+// Connecting the organisation's OWN mailbox
+//
+// The product promised organisations could connect their existing Gmail rather than take a
+// Granada-managed address. It matters beyond convenience: reading their own inbox is the one route to
+// a verification code that does not depend on Cloudflare Email Routing.
+// ---------------------------------------------------------------------------
+
+export interface ConnectMailboxInput {
+  address: string;
+  imap_host: string;
+  imap_port: number;
+  imap_user: string;
+  imap_password: string;
+  use_ssl: boolean;
+  display_name?: string;
+}
+
+export interface ConnectedMailbox {
+  id: string;
+  address: string;
+  provider: string;
+  connection_type: string;
+  status: string;
+  note: string;
+}
+
+/**
+ * Register an external mailbox. A WRITE, so it is separate from the read helpers above.
+ *
+ * The password is sent once and never returned: the server encrypts it and keeps only a reference.
+ * Nothing in this module reads it back.
+ */
+export async function connectMailbox(
+  input: ConnectMailboxInput,
+): Promise<AgentResult<ConnectedMailbox>> {
+  try {
+    const response = await api.post('/agent/mail/accounts', input);
+    return { ok: true, data: response.data };
+  } catch (error: any) {
+    const detail = error?.response?.data?.detail;
+    return {
+      ok: false,
+      error:
+        typeof detail === 'string'
+          ? detail
+          : Array.isArray(detail)
+            ? 'some fields were not accepted'
+            : 'the mailbox could not be connected',
+    };
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Funding: what the discovery bot found, and what the matcher decided

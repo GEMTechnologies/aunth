@@ -5,6 +5,7 @@ import {
   Mailbox,
   MailboxList,
   MessagePage,
+  connectMailbox,
   fetchMailboxes,
   fetchMailMessages,
 } from '../lib/agent';
@@ -53,6 +54,21 @@ const MailPage: React.FC<{ organisationName?: string }> = () => {
   const [selected, setSelected] = useState<string | null>(null);
   const [showOnlyInbound, setShowOnlyInbound] = useState(false);
 
+  // Connecting the organisation's OWN mailbox. Kept here rather than on a separate screen because it
+  // creates a mailbox, and this is the screen where mailboxes live.
+  const [showConnect, setShowConnect] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [connectError, setConnectError] = useState<string | null>(null);
+  const [connected, setConnected] = useState<string | null>(null);
+  const [form, setForm] = useState({
+    address: '',
+    imap_host: '',
+    imap_port: '993',
+    imap_user: '',
+    imap_password: '',
+    use_ssl: true,
+  });
+
   const loadMailboxes = useCallback(async () => {
     setMailboxes(null);
     setMailboxes(panelOf(await fetchMailboxes()));
@@ -81,6 +97,33 @@ const MailPage: React.FC<{ organisationName?: string }> = () => {
 
   const boxes = mailboxes?.kind === 'ready' ? mailboxes.value.mailboxes : [];
   const chosen = boxes.find((box) => box.id === selected) ?? null;
+
+  const submitConnect = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setConnecting(true);
+    setConnectError(null);
+    setConnected(null);
+
+    const result = await connectMailbox({
+      address: form.address.trim(),
+      imap_host: form.imap_host.trim(),
+      imap_port: Number(form.imap_port) || 993,
+      imap_user: form.imap_user.trim(),
+      imap_password: form.imap_password,
+      use_ssl: form.use_ssl,
+    });
+    setConnecting(false);
+
+    if (!result.ok) {
+      setConnectError(result.error);
+      return;
+    }
+    setConnected(result.data.address);
+    // The password is never read back and is no longer needed in the browser.
+    setForm({ address: '', imap_host: '', imap_port: '993', imap_user: '', imap_password: '', use_ssl: true });
+    setShowConnect(false);
+    loadMailboxes();
+  };
 
   return (
     <div className="space-y-6" data-testid="mail-page">
@@ -155,8 +198,7 @@ const MailPage: React.FC<{ organisationName?: string }> = () => {
 
           {mailboxes?.kind === 'ready' && boxes.length > 0 && (
             <>
-              <ul className="space-y-2">
-                <li>
+              <ul className="space-y-2">                <li>
                   <button
                     onClick={() => setSelected(null)}
                     className={`w-full text-left px-3 py-2 rounded-md text-sm ${
@@ -205,6 +247,115 @@ const MailPage: React.FC<{ organisationName?: string }> = () => {
               )}
             </>
           )}
+
+          {/* ------------------------------------------------------------ */}
+          {/* Connect the organisation's OWN mailbox                        */}
+          {/*                                                              */}
+          {/* Offered on this screen because it creates a mailbox, and it  */}
+          {/* is the one route to a verification code that does not depend  */}
+          {/* on Cloudflare Email Routing.                                  */}
+          {/* ------------------------------------------------------------ */}
+          <div className="mt-4 pt-4 border-t border-gray-100">
+            {connected && (
+              <p className="text-xs text-emerald-700 mb-2" data-testid="connect-ok">
+                Connected {connected}. Granada reads it on the sync sweep.
+              </p>
+            )}
+
+            {!showConnect && (
+              <button
+                onClick={() => setShowConnect(true)}
+                className="text-sm text-blue-700 hover:underline"
+                data-testid="show-connect"
+              >
+                Connect an existing mailbox (e.g. your Gmail)
+              </button>
+            )}
+
+            {showConnect && (
+              <form onSubmit={submitConnect} className="space-y-2" data-testid="connect-form">
+                <p className="text-xs text-gray-500">
+                  Use an <strong>app password</strong>, not your account password. It is stored
+                  encrypted and never shown again.
+                </p>
+                <input
+                  value={form.address}
+                  onChange={(e) => setForm({ ...form, address: e.target.value })}
+                  placeholder="Mailbox address (e.g. ngo@gmail.com)"
+                  className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md"
+                  data-testid="connect-address"
+                  required
+                />
+                <input
+                  value={form.imap_host}
+                  onChange={(e) => setForm({ ...form, imap_host: e.target.value })}
+                  placeholder="IMAP host (e.g. imap.gmail.com)"
+                  className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md"
+                  data-testid="connect-host"
+                  required
+                />
+                <div className="flex gap-2">
+                  <input
+                    value={form.imap_user}
+                    onChange={(e) => setForm({ ...form, imap_user: e.target.value })}
+                    placeholder="IMAP username"
+                    className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-md"
+                    data-testid="connect-user"
+                    required
+                  />
+                  <input
+                    value={form.imap_port}
+                    onChange={(e) => setForm({ ...form, imap_port: e.target.value })}
+                    placeholder="993"
+                    className="w-20 px-3 py-2 text-sm border border-gray-300 rounded-md"
+                    data-testid="connect-port"
+                    required
+                  />
+                </div>
+                <input
+                  type="password"
+                  value={form.imap_password}
+                  onChange={(e) => setForm({ ...form, imap_password: e.target.value })}
+                  placeholder="App password"
+                  className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md"
+                  data-testid="connect-password"
+                  required
+                />
+                <label className="flex items-center gap-2 text-xs text-gray-600">
+                  <input
+                    type="checkbox"
+                    checked={form.use_ssl}
+                    onChange={(e) => setForm({ ...form, use_ssl: e.target.checked })}
+                  />
+                  Use SSL
+                </label>
+
+                {connectError && (
+                  <p className="text-xs text-red-700" data-testid="connect-error">
+                    {connectError}
+                  </p>
+                )}
+
+                <div className="flex gap-2">
+                  <button
+                    type="submit"
+                    disabled={connecting}
+                    className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50"
+                    data-testid="connect-submit"
+                  >
+                    {connecting ? 'Connecting…' : 'Connect'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowConnect(false)}
+                    className="px-3 py-1.5 text-sm border border-gray-300 rounded-md text-gray-700"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
         </section>
 
         {/* ---------------------------------------------------------------- */}
