@@ -1301,6 +1301,7 @@ class StartRegistrationOut(BaseModel):
     state: str
     opportunity_id: str
     application_id: str
+    documents_workflow_id: str
     note: str
 
 
@@ -1360,6 +1361,28 @@ def start_portal_registration(
         )
     application, opportunity = row
 
+    # THE DOCUMENTS COME FIRST, AND NOTHING EVER ASKED FOR THEM.
+    #
+    # `_handle_document_generate` is registered under the DOCUMENT specialist and was created by no
+    # production code at all - measured: `documents=0` in a database with 112 applications, and every
+    # submission package stuck on "missing mandatory material: cover_letter, organisation_profile".
+    # Both of those are PLATFORM-GENERATED (agent/documents.py): the organisation cannot upload a
+    # cover letter the software writes. So the package could never become ready, the browser task
+    # could never open the portal, and the blocker was reported to the operator as their own missing
+    # data. It was not.
+    documents_workflow = AgentWake.schedule(
+        db,
+        agent=agent,
+        workflow_type="document_generate",
+        specialist_key="DOCUMENT",
+        subject_type="OPPORTUNITY",
+        subject_id=str(opportunity.id),
+        # Ahead of the browser task: opening a portal with no assembled package parks, which is
+        # correct but wasteful when the package is a few seconds of template work away.
+        run_at=None,
+        payload_ref={"application_id": str(application.id)},
+    )
+
     workflow = AgentWake.schedule(
         db,
         agent=agent,
@@ -1379,6 +1402,7 @@ def start_portal_registration(
         state=str(workflow.state),
         opportunity_id=str(opportunity.id),
         application_id=str(application.id),
+        documents_workflow_id=str(documents_workflow.id),
         note=(
             "The agent will open the portal. It never submits: submission authority is a separate "
             "decision, and it will wait for a verification code if one is requested."
