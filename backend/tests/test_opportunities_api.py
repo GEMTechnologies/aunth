@@ -60,14 +60,15 @@ def world(db):
     return {"org": org, "user": user}
 
 
-def opportunity(db, *, title="Community Development Grant", country="Uganda", deadline_days=30):
+def opportunity(db, *, title="Community Development Grant", country="Uganda",
+                deadline_days=30, active=True):
     row = models.Opportunity(
         id=str(uuid.uuid4()), title=title,
         source_url=f"https://grants.example/{uuid.uuid4().hex[:8]}",
         source_name="Grants.gov", country=country,
         content_hash=uuid.uuid4().hex + uuid.uuid4().hex,
         dedupe_fingerprint=uuid.uuid4().hex + uuid.uuid4().hex,
-        amount_max=500000, currency="USD", is_active=True,
+        amount_max=500000, currency="USD", is_active=active,
         deadline=datetime.now(timezone.utc) + timedelta(days=deadline_days),
         created_at=datetime.now(timezone.utc),
     )
@@ -250,6 +251,50 @@ def test_pagination_does_not_repeat(client, db, world):
 def test_the_limit_is_bounded(client, db, world):
     opportunity(db)
     assert get(client, limit=100000)["limit"] == 200
+
+
+# ---------------------------------------------------------------------------
+# Inactive listings: excluded by default, and stale when included
+# ---------------------------------------------------------------------------
+def test_an_inactive_listing_is_excluded_by_default(client, db, world):
+    """MEASURED ON PRODUCTION. The catalogue held 23 ReliefWeb news reports, 20 training courses and
+    51 browser-test fixtures beside 18 real funding calls. Their stored verdicts were computed while
+    they were active, so the screen ranked a `LIVE TEST:` row at the top as "needs data" - a stale
+    verdict presented as an actionable one."""
+    opportunity(db, title="Closed programme", active=False)
+    opportunity(db, title="Open programme")
+    titles = [row["title"] for row in get(client)["opportunities"]]
+    assert titles == ["Open programme"]
+
+
+def test_inactive_listings_can_be_requested_and_are_marked_stale(client, db, world):
+    closed = opportunity(db, title="Closed programme", active=False)
+    match(db, world, closed, state=models.OpportunityMatch.NEEDS_DATA, gates=["country_eligible"])
+
+    body = get(client, include_inactive=True)
+    row = next(r for r in body["opportunities"] if r["title"] == "Closed programme")
+    assert row["is_active"] is False
+    assert row["match"]["stale"] is True, "a verdict from when it was live is stale, not current"
+    assert body["include_inactive"] is True
+
+
+def test_the_summary_describes_the_listings_on_the_screen(client, db, world):
+    """A summary that counted inactive rows the list excludes would report work nobody can see."""
+    closed = opportunity(db, title="Closed", active=False)
+    match(db, world, closed, state=models.OpportunityMatch.NEEDS_DATA, gates=["country_eligible"])
+    live = opportunity(db, title="Live")
+    match(db, world, live, state=models.OpportunityMatch.MATCHED, passed=True, score=0.9, rank=1)
+
+    body = get(client)
+    assert body["summary"]["needs_data"] == 0, "the closed one is not on the screen"
+    assert body["summary"]["matched"] == 1
+    assert body["catalogue_size"] == 1
+
+
+def test_blocked_by_fact_ignores_inactive_listings(client, db, world):
+    closed = opportunity(db, title="Closed", active=False)
+    match(db, world, closed, state=models.OpportunityMatch.NEEDS_DATA, gates=["country_eligible"])
+    assert get(client)["blocked_by_fact"] == {}
 
 
 # ---------------------------------------------------------------------------

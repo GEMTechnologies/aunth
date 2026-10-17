@@ -236,6 +236,11 @@ const OpportunitiesPage: React.FC<{ onOpenProfile?: () => void }> = ({ onOpenPro
                       {opp.amount_min ? ` · from ${money(opp.amount_min, opp.currency)}` : ''}
                     </span>
                     {!opp.is_active && <span className="text-gray-400">no longer active</span>}
+                    {opp.match?.stale && (
+                      <span className="text-amber-700" data-testid="stale">
+                        verdict from before the listing closed
+                      </span>
+                    )}
                   </div>
 
                   {/* WHY, in the organisation's own terms. */}

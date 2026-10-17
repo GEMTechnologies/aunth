@@ -309,6 +309,9 @@ export interface OpportunityMatch {
   final_score?: number | null;
   rank?: number | null;
   computed_at?: string | null;
+  //: The verdict was computed while the listing was still live. A stale answer is different from a
+  //: wrong one, and the screen must say which it is.
+  stale?: boolean;
   failed_gates: string[];
   unknown_gates: string[];
   blocking: BlockingRequirement[];
@@ -335,6 +338,7 @@ export interface OpportunityList {
   total: number;
   limit: number;
   offset: number;
+  include_inactive?: boolean;
   summary: { matched: number; needs_data: number; rejected: number; not_evaluated: number };
   catalogue_size: number;
   //: How many blocked matches each missing fact would unblock. The single most useful number on the
@@ -343,7 +347,11 @@ export interface OpportunityList {
   next_offset?: number | null;
 }
 
-export const fetchOpportunities = (params?: { state?: string; limit?: number; offset?: number }) =>
-  load<OpportunityList>('/agent/opportunities', params);
+export const fetchOpportunities = (params?: {
+  state?: string;
+  limit?: number;
+  offset?: number;
+  include_inactive?: boolean;
+}) => load<OpportunityList>('/agent/opportunities', params);
 
 

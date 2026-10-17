@@ -1530,6 +1530,7 @@ def list_opportunities(
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
     state: Optional[str] = None,
+    include_inactive: bool = False,
     limit: int = 50,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -1538,6 +1539,14 @@ def list_opportunities(
     LEFT JOIN, not inner: an opportunity the matcher has not reached yet is a real and interesting
     state ("the bot found it, the matcher hasn't judged it"). An inner join would hide it and make the
     catalogue look smaller than it is.
+
+    INACTIVE LISTINGS ARE EXCLUDED BY DEFAULT, and that is a correction rather than a filter.
+    Measured on production: the catalogue held 23 ReliefWeb news reports, 20 training courses and 51
+    browser-test fixtures alongside 18 real funding calls. The stored verdicts for those were
+    computed while they were still active, so the screen ranked a `LIVE TEST:` row at the top as
+    "needs data" - a stale verdict presented as an actionable one. A person browsing funding wants
+    funding they can apply to, so inactive listings are opt-in and, when included, are marked
+    `stale` rather than silently mixed in.
 
     The catalogue is SHARED and not tenant-owned (ADR-0009); only the match is per-organisation. The
     join is therefore scoped on `org_id` so one organisation's verdicts can never appear beside
@@ -1549,8 +1558,8 @@ def list_opportunities(
     limit = max(1, min(int(limit), 200))
     offset = max(0, int(offset))
 
-    # MATCHED first, then blocked, then ruled out, then not-yet-judged. An operator's attention
-    # belongs at the top of that list, not in the order rows happened to be inserted.
+    # MATCHED first, then blocked, then ruled out, then not-yet-judged, then inactive. An operator's
+    # attention belongs at the top of that list, not in the order rows happened to be inserted.
     priority = case(
         (models.OpportunityMatch.state == models.OpportunityMatch.MATCHED, 0),
         (models.OpportunityMatch.state == models.OpportunityMatch.NEEDS_DATA, 1),
@@ -1569,6 +1578,8 @@ def list_opportunities(
             ),
         )
     )
+    if not include_inactive:
+        query = query.filter(models.Opportunity.is_active.is_(True))
     if state:
         wanted = state.strip().upper()
         allowed = {
@@ -1620,6 +1631,9 @@ def list_opportunities(
                     "final_score": match.final_score,
                     "rank": match.rank,
                     "computed_at": _iso(match.computed_at),
+                    # The verdict was computed while the listing was live. Saying so is the
+                    # difference between a stale answer and a wrong one.
+                    "stale": not bool(opportunity.is_active),
                     # The evidence, not just the verdict.
                     "failed_gates": (match.failed_gates or {}).get("gates", []),
                     "unknown_gates": (match.unknown_gates or {}).get("gates", []),
@@ -1638,34 +1652,43 @@ def list_opportunities(
         )
 
     # Counts for the whole catalogue, not the page: a summary that described one page would be
-    # mistaken for the portfolio.
+    # mistaken for the portfolio. Scoped to the same listings the list is scoped to, so "95 need
+    # data" cannot refer to rows that are not on the screen.
     tally = {"matched": 0, "needs_data": 0, "rejected": 0, "not_evaluated": 0}
-    for state_name, count in (
+    counts_query = (
         db.query(models.OpportunityMatch.state, func.count())
+        .join(models.Opportunity, models.Opportunity.id == models.OpportunityMatch.opportunity_id)
         .filter(models.OpportunityMatch.org_id == org_id)
-        .group_by(models.OpportunityMatch.state)
-        .all()
-    ):
+    )
+    if not include_inactive:
+        counts_query = counts_query.filter(models.Opportunity.is_active.is_(True))
+    for state_name, count in counts_query.group_by(models.OpportunityMatch.state).all():
         if state_name == models.OpportunityMatch.MATCHED:
             tally["matched"] = count
         elif state_name == models.OpportunityMatch.NEEDS_DATA:
             tally["needs_data"] = count
         elif state_name == models.OpportunityMatch.REJECTED_BY_RULE:
             tally["rejected"] = count
-    catalogue = db.query(models.Opportunity).count()
+
+    catalogue_query = db.query(models.Opportunity)
+    if not include_inactive:
+        catalogue_query = catalogue_query.filter(models.Opportunity.is_active.is_(True))
+    catalogue = catalogue_query.count()
     tally["not_evaluated"] = max(0, catalogue - sum(tally.values()))
 
     # The single most useful sentence on the screen: what would unblock the most matches.
     blocked_facts: dict[str, int] = {}
-    for match in (
+    blocked_query = (
         db.query(models.OpportunityMatch)
+        .join(models.Opportunity, models.Opportunity.id == models.OpportunityMatch.opportunity_id)
         .filter(
             models.OpportunityMatch.org_id == org_id,
             models.OpportunityMatch.state == models.OpportunityMatch.NEEDS_DATA,
         )
-        .limit(500)
-        .all()
-    ):
+    )
+    if not include_inactive:
+        blocked_query = blocked_query.filter(models.Opportunity.is_active.is_(True))
+    for match in blocked_query.limit(500).all():
         for requirement in _blocking_requirements(match.unknown_gates):
             for fact in requirement["needs_facts"]:
                 blocked_facts[fact] = blocked_facts.get(fact, 0) + 1
@@ -1675,6 +1698,7 @@ def list_opportunities(
         "total": total,
         "limit": limit,
         "offset": offset,
+        "include_inactive": bool(include_inactive),
         "summary": tally,
         "catalogue_size": catalogue,
         "blocked_by_fact": blocked_facts,
