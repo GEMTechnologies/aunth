@@ -113,6 +113,16 @@ class FrozenDocument:
     mime_type: Optional[str] = None
     checksum_sha256: Optional[str] = None
     storage_ref: Optional[str] = None
+    #: THE MANIFEST WRITES THIS AND THIS CLASS DID NOT ACCEPT IT.
+    #
+    # The package manifest records a human-readable title per document, and rehydration does
+    # `FrozenDocument(**d)` - so authorising any package containing a titled document raised
+    # "unexpected keyword argument 'title'" and the package could never be authorised. Measured: the
+    # final gate before the browser opens the portal was unreachable for exactly this reason.
+    #
+    # Kept rather than filtered: this class is described as self-describing about what was authorised,
+    # and a filed document with no title is less self-describing than one with.
+    title: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -123,6 +133,7 @@ class FrozenDocument:
             "mime_type": self.mime_type,
             "checksum_sha256": self.checksum_sha256,
             "storage_ref": self.storage_ref,
+            "title": self.title,
         }
 
 
