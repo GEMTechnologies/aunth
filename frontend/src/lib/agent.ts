@@ -570,6 +570,10 @@ export interface ProfileFacts {
   matching_gates: MatchingGate[];
   blocks_matching: string[];
   suggested_keys: Record<string, string>;
+  //: The facts the document TEMPLATES interpolate, read from the templates by the server. The
+  //: product used to hardcode this list, which meant a changed template could leave the panel saying
+  //: "all facts supplied" while generation parked on a placeholder it needed.
+  required_fact_keys?: string[];
 }
 
 export interface ProfileFactsWriteResult {

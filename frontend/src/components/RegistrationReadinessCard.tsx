@@ -30,7 +30,10 @@ interface Step {
   detail: string;
 }
 
-const FACT_KEYS = [
+//: Used only if the server does not send its own list. The source of truth is `required_fact_keys`,
+//: computed from the document templates - a hardcoded list here would let a changed template leave
+//: this panel saying "all supplied" while generation parked on a placeholder nobody was asked for.
+const FALLBACK_FACT_KEYS = [
   'organisation_name',
   'registration_number',
   'registration_valid_until',
@@ -71,14 +74,17 @@ const RegistrationReadinessCard: React.FC = () => {
           .filter((f) => typeof f.value === 'string' && f.value.trim())
           .map((f) => f.key),
       );
-      const missing = FACT_KEYS.filter((k) => !known.has(k));
+      const required = facts.data.required_fact_keys?.length
+        ? facts.data.required_fact_keys
+        : FALLBACK_FACT_KEYS;
+      const missing = required.filter((k) => !known.has(k));
       out.push({
         key: 'facts',
         label: 'Organisation facts',
         state: missing.length ? 'OUTSTANDING' : 'DONE',
         detail: missing.length
-          ? `${missing.length} of ${FACT_KEYS.length} still needed: ${missing.slice(0, 4).join(', ')}${missing.length > 4 ? '…' : ''}`
-          : `all ${FACT_KEYS.length} supplied`,
+          ? `${missing.length} of ${required.length} still needed: ${missing.slice(0, 4).join(', ')}${missing.length > 4 ? '…' : ''}`
+          : `all ${required.length} supplied`,
       });
     }
 

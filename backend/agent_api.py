@@ -2281,6 +2281,37 @@ class FactsWriteRequest(BaseModel):
     facts: list[FactInput] = Field(min_length=1, max_length=100)
 
 
+def _required_fact_keys() -> list[str]:
+    """The organisation facts the document templates actually interpolate.
+
+    Read from `DEFAULT_TEMPLATES` rather than listed here, so "what the documents need" has exactly one
+    definition. Three placeholders are filled from the opportunity at generation time and are therefore
+    excluded - asking an organisation for its funder's name would be the same category error as asking
+    it to upload a cover letter the platform writes.
+    """
+    try:
+        from agent.documents import DEFAULT_TEMPLATES
+
+        # Exactly the set `_handle_document_generate` fills from the opportunity before rendering:
+        # see the `facts.setdefault(...)` block there. Anything it supplies is not the organisation's
+        # to provide, and listing it would make the panel ask for a funder's name.
+        supplied_from_opportunity = {
+            "today",
+            "donor_name",
+            "opportunity_title",
+            "currency",
+            "amount_requested",
+        }
+        keys: set[str] = set()
+        for template in DEFAULT_TEMPLATES:
+            for name in template.placeholders():
+                if name not in supplied_from_opportunity:
+                    keys.add(name)
+        return sorted(keys)
+    except Exception:  # noqa: BLE001 - a missing list must not break reading the facts
+        return []
+
+
 def _fact_payload(fact: models.OrgFact) -> dict[str, Any]:
     value = fact.value
     if isinstance(value, dict) and "value" in value:
@@ -2351,6 +2382,16 @@ def list_profile_facts(
     return {
         "facts": [_fact_payload(fact) for fact in current],
         "total": len(current),
+        # THE DOCUMENTS' OWN SHOPPING LIST, READ FROM THE TEMPLATES.
+        #
+        # The product screen used to hardcode this list, which meant two sources of truth: change a
+        # template and the panel would still say "all facts supplied" while document generation parked
+        # on a placeholder it needed. That is the same disagreement this project already paid for once,
+        # when the generator and the readiness gate disagreed about required documents.
+        #
+        # `opportunity_title`, `donor_name` and `today` are excluded: they are supplied from the
+        # opportunity at generation time, so the organisation is never asked for them.
+        "required_fact_keys": _required_fact_keys(),
         # What the matcher can use, as opposed to what is merely stored.
         "usable_fact_keys": sorted(usable),
         "matching_gates": _gate_readiness(usable),
