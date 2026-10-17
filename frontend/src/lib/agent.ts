@@ -226,3 +226,65 @@ export async function markNotification(
     };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Mail
+//
+// An organisation holds ONE MAILBOX PER PORTAL ACCOUNT, so this is a list of mailboxes rather than
+// a single inbox. Keeping them distinguishable is the whole reason the mailbox is recorded on every
+// message: a code for the UN portal and a notification from a different portal belong to different
+// histories, and merging them is what makes a verification impossible to attribute.
+// ---------------------------------------------------------------------------
+
+export interface Mailbox {
+  id: string;
+  address: string;
+  //: Already translated by the server into a sentence, e.g. "Registration mail for www.example.org".
+  purpose: string;
+  is_primary: boolean;
+  status: string;
+  identity_type: string;
+  message_count: number;
+  last_message_at?: string | null;
+}
+
+export interface MailboxList {
+  mailboxes: Mailbox[];
+  total: number;
+  //: Messages that arrived before a mailbox was recorded. Counted separately rather than hidden,
+  //: because "no mailbox" and "no mail" are different facts.
+  unassigned_messages: number;
+}
+
+export interface MailSummary {
+  id: string;
+  mailbox_id?: string | null;
+  mailbox_address?: string | null;
+  direction: 'INBOUND' | 'OUTBOUND';
+  sender?: string | null;
+  sender_name?: string | null;
+  subject?: string | null;
+  //: ALREADY REDACTED. A verification code never reaches this field; the server masks it. `null`
+  //: here does not mean "empty" - it means the message had no preview stored.
+  preview?: string | null;
+  received_at?: string | null;
+  created_at?: string | null;
+  processing_status: string;
+  has_body: boolean;
+  //: True when a code was masked on the way out. The UI says "a code arrived, value withheld"
+  //: rather than pretending the message had no code.
+  code_redacted: boolean;
+}
+
+export interface MessagePage {
+  messages: MailSummary[];
+  count: number;
+  has_more: boolean;
+  next_before?: string | null;
+}
+
+export const fetchMailboxes = () => load<MailboxList>('/agent/mail/mailboxes');
+
+export const fetchMailMessages = (params?: { mailbox_id?: string; direction?: string; limit?: number; before?: string }) =>
+  load<MessagePage>('/agent/mail/messages', params);
+

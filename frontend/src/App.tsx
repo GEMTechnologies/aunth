@@ -4,13 +4,14 @@ import ProfilePage from './pages/ProfilePage';
 import OrganizationPage from './pages/OrganizationPage';
 import SecurityPage from './pages/SecurityPage';
 import AgentPage from './pages/AgentPage';
+import MailPage from './pages/MailPage';
 import { apiMe, apiLogout, restoreSession } from './lib/api';
 import './index.css';
 
 // Assume these components are defined elsewhere and handle context selection and routing
 import ContextRouter from './components/ContextRouter'; // Resolves which context a user lands in
 
-type Page = 'auth' | 'profile' | 'organizations' | 'security' | 'agent';
+type Page = 'auth' | 'profile' | 'organizations' | 'security' | 'agent' | 'mail';
 
 interface User {
   id: string;
@@ -123,6 +124,16 @@ function App() {
                 Agent
               </button>
               <button
+                onClick={() => setCurrentPage('mail')}
+                className={`px-3 py-2 text-sm font-medium rounded-md ${
+                  currentPage === 'mail'
+                    ? 'bg-blue-100 text-blue-700'
+                    : 'text-gray-500 hover:text-gray-700'
+                }`}
+              >
+                Mail
+              </button>
+              <button
                 onClick={() => setCurrentPage('profile')}
                 className={`px-3 py-2 text-sm font-medium rounded-md ${
                   currentPage === 'profile'
@@ -174,6 +185,7 @@ function App() {
           {currentPage === 'agent' && (
             <AgentPage organisationName={currentContext?.name} />
           )}
+          {currentPage === 'mail' && <MailPage organisationName={currentContext?.name} />}
           {currentPage === 'profile' && <ProfilePage user={user} onUserUpdate={setUser} />}
           {currentPage === 'organizations' && <OrganizationPage user={user} />}
           {currentPage === 'security' && <SecurityPage user={user} />}
