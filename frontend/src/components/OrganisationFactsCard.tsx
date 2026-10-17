@@ -41,6 +41,45 @@ const FIELD_LABELS: Record<string, { label: string; hint: string; type: string; 
     type: 'date',
     placeholder: '',
   },
+  // THE FIVE THE DOCUMENT GENERATOR NEEDS AND THE MATCHER NEVER MENTIONS.
+  //
+  // The form used to render only the facts named by `matching_gates`, so these could not be entered
+  // anywhere in the product - and the cover letter the PLATFORM writes cannot be generated without
+  // them. Measured: `document_generate` parked with
+  //   "organisation information: cover_letter: registration_number, organisation_type, country,
+  //    authorised_role, organisation_address, organisation_name, authorised_signatory"
+  // while the only form offered three of those seven. The package therefore stayed NEEDS_DATA and the
+  // portal step could never start - and it was reported to the operator as their own missing data.
+  registration_number: {
+    label: 'Registration number',
+    hint: 'The number on the registration certificate. Printed in the cover letter.',
+    type: 'text',
+    placeholder: 'e.g. 8001234567890',
+  },
+  organisation_type: {
+    label: 'Organisation type',
+    hint: 'How the organisation is legally constituted, e.g. NGO, charity, foundation.',
+    type: 'text',
+    placeholder: 'NGO',
+  },
+  organisation_address: {
+    label: 'Registered address',
+    hint: 'The address a funder would write to. Printed in the cover letter.',
+    type: 'text',
+    placeholder: 'Street, city, country',
+  },
+  authorised_signatory: {
+    label: 'Authorised signatory',
+    hint: 'The person who signs on behalf of the organisation.',
+    type: 'text',
+    placeholder: 'Full name',
+  },
+  authorised_role: {
+    label: 'Signatory role',
+    hint: 'That person\'s title, e.g. Executive Director.',
+    type: 'text',
+    placeholder: 'Executive Director',
+  },
 };
 
 const OrganisationFactsCard: React.FC = () => {
@@ -71,10 +110,13 @@ const OrganisationFactsCard: React.FC = () => {
     load();
   }, [load]);
 
-  // The gates the server says are undecidable; their required facts are the fields to show.
+  // The gates the server says are undecidable come first - they are what the screen's sentence
+  // promises - and every fact the DOCUMENT GENERATOR needs is always offered, whether or not a
+  // matcher gate happens to name it. Without that, five of the seven facts the platform needs to
+  // write a cover letter had no field anywhere in the product.
   const gates: MatchingGate[] = data?.matching_gates ?? [];
   const wanted = Array.from(new Set(gates.flatMap((gate) => gate.needs)));
-  const keys = wanted.length ? wanted : Object.keys(FIELD_LABELS).slice(0, 1);
+  const keys = Array.from(new Set([...wanted, ...Object.keys(FIELD_LABELS)]));
 
   const save = async () => {
     const facts = keys
