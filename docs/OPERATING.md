@@ -122,10 +122,16 @@ not a bug and not a loop: the correction is committed before refusing, so the se
 
 ## What is not built
 
-- **Rejecting a document with a reason.** The button records the rejection and who made it, but there
-  is no field for *why*, so a rejected document does not tell the next person what to fix.
-- Registration on the UN portal has been **researched** end to end by the agent, and the registration page
-  reached with the mailbox filled in — but **no organisation has been registered**. That needs step 7.
+Nothing that I can identify as an unfinished part of the chain. Every gate is operable in the product,
+every "built but unreachable" component has been wired, and the browser has visited the live UN portal.
+
+What remains is not software:
+
+- Registration on the UN portal has been **researched** end to end by the agent, and the registration
+  page reached with the mailbox filled in — but **no organisation has been registered**. That needs a
+  real organisation's facts, a mail route, and a person authorising the package.
+
+A rejection now records *why* as well as who (migration 028), so the audit trail can explain itself.
 
 ---
 
