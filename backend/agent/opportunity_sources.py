@@ -142,6 +142,42 @@ def _to_int(value: Any) -> Optional[int]:
         return None
 
 
+def _bounded(value: Optional[str], width: int) -> Optional[str]:
+    """Fit a free-text value into a bounded column, or None.
+
+    SOURCES DO NOT RESPECT OUR COLUMN WIDTHS, AND THE DATABASE IS THE WRONG PLACE TO FIND OUT.
+    Measured live: grants.gov's funding-activity category is the sentence "Other (see text field
+    entitled "Explanation of Other Category of Funding Activity" for clarification)", which is 108
+    characters against a varchar(100) - so a single such record aborted the whole sweep with
+    `StringDataRightTruncation` after every other opportunity in the batch had been validated.
+
+    Truncating here is the smaller evil: the alternative is either dropping an otherwise good
+    opportunity because one descriptive field is long, or raising the column width for a value
+    nobody filters on. The full text is still retained in `raw_payload`, so nothing is lost.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:width] if text else None
+
+
+def _looks_like_email(value: Optional[str]) -> bool:
+    """Whether a source's "contact email" is actually an email.
+
+    Measured live: grants.gov returns `http://www.eda.gov/contact/` in `agencyContactEmail` for some
+    records. Storing that in an email column means every later consumer - reputation checks, mail
+    drafting, dedupe by domain - treats a web form as an address, so a value that is not an address
+    is kept as None and the description retains the link.
+    """
+    if not value:
+        return False
+    text = str(value).strip()
+    if "@" not in text or text.lower().startswith(("http://", "https://")):
+        return False
+    local, _, domain = text.rpartition("@")
+    return bool(local) and "." in domain and " " not in text
+
+
 def _as_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -320,13 +356,19 @@ class GrantsGovSource:
             amount_min=award_min,
             amount_max=award_max,
             currency="USD" if (award_min or award_max) else None,
-            sector=(categories[0] if categories else None),
+            # Every free-text field is bounded to its column width; see `_bounded` for why a long
+            # descriptive value must not be able to reject an otherwise good opportunity.
+            sector=_bounded(categories[0] if categories else None, 100),
             eligibility_criteria=eligibility,
             application_process=_strip_html(
                 synopsis.get("fundingDescLinkDesc") or synopsis.get("fundingDescLinkUrl")
             ),
-            contact_email=(synopsis.get("agencyContactEmail") or None),
-            contact_phone=(synopsis.get("agencyContactPhone") or None),
+            contact_email=(
+                _bounded(synopsis.get("agencyContactEmail"), 200)
+                if _looks_like_email(synopsis.get("agencyContactEmail"))
+                else None
+            ),
+            contact_phone=_bounded(synopsis.get("agencyContactPhone"), 50),
             # JSON columns: the raw code lists are what a matcher can compare against.
             keywords={"cfda": _as_list(hit.get("cfdaList")), "number": number,
                       "agency_code": hit.get("agencyCode"), "doc_type": hit.get("docType")},
