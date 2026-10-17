@@ -385,6 +385,35 @@ export async function startPortalRegistration(): Promise<AgentResult<Registratio
 }
 
 // ---------------------------------------------------------------------------
+// Browser evidence
+//
+// The screenshots the browser captured while working a package. They were written to the host and
+// their paths recorded, but nothing showed them: for a system whose product is partly a defensible
+// record of what it did, a file nobody can open is not evidence.
+// ---------------------------------------------------------------------------
+
+export interface EvidenceItem {
+  name: string;
+  url: string;
+}
+
+export interface EvidenceList {
+  package_id: string;
+  count: number;
+  evidence: EvidenceItem[];
+  note: string;
+}
+
+export const fetchEvidence = (packageId: string) =>
+  load<EvidenceList>(`/agent/evidence/${packageId}`);
+
+/** The absolute URL for one screenshot, for an <img src>. */
+export function evidenceUrl(item: EvidenceItem): string {
+  const base = (api.defaults.baseURL || '/api/v1').replace(/\/$/, '');
+  return `${base}${item.url}`;
+}
+
+// ---------------------------------------------------------------------------
 // Authorising a package
 //
 // Authorisation approves a FINGERPRINT over the exact bytes that will be sent, and it is what permits

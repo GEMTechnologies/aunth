@@ -1,8 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   ApplicationPackage,
+  EvidenceItem,
   PackageSummary,
   authorisePackage,
+  evidenceUrl,
+  fetchEvidence,
   fetchPackages,
 } from '../lib/agent';
 
@@ -33,6 +36,16 @@ const PackagesCard: React.FC = () => {
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [authorised, setAuthorised] = useState<string | null>(null);
+  const [evidence, setEvidence] = useState<Record<string, EvidenceItem[] | 'loading'>>({});
+
+  const showEvidence = async (packageId: string) => {
+    setEvidence((current) => ({ ...current, [packageId]: 'loading' }));
+    const result = await fetchEvidence(packageId);
+    setEvidence((current) => ({
+      ...current,
+      [packageId]: result.ok ? result.data.evidence : [],
+    }));
+  };
 
   const load = useCallback(async () => {
     setError(null);
@@ -140,6 +153,34 @@ const PackagesCard: React.FC = () => {
                   )}
                 </div>
                 <p className="text-xs text-gray-500 mt-1">{item.message}</p>
+
+                <button
+                  onClick={() => showEvidence(item.package_id)}
+                  className="mt-1 text-[11px] text-blue-700 hover:underline"
+                  data-testid={`evidence-${item.package_id}`}
+                >
+                  Show browser evidence
+                </button>
+                {Array.isArray(evidence[item.package_id]) && (
+                  <div className="flex gap-2 mt-2 flex-wrap" data-testid="evidence-strip">
+                    {evidence[item.package_id].length === 0 ? (
+                      <span className="text-[11px] text-gray-500">no screenshots captured</span>
+                    ) : (
+                      (evidence[item.package_id] as EvidenceItem[]).slice(-4).map((shot) => (
+                        <a key={shot.name} href={evidenceUrl(shot)} target="_blank" rel="noreferrer">
+                          <img
+                            src={evidenceUrl(shot)}
+                            alt={shot.name}
+                            className="h-16 w-24 object-cover border border-gray-200 rounded"
+                          />
+                        </a>
+                      ))
+                    )}
+                  </div>
+                )}
+                {evidence[item.package_id] === 'loading' && (
+                  <span className="text-[11px] text-gray-500">loading evidence…</span>
+                )}
               </div>
 
               {item.awaiting_authorisation && (
