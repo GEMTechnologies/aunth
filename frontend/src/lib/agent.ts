@@ -288,6 +288,57 @@ export const fetchMailMessages = (params?: { mailbox_id?: string; direction?: st
   load<MessagePage>('/agent/mail/messages', params);
 
 // ---------------------------------------------------------------------------
+// Documents: the vault, and the approval that unblocks assembly
+//
+// `DocumentVault` could generate, approve and reject; NO route exposed any of it, so a generated cover
+// letter was invisible and unapprovable. Assembly then refused to freeze a package built on drafts -
+// correctly - and the chain stopped one step from the portal with nothing in the product to unblock it.
+// ---------------------------------------------------------------------------
+
+export interface VaultDocument {
+  id: string;
+  title: string;
+  doc_type: string;
+  approval_status: string;
+  version: number;
+  is_current: boolean;
+  scope_ref?: string | null;
+  created_at?: string | null;
+  approved_at?: string | null;
+  size_bytes?: number | null;
+}
+
+export interface VaultDocumentList {
+  documents: VaultDocument[];
+  total: number;
+  pending_approval: number;
+  note: string;
+}
+
+export const fetchDocuments = () => load<VaultDocumentList>('/agent/documents');
+
+/** Approve one document in the name of the person clicking. A WRITE, so it reports its own failure. */
+export async function approveDocument(id: string): Promise<AgentResult<{ approval_status: string }>> {
+  try {
+    const response = await api.post(`/agent/documents/${id}/approve`);
+    return { ok: true, data: response.data };
+  } catch (error: any) {
+    const detail = error?.response?.data?.detail;
+    return { ok: false, error: typeof detail === 'string' ? detail : 'this document could not be approved' };
+  }
+}
+
+export async function rejectDocument(id: string): Promise<AgentResult<{ approval_status: string }>> {
+  try {
+    const response = await api.post(`/agent/documents/${id}/reject`);
+    return { ok: true, data: response.data };
+  } catch (error: any) {
+    const detail = error?.response?.data?.detail;
+    return { ok: false, error: typeof detail === 'string' ? detail : 'this document could not be rejected' };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Connecting the organisation's OWN mailbox
 //
 // The product promised organisations could connect their existing Gmail rather than take a

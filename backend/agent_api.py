@@ -1422,6 +1422,165 @@ class MailboxSummary(BaseModel):
     last_message_at: Optional[str] = None
 
 
+class DocumentSummary(BaseModel):
+    id: str
+    title: str
+    doc_type: str
+    approval_status: str
+    version: int
+    is_current: bool
+    scope_ref: Optional[str] = None
+    created_at: Optional[str] = None
+    approved_at: Optional[str] = None
+    size_bytes: Optional[int] = None
+
+
+@router.get("/documents", summary="Documents in the organisation's vault")
+def list_documents(
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Every document and whether the organisation has approved it.
+
+    WHY THIS EXISTS. `DocumentVault` could generate, approve, reject and check approval, and NO route
+    exposed any of it. The generator wrote cover letters and organisation profiles that were then
+    invisible: assembly correctly refused to freeze a package built on drafts, and the organisation had
+    no way to say "yes, that is us" - so the chain stopped one step from the portal with nothing in the
+    product to unblock it.
+    """
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    rows = (
+        db.query(models.Document)
+        .filter(models.Document.org_id == org_id)
+        .order_by(models.Document.created_at.desc())
+        .all()
+    )
+
+    documents = [
+        DocumentSummary(
+            id=str(row.id),
+            title=row.title or "",
+            doc_type=row.doc_type or "",
+            approval_status=row.approval_status or "",
+            version=int(row.version or 1),
+            is_current=bool(row.is_current),
+            scope_ref=row.scope_ref,
+            created_at=row.created_at.isoformat() if row.created_at else None,
+            approved_at=row.approved_at.isoformat() if row.approved_at else None,
+            size_bytes=row.size_bytes,
+        )
+        for row in rows
+    ]
+
+    pending = [d for d in documents if d.is_current and d.approval_status == models.Document.PENDING]
+    return {
+        "documents": [d.model_dump() for d in documents],
+        "total": len(documents),
+        "pending_approval": len(pending),
+        "note": (
+            "A document is a draft until a named person approves it, and assembly will not freeze a "
+            "package built on drafts."
+            if pending
+            else "No documents are waiting for approval."
+        ),
+    }
+
+
+@router.post("/documents/{document_id}/approve", summary="Approve THIS document")
+def approve_document(
+    document_id: str,
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Approve one document, in the name of the person who clicked.
+
+    The vault refuses a superseded version or a document with no checksum: approving bytes that are no
+    longer the current file, or bytes nothing hashed, is the mismatch `approved_by` exists to prevent.
+    """
+    from agent.organisation_memory import DocumentVault, OrganisationMemoryError
+
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    allowed, reason = has_permission(
+        db, org_id=org_id, user_id=user.id, permission=PROFILE_WRITE_PERMISSION
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"you may not approve this organisation's documents: {reason}",
+        )
+
+    document = (
+        db.query(models.Document)
+        .filter(models.Document.id == document_id, models.Document.org_id == org_id)
+        .first()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="no such document in this organisation")
+
+    try:
+        DocumentVault(db, org_id).approve(document, approved_by=str(user.id))
+    except OrganisationMemoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+
+    return {
+        "id": str(document.id),
+        "approval_status": document.approval_status,
+        "approved_by": document.approved_by,
+        "approved_at": document.approved_at.isoformat() if document.approved_at else None,
+        "note": "Approved. Assembly can now freeze a package that includes it.",
+    }
+
+
+@router.post("/documents/{document_id}/reject", summary="Reject THIS document")
+def reject_document(
+    document_id: str,
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Reject one document. It stays in the vault and is attached to nothing."""
+    from agent.organisation_memory import DocumentVault, OrganisationMemoryError
+
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    allowed, reason = has_permission(
+        db, org_id=org_id, user_id=user.id, permission=PROFILE_WRITE_PERMISSION
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"you may not change this organisation's documents: {reason}",
+        )
+
+    document = (
+        db.query(models.Document)
+        .filter(models.Document.id == document_id, models.Document.org_id == org_id)
+        .first()
+    )
+    if document is None:
+        raise HTTPException(status_code=404, detail="no such document in this organisation")
+
+    try:
+        DocumentVault(db, org_id).reject(document, rejected_by=str(user.id))
+    except OrganisationMemoryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    db.commit()
+
+    return {
+        "id": str(document.id),
+        "approval_status": document.approval_status,
+        "note": "Rejected. It stays in the vault and will not be attached.",
+    }
+
+
 class ConnectMailboxRequest(BaseModel):
     """Connect an external mailbox the organisation already owns.
 

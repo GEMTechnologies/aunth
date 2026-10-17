@@ -1494,6 +1494,31 @@ def _handle_donor_research(db: Session, context: dict[str, Any]) -> dict[str, An
 
     eligibility = EligibilityEngine(OrganisationMemory(db, agent.org_id)).qualify(opportunity)
     service = DonorResearchService(db, agent)
+
+    # LIVE SOURCES, AND ONLY WHEN THEY ANSWER.
+    #
+    # DeepSeek's Search API means the funder's own published requirements can be read for about
+    # $0.00075, instead of being inferred from whatever the listing text happened to contain. Measured
+    # live: the top hit for the UN Partner Portal registration question was the portal's own "Partner
+    # Registration" article, which states the documents required.
+    #
+    # It CANNOT fail this workflow. An opportunity is still real and still due when the search API is
+    # down, and `search_or_none` returns the reason so the record can say WHY there are no citations -
+    # a different fact from "the web had nothing".
+    research_sources: list[dict[str, Any]] = []
+    research_error: Optional[str] = None
+    try:
+        from agent.web_research import search_or_none
+
+        query = f"{opportunity.source_name or ''} {opportunity.title or ''} application requirements"
+        hits, research_error = search_or_none(query.strip()[:128], count=5)
+        research_sources = [
+            {"title": hit.title, "url": hit.url, "score": hit.score, "authority": hit.authority}
+            for hit in hits
+        ]
+    except Exception as exc:  # noqa: BLE001 - research must never fail the application
+        research_error = f"{type(exc).__name__}: {exc}"[:200]
+
     result = service.build(
         opportunity,
         eligibility={
@@ -1529,6 +1554,10 @@ def _handle_donor_research(db: Session, context: dict[str, Any]) -> dict[str, An
             "research_version": row.version,
             "unknown_fields": result.unknown_fields,
             "required_documents": sorted(result.required_documents),
+            # Provenance: every source carries a URL a person can open, and a failure says so rather
+            # than leaving the reader to assume the web had nothing.
+            "sources": research_sources,
+            "sources_error": research_error,
         },
         "events": [{
             "event_type": "research.completed",
