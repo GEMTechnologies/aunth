@@ -119,10 +119,36 @@ not a bug and not a loop: the correction is committed before refusing, so the se
 
 ## What is not built
 
-- No UI for **authorising a package** (the endpoint exists and is permission-checked).
-- No UI for **rejecting with a reason** on documents beyond a click.
+- **Rejecting a document with a reason.** The button records the rejection and who made it, but there
+  is no field for *why*, so a rejected document does not tell the next person what to fix.
+- **Viewing browser evidence in the product.** Screenshots are captured to
+  `/var/lib/granada/browser-evidence/` and their paths are recorded in the activity, but nothing serves
+  them to a person: the evidence store is on the host and not mounted into the API container. Today you
+  read it over SSH.
 - Registration on the UN portal has been **researched** end to end by the agent, and the registration page
   reached with the mailbox filled in — but **no organisation has been registered**. That needs step 7.
+
+---
+
+## The controls, all in the product
+
+Everything a person must do lives on the **Organisation** page, in four cards, in the order they are
+needed:
+
+| Card | What it does |
+|---|---|
+| **Ready to register?** | the four steps below, each DONE / OUTSTANDING / UNKNOWN — a failed check reads UNKNOWN, never DONE |
+| **Profile facts** | the ten values the document templates interpolate, named by the server from the templates themselves |
+| **Documents** | approve what the platform wrote; approving the last one queues assembly |
+| **Submission packages** | authorise the fingerprint that may be sent — this is what permits the browser to act |
+| **Portal registration** | the button that queues the browser work. It never sends anything by itself |
+
+`UNKNOWN` is deliberate: "we could not check" and "it is done" are different answers, and conflating
+them is how a broken endpoint reads as a finished setup.
+
+An earlier version of this document listed "no UI for authorising a package" as missing. That was true
+when the submission service was written and false by the time this file was reviewed — the control
+exists. Recorded here because a handover that misstates what exists is worse than no handover.
 
 ---
 
