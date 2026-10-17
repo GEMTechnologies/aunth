@@ -1542,7 +1542,7 @@ def get_evidence(
 
 
 @router.post("/documents/upload", status_code=status.HTTP_201_CREATED, summary="Upload a document")
-async def upload_document(
+def upload_document(
     file: UploadFile = File(...),
     doc_type: str = "registration_certificate",
     title: Optional[str] = None,
@@ -1577,7 +1577,11 @@ async def upload_document(
             detail=f"you may not add documents to this organisation: {denial}",
         )
 
-    data = await file.read()
+    # SYNC READ, NOT await. This handler is def on purpose: it does a database write, a file write
+    # and a MODEL CALL, and an sync def handler runs on the event loop - so one upload would block
+    # every other request on the instance. The project measured that at 6.7 seconds for /readyz under
+    # concurrency 25, and test_event_loop_discipline caught this route doing it.
+    data = file.file.read()
     try:
         stored = store_upload(
             db=db,
