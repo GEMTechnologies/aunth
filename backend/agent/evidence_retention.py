@@ -21,7 +21,13 @@ is worse than no evidence at all - it looks like evidence. So retention is built
 
 WHAT IS DELIBERATELY NOT AUTOMATIC. Nothing in the fleet loop calls `apply_prune`. Deleting a
 customer's audit trail is not a thing to do behind their back on a timer; it is an operator action
-with a plan they can read first. The scheduling that DOES happen is the dry run.
+with a plan they can read first.
+
+NOR CAN THE FLEET RUN THE DRY RUN. The evidence root lives on the host (the browser worker writes it
+outside Docker) and is not mounted into any container, so a sweep inside `fleet_runner` would scan an
+empty directory and report "0 runs, nothing to do" - the exact healthy-looking blindness this
+codebase keeps recording. The command is therefore run where the files are: on the host, from
+`tools/prune_evidence.py`, by cron or by hand. `deploy/evidence-retention.md` documents that.
 """
 
 from __future__ import annotations
