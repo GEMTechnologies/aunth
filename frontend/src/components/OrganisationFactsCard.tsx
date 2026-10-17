@@ -80,6 +80,24 @@ const FIELD_LABELS: Record<string, { label: string; hint: string; type: string; 
     type: 'text',
     placeholder: 'Executive Director',
   },
+  // THE TWO THE ORGANISATION PROFILE STILL COULD NOT BE GENERATED WITHOUT.
+  //
+  // Read from the template itself (`agent/documents.py`, DEFAULT_TEMPLATES): it interpolates
+  // `contact_email` and `focus_area`, and a blank one raises MissingFact, which parks the whole
+  // generation step. Without these fields the profile document can never be produced, so the package
+  // can never assemble, so the portal step can never start.
+  contact_email: {
+    label: 'Contact email',
+    hint: 'The address a funder would write to. Printed in the organisation profile.',
+    type: 'email',
+    placeholder: 'info@example.org',
+  },
+  focus_area: {
+    label: 'Focus area',
+    hint: 'What the organisation works on, e.g. "girls education in northern Uganda".',
+    type: 'text',
+    placeholder: 'girls education',
+  },
 };
 
 const OrganisationFactsCard: React.FC = () => {
