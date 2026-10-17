@@ -1399,6 +1399,10 @@ def connect_mailbox(
                 "port": int(payload.imap_port),
                 "username": payload.imap_user.strip(),
                 "password": payload.imap_password,
+                # THE NAME MATTERS. This was written as "ssl" while the transport builder read
+                # "use_ssl", so a mailbox connected with SSL off was built with SSL on and could not
+                # reach its server. Both names are now written and both are read.
+                "use_ssl": bool(payload.use_ssl),
                 "ssl": bool(payload.use_ssl),
             },
             kind=models.CredentialSecret.KIND_IMAP_PASSWORD,

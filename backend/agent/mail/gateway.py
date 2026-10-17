@@ -541,7 +541,12 @@ class MailGateway:
                     port=int(payload.get("port") or 993),
                     username=payload.get("username", account.address),
                     password=payload.get("password", ""),
-                    use_ssl=bool(payload.get("use_ssl", True)),
+                    # `use_ssl` is the name the connect route writes; `ssl` is accepted too because
+                    # the first version of that route wrote `ssl` while this line read `use_ssl`,
+                    # so a mailbox connected with SSL off was silently connected with SSL on and
+                    # failed to reach the server. Defaults to True, which is right for every real
+                    # provider.
+                    use_ssl=bool(payload.get("use_ssl", payload.get("ssl", True))),
                     mailbox=payload.get("mailbox") or "INBOX",
                 )
             )
