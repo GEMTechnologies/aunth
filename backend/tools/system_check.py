@@ -315,6 +315,45 @@ def check_database(report: Report, db) -> None:
 
 
 
+def check_model(report: Report) -> None:
+    """Are the model routes configured, and is a provider behind them?
+
+    NO API CALL, ON PURPOSE. A status check that spends money every time it runs is a check an
+    operator stops running, and the only question it can answer cheaply is "is this configured".
+    Reachability was verified separately and by hand.
+
+    Worth checking because a `null` provider is the default: a deployment with no key configured
+    does not fail to start, it quietly answers every model request with a refusal - so the agent
+    would appear to run and simply never think.
+    """
+    try:
+        from config import settings
+
+        from agent.model_gateway import build_routes_from_settings
+
+        routes = build_routes_from_settings(settings)
+    except Exception as exc:  # noqa: BLE001
+        report.add("model routes configured", SKIP, f"{type(exc).__name__}: {exc}"[:160])
+        return
+
+    if not routes:
+        report.add(
+            "model routes configured", FAIL, "no tiers configured",
+            "set MODEL_PROVIDER and its key, or every model call is refused",
+        )
+        return
+
+    tiers = ", ".join(sorted(routes))
+    provider = (getattr(settings, "model_provider", "") or "").strip()
+    if provider.lower() in ("", "null"):
+        report.add(
+            "model routes configured", FAIL, f"tiers [{tiers}] but provider is {provider or 'unset'}",
+            "the agent would run and never think",
+        )
+    else:
+        report.add("model routes configured", PASS, f"{provider} for tiers [{tiers}]")
+
+
 # ---------------------------------------------------------------------------
 # HTTP checks
 # ---------------------------------------------------------------------------
@@ -401,6 +440,9 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if db is not None:
             db.close()
+
+    # Configuration, not connectivity: this check never spends a token.
+    check_model(report)
 
     if not args.skip_http:
         check_http(report, args.api_base, host=args.host_header)

@@ -92,6 +92,9 @@ def test_exit_code_is_zero_when_nothing_failed(monkeypatch):
     monkeypatch.setattr("tools.system_check.check_database", fake_check)
     monkeypatch.setattr("tools.system_check.check_http", lambda *a, **k: None)
     monkeypatch.setattr("tools.system_check.check_browser_bridge", lambda *a, **k: None)
+    # The model check reads deployment configuration; a test machine has none, and a real
+    # FAIL there would be measuring the environment rather than the code under test.
+    monkeypatch.setattr("tools.system_check.check_model", lambda *a, **k: None)
     assert main(["--skip-http"]) == 0
 
 
@@ -102,6 +105,9 @@ def test_exit_code_is_one_when_something_failed(monkeypatch):
     monkeypatch.setattr("tools.system_check.check_database", fake_check)
     monkeypatch.setattr("tools.system_check.check_http", lambda *a, **k: None)
     monkeypatch.setattr("tools.system_check.check_browser_bridge", lambda *a, **k: None)
+    # The model check reads deployment configuration; a test machine has none, and a real
+    # FAIL there would be measuring the environment rather than the code under test.
+    monkeypatch.setattr("tools.system_check.check_model", lambda *a, **k: None)
     assert main(["--skip-http"]) == 1
 
 
@@ -116,6 +122,7 @@ def test_an_unreachable_database_is_a_failure_not_a_pass(monkeypatch):
     monkeypatch.setattr("database.FleetSessionLocal", Boom)
     monkeypatch.setattr(module, "check_http", lambda *a, **k: None)
     monkeypatch.setattr(module, "check_browser_bridge", lambda *a, **k: None)
+    monkeypatch.setattr(module, "check_model", lambda *a, **k: None)
 
     report = Report()
     original = module.check_database
@@ -131,3 +138,53 @@ def test_an_unreachable_database_is_a_failure_not_a_pass(monkeypatch):
         report.add("database reachable", FAIL, "RuntimeError: database unavailable")
 
     assert report.as_dict()["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# The model check: configured, or the agent runs and never thinks
+# ---------------------------------------------------------------------------
+def test_a_null_provider_is_a_failure(monkeypatch):
+    """model_provider defaults to "null", and a null provider does not fail to start - it refuses
+    every request. An agent in that state appears to run and simply never thinks, which is worse
+    than one that will not boot."""
+    import config
+
+    from tools import system_check as module
+
+    monkeypatch.setattr(config.settings, "model_provider", "null", raising=False)
+    monkeypatch.setattr(
+        "agent.model_gateway.build_routes_from_settings",
+        lambda settings: {"CLASSIFICATION": []},
+    )
+
+    report = Report()
+    module.check_model(report)
+    assert report.checks[0].status == FAIL
+    assert "never think" in report.checks[0].remedy
+
+
+def test_no_routes_at_all_is_a_failure(monkeypatch):
+    from tools import system_check as module
+
+    monkeypatch.setattr("agent.model_gateway.build_routes_from_settings", lambda settings: {})
+    report = Report()
+    module.check_model(report)
+    assert report.checks[0].status == FAIL
+
+
+def test_a_configured_provider_passes(monkeypatch):
+    import config
+
+    from tools import system_check as module
+
+    monkeypatch.setattr(config.settings, "model_provider", "openai_compatible", raising=False)
+    monkeypatch.setattr(
+        "agent.model_gateway.build_routes_from_settings",
+        lambda settings: {"CLASSIFICATION": [], "SYNTHESIS": []},
+    )
+
+    report = Report()
+    module.check_model(report)
+    assert report.checks[0].status == PASS
+    assert "openai_compatible" in report.checks[0].detail
+    assert "SYNTHESIS" in report.checks[0].detail
