@@ -66,9 +66,36 @@ DEFAULT_MAIL_SYNC_INTERVAL_SECONDS = 300
 #: A mailbox is due for reconciliation when it has not synced within this window.
 DEFAULT_MAIL_SYNC_STALE_SECONDS = 900
 
+#: How often funding sources are swept for new opportunities. Much slower than the dispatch sweep on
+#: purpose: a funding call is published once and stays posted for weeks, so re-reading a federal feed
+#: every fifteen seconds would hammer somebody else's API to learn nothing. Hourly is polite and
+#: still fast enough that a new call is in the catalogue long before anyone acts on it.
+DEFAULT_DISCOVERY_INTERVAL_SECONDS = 3600.0
+
 #: Cap on a single sleep, so a stop signal is honoured promptly even if the
 #: configured interval is long.
 MAX_SLEEP_SLICE_SECONDS = 1.0
+
+
+def _discovery_interval_from_env() -> float:
+    """The discovery interval, overridable per deployment.
+
+    A CONSTANT WOULD MAKE THIS UNPROVABLE IN PRODUCTION. Hourly is the right cadence for a funding
+    feed, but proving the sweep works would then mean waiting an hour, and an operator who needs to
+    pause it during an incident would have to redeploy. The variable accepts:
+      * unset / empty  -> the hourly default
+      * a positive number of seconds -> that interval
+      * 0 (or anything non-numeric) -> disabled, because a value nobody can parse must fail SAFE
+        (no outbound calls) rather than silently fall back to hammering somebody else's API.
+    """
+    raw = (os.environ.get("FUNDING_DISCOVERY_INTERVAL_SECONDS") or "").strip()
+    if not raw:
+        return DEFAULT_DISCOVERY_INTERVAL_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning("fleet.discovery_interval_unparseable", extra={"value": raw[:40]})
+        return 0.0
 
 
 @dataclass
@@ -96,6 +123,14 @@ class FleetHealth:
     mail_sync_sweeps: int = 0
     mail_sync_queued: int = 0
 
+    #: Funding discovery is part of fleet health for the same reason, and more so: a source that has
+    #: been returning nothing for a week looks exactly like a source with nothing new, unless the
+    #: sweep is counted and its last outcome is visible.
+    discovery_sweeps: int = 0
+    discovery_found: int = 0
+    discovery_stored: int = 0
+    discovery_last_error: Optional[str] = None
+
     @property
     def healthy(self) -> bool:
         """A loop that has never completed a sweep is not healthy, however new."""
@@ -117,12 +152,15 @@ class FleetHealth:
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "mail_sync_sweeps": self.mail_sync_sweeps,
             "mail_sync_queued": self.mail_sync_queued,
+            "discovery_sweeps": self.discovery_sweeps,
+            "discovery_found": self.discovery_found,
+            "discovery_stored": self.discovery_stored,
+            "discovery_last_error": self.discovery_last_error,
         }
 
 
 class FleetRunner:
     """The fleet-level dispatcher loop.
-
     Owns a session **per sweep**, not one for the lifetime of the process. A
     long-lived session accumulates an identity map and holds a transaction open
     across sleeps, which on PostgreSQL means an idle-in-transaction connection and
@@ -138,6 +176,9 @@ class FleetRunner:
         per_agent_limit: int = 25,
         on_sweep: Optional[Callable[[DispatchResult], None]] = None,
         mail_sync_interval_seconds: Optional[float] = None,
+        discovery_interval_seconds: Optional[float] = None,
+        discovery_keywords: Optional[Iterable[str]] = None,
+        discovery_limit: int = 25,
     ) -> None:
         self.session_factory = session_factory
         self.interval_seconds = max(1.0, float(interval_seconds))
@@ -165,6 +206,21 @@ class FleetRunner:
         self._last_mail_sync_at: Optional[datetime] = None
         self.health.mail_sync_sweeps = 0
         self.health.mail_sync_queued = 0
+
+        #: Funding discovery runs on its own, much slower clock inside the SAME process, exactly like
+        #: mail reconciliation. A zero interval DISABLES it, which is how a deployment that must not
+        #: make outbound requests (an air-gapped or test environment) turns it off without a code
+        #: branch - and the API tests rely on the same switch rather than patching the loop.
+        self.discovery_interval_seconds = max(
+            0.0, float(discovery_interval_seconds if discovery_interval_seconds is not None
+                       else _discovery_interval_from_env())
+        )
+        self.discovery_keywords = tuple(discovery_keywords or ())
+        self.discovery_limit = int(discovery_limit)
+        self._last_discovery_at: Optional[datetime] = None
+        self.health.discovery_sweeps = 0
+        self.health.discovery_found = 0
+        self.health.discovery_stored = 0
 
     def sync_due_mail_accounts(self, *, stale_seconds: int = DEFAULT_MAIL_SYNC_STALE_SECONDS) -> int:
         """Create ``mail_sync`` work for mailboxes that need reconciling.
@@ -234,6 +290,77 @@ class FleetRunner:
             return 0
         finally:
             db.close()
+
+    def refresh_funding_catalogue(self) -> int:
+        """Sweep the funding sources and ingest what they published. Returns rows stored.
+
+        WHY THIS LIVES IN THE FLEET LOOP AND NOT IN A SEPARATE CRON. The dispatcher already owns the
+        slow clocks in this process - mail reconciliation runs here for exactly this reason - and a
+        separate scheduler would mean a second place that has to be deployed, monitored and restarted
+        with the rest. Discovery is a periodic read of somebody else's API, which is what the loop is
+        already good at, and the ingestion it feeds is channel-agnostic: a call found by a bot and a
+        call delivered by a producer land in the same catalogue through the same adapter.
+
+        FULLY ISOLATED. Its own session, its own transaction, and every failure is caught: a funding
+        source that is down must not stop the dispatch sweep, which is the work a customer is
+        actually waiting on. The failure is recorded on health rather than raised, so an operator
+        sees `discovery_last_error` instead of a dead worker.
+
+        REFUSES TO CARRY TENANT CONTEXT. The funding catalogue is shared and deliberately not
+        tenant-owned (ADR-0009), so this sweep must not run under a bound organisation - doing so
+        would create rows nobody can read and imply the catalogue belongs to one customer.
+        """
+        if self.discovery_interval_seconds <= 0:
+            return 0
+
+        db: Optional[Session] = None
+        try:
+            from agent.opportunity_discovery import DEFAULT_KEYWORDS, run_and_commit
+
+            db = self.session_factory()
+            summary = run_and_commit(
+                db,
+                keywords=self.discovery_keywords or DEFAULT_KEYWORDS,
+                limit=self.discovery_limit,
+            )
+            self.health.discovery_sweeps += 1
+            self.health.discovery_found += summary.found
+            self.health.discovery_stored += summary.stored
+            self.health.discovery_last_error = (
+                "; ".join(summary.errors[:3]) if summary.errors else None
+            )
+            self._last_discovery_at = datetime.now(timezone.utc)
+            if summary.errors:
+                logger.warning(
+                    "fleet.discovery_source_errors",
+                    extra={"errors": summary.errors[:3], "found": summary.found},
+                )
+            return summary.stored
+        except Exception as exc:  # noqa: BLE001 - discovery must never stop the fleet
+            if db is not None:
+                try:
+                    db.rollback()
+                except Exception:  # pragma: no cover
+                    pass
+            self.health.discovery_last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "fleet.discovery_failed", extra={"error": self.health.discovery_last_error}
+            )
+            return 0
+        finally:
+            if db is not None:
+                db.close()
+
+    def _discovery_due(self) -> bool:
+        if self.discovery_interval_seconds <= 0:
+            return False
+        if self._last_discovery_at is None:
+            # NOT on the first sweep. A worker restarting in a loop would otherwise hit the funding
+            # API on every boot, which is how a polite integration becomes a blocked one.
+            self._last_discovery_at = datetime.now(timezone.utc)
+            return False
+        elapsed = (datetime.now(timezone.utc) - self._last_discovery_at).total_seconds()
+        return elapsed >= self.discovery_interval_seconds
 
     def _mail_sync_due(self) -> bool:
         if self._last_mail_sync_at is None:
@@ -341,6 +468,10 @@ class FleetRunner:
                     pass  # already counted and logged; the loop continues
                 if self._mail_sync_due():
                     self.sync_due_mail_accounts()
+                # AFTER the mail sync: funding discovery is the least urgent thing in the loop, and
+                # it must never delay the reconciliation of a mailbox somebody is waiting on.
+                if self._discovery_due():
+                    self.refresh_funding_catalogue()
 
                 # AFTER the work, and after the mail sync: the heartbeat says "a full turn
                 # completed", which is exactly what liveness means for a loop. Touching it before
