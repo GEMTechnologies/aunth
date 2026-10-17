@@ -1446,6 +1446,99 @@ class DocumentSummary(BaseModel):
     size_bytes: Optional[int] = None
 
 
+#: Where the browser bridge writes screenshots. The bridge runs on the HOST, so this path is mounted
+#: read-only into the API container; without that mount the audit trail was write-only.
+EVIDENCE_ROOT = "/var/lib/granada/browser-evidence"
+
+
+def _evidence_dir(org_id: str, package_id: str):
+    """The evidence directory for one package, or None if it is not a directory under the root.
+
+    RESOLVED AND RE-CHECKED rather than joined. `package_id` arrives from the URL, and a path built by
+    concatenation is how `../` becomes a file read. Checking the resolved path is still inside the
+    organisation's own directory is what makes `..%2f..%2f` a 404 instead of a disclosure.
+    """
+    from pathlib import Path
+
+    root = Path(EVIDENCE_ROOT).resolve()
+    try:
+        candidate = (root / org_id / package_id).resolve()
+    except Exception:  # noqa: BLE001 - an unresolvable path is simply not found
+        return None
+    if candidate != root and root not in candidate.parents:
+        return None
+    # Scoped to THIS organisation's directory, so one tenant cannot read another's screenshots.
+    if candidate.parent != (root / org_id).resolve():
+        return None
+    return candidate if candidate.is_dir() else None
+
+
+@router.get("/evidence/{package_id}", summary="Screenshots captured for a package")
+def list_evidence(
+    package_id: str,
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """The browser's own screenshots for one package, newest last.
+
+    WHY THIS EXISTS. Evidence was captured and never shown: the worker wrote PNGs to the host, the
+    activity recorded their paths, and nothing served them. For a system whose product is partly a
+    defensible record of what it did, that is not evidence - it is a file that happens to exist.
+
+    It is also what makes a refusal reviewable: "the planner stopped here" is far more convincing with
+    the page it was looking at.
+    """
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    directory = _evidence_dir(org_id, package_id)
+    if directory is None:
+        return {"package_id": package_id, "count": 0, "evidence": [], "note": "no evidence captured"}
+
+    files = sorted(p.name for p in directory.glob("*.png") if p.is_file())
+    return {
+        "package_id": package_id,
+        "count": len(files),
+        "evidence": [
+            {"name": name, "url": f"/agent/evidence/{package_id}/{name}"} for name in files
+        ],
+        "note": "captured by the browser worker; read-only",
+    }
+
+
+@router.get("/evidence/{package_id}/{name}", summary="One evidence screenshot")
+def get_evidence(
+    package_id: str,
+    name: str,
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+):
+    """Serve one screenshot. PNG only, from inside this organisation's own evidence directory."""
+    from pathlib import Path
+
+    from fastapi.responses import FileResponse
+
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    directory = _evidence_dir(org_id, package_id)
+    if directory is None:
+        raise HTTPException(status_code=404, detail="no evidence for this package")
+
+    # A bare filename, suffixed .png - no separators, no traversal, nothing the filesystem can
+    # reinterpret.
+    if "/" in name or "\\" in name or not name.lower().endswith(".png"):
+        raise HTTPException(status_code=404, detail="no such evidence file")
+
+    path = (directory / name).resolve()
+    if path.parent != directory or not path.is_file():
+        raise HTTPException(status_code=404, detail="no such evidence file")
+
+    return FileResponse(str(path), media_type="image/png")
+
+
 @router.get("/documents", summary="Documents in the organisation's vault")
 def list_documents(
     user: Any = Depends(get_current_user),
