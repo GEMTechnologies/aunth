@@ -26,7 +26,9 @@ interface Context {
 
 interface ContextRouterProps {
   user: User;
-  onContextResolved: (context: Context) => void;
+  //: `null` means "signed in, but not part of an organisation yet" - a legitimate state that the
+  //: shell renders as onboarding, not an error.
+  onContextResolved: (context: Context | null) => void;
 }
 
 const ContextRouter: React.FC<ContextRouterProps> = ({ user, onContextResolved }) => {
@@ -127,6 +129,34 @@ const ContextRouter: React.FC<ContextRouterProps> = ({ user, onContextResolved }
         onContextSelect={handleContextSelect}
         title={title}
       />
+    );
+  }
+
+  // ONBOARDING, NOT A DEAD END. A user who has just signed up belongs to no organisation, and the
+  // backend used to answer that with a 500. It now answers `action: "onboarding"`, and this branch
+  // turns that into a way forward instead of a spinner that never finishes: the shell opens on the
+  // organisations page, where creating one is already implemented.
+  if (resolution?.action === 'onboarding') {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center px-4">
+        <div className="max-w-md w-full bg-white rounded-xl shadow-sm border border-gray-200 p-8 text-center">
+          <div className="w-12 h-12 rounded-lg bg-orange-500 mx-auto mb-4" />
+          <h2 className="text-xl font-semibold text-gray-900 mb-2">
+            Welcome, {user.display_name}
+          </h2>
+          <p className="text-gray-600 text-sm mb-6">
+            You are signed in, but you are not part of an organisation yet. Granada finds and
+            tracks funding for an organisation, so the next step is to create yours.
+          </p>
+          <button
+            onClick={() => onContextResolved(null)}
+            className="w-full px-4 py-2.5 bg-orange-500 text-white rounded-lg font-medium hover:bg-orange-600"
+            data-testid="start-onboarding"
+          >
+            Set up your organisation
+          </button>
+        </div>
+      </div>
     );
   }
 

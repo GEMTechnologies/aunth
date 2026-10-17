@@ -78,6 +78,10 @@ function App() {
   const handleContextResolved = (context: any) => {
     setCurrentContext(context);
     setShowContextRouter(false);
+    // ONBOARDING LANDS ON THE ORGANISATIONS PAGE. The user is signed in but belongs to no
+    // organisation, so the product pages have nothing to show; creating the organisation is the one
+    // action available, and it is already implemented there.
+    setCurrentPage(context ? 'profile' : 'organizations');
   };
 
   if (loading) {
