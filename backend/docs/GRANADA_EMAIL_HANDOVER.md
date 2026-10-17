@@ -162,3 +162,35 @@ bounce/delivery events, queues, retries, isolation tests, PARJ unaffected.
 - Do not bypass approval or tenant isolation to make a test pass.
 - Do not commit secrets; do not print them.
 - Do not re-investigate what section 2 and 3 already establish.
+
+## 8. Inbound mail is labelled with the mailbox it arrived at
+
+`mail_messages.mail_identity_id` (migration `024_mail_message_identity`, FK to `mail_identities.id`)
+records **which Granada mailbox** a delivered message arrived at. `mail_account_id` cannot express
+this: it names the EXTERNAL account that carried the message - the Cloudflare delivery, a connected
+Gmail - and one such account carries mail for every mailbox Granada manages. Without the column, an
+NGO holding one mailbox per portal account reads one merged inbox.
+
+Written on every delivery by both inbound paths: `mail_ingest_api.ingest` (from the `mail_routing`
+lookup it already performs) and `GranadaMail._store_message` (by matching the recipient address).
+
+### Backfilling the history, and why it is deliberately partial
+
+The migration's UPDATE runs as `granada_user`, which owns `mail_messages` under FORCE ROW LEVEL
+SECURITY, so it can match **zero rows and still report success** - the same trap `023` documented.
+Nothing depends on it: the column is new, and the live path fills it on every delivery from the
+moment the revision applies. To label the history, run as a superuser:
+
+```sql
+UPDATE mail_messages AS m
+SET mail_identity_id = r.identity_id
+FROM mail_routing AS r
+WHERE m.mail_identity_id IS NULL
+  AND m.recipients IS NOT NULL
+  AND jsonb_typeof(m.recipients::jsonb) = 'array'
+  AND lower(coalesce(m.recipients::jsonb ->> 0, '')) = r.address;
+```
+
+Rows whose address is not routable stay NULL rather than being attributed to a guess. A mailbox
+renamed since the message arrived cannot be identified correctly, and a wrong mailbox is worse than
+a missing one: it files one organisation's mail under another's history.

@@ -851,6 +851,38 @@ class GranadaMail:
         self.db.flush()
         return thread
 
+    def _identity_for(self, recipients) -> Optional[str]:
+        """The Granada mailbox a delivered message was addressed to, or None.
+
+        Resolved by ADDRESS, because this is a delivered message and the recipient is whatever the
+        sender actually used - including a managed mailbox that carries no token purpose at all. The
+        lookup is tenant-scoped, so one organisation cannot resolve another's mailbox even if it
+        knows the address.
+
+        None rather than an exception: a message stored without a mailbox is still in the
+        organisation's records, and losing the mail is worse than an unlabelled row. It is also
+        honest - a provider that does not report recipients leaves us genuinely unable to say.
+        """
+        for address in recipients or ():
+            cleaned = (address or "").strip().lower()
+            if "@" not in cleaned:
+                continue
+            # COMPARED IN PYTHON, NOT WITH `ILIKE`. `ILIKE` treats `_` and `%` in the pattern as
+            # wildcards, and `_` is a legal character in the local part of an address - so
+            # `john_doe@granadac.com` would also match `johnXdoe@granadac.com` and file one mailbox's
+            # mail under another's. Within one organisation that is exactly the merge this column
+            # exists to prevent. An organisation holds one mailbox per portal account, so the list is
+            # short and an exact comparison is both correct and cheap.
+            rows = self.db.execute(
+                select(models.MailIdentity).where(
+                    models.MailIdentity.org_id == self.org_id,
+                )
+            ).scalars().all()
+            for row in rows:
+                if (row.address or "").strip().lower() == cleaned:
+                    return row.id
+        return None
+
     def _store_message(
         self,
         *,
@@ -877,6 +909,11 @@ class GranadaMail:
             org_id=self.org_id,
             agent_id=self.agent_id,
             mail_account_id=account.id,
+            # WHICH GRANADA MAILBOX, not merely which external account carried it. See
+            # `_identity_for`: the account is the external thing that delivered the message, and one
+            # such account carries mail for every mailbox Granada manages. Recording the mailbox here
+            # is what keeps one organisation's portal accounts from sharing a single inbox.
+            mail_identity_id=self._identity_for(message.recipients),
             thread_id=thread.id,
             provider_message_id=message.provider_message_id,
             internet_message_id=message.internet_message_id,

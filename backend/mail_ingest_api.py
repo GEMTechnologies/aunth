@@ -174,6 +174,10 @@ def ingest(
             id=str(_uuid.uuid4()),
             org_id=org_id,
             agent_id=str(identity_agent) if identity_agent else None,
+            # THE MAILBOX, carried from the routing lookup onto the row. `mail_routing` answered
+            # whose mailbox this is; recording it here is what keeps each portal account's mail
+            # separate instead of collapsing an organisation's mailboxes into one inbox.
+            mail_identity_id=identity_id,
             provider_message_id=(payload.message_id or f"cf:{received.timestamp()}")[:255],
             direction=models.MailMessage.DIRECTION_INBOUND,
             sender=payload.sender or None,

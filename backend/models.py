@@ -1762,6 +1762,18 @@ class MailMessage(Base):
     mail_account_id: Mapped[Optional[str]] = mapped_column(
         ForeignKey("mail_accounts.id"), index=True
     )
+    #: WHICH GRANADA MAILBOX THIS ARRIVED AT - not merely which account carried it.
+    #:
+    #: An organisation can hold several portal accounts, each with its own unpredictable mailbox,
+    #: and their codes, notifications and recovery messages must not merge into one history.
+    #: ``mail_account_id`` cannot express that: it names the EXTERNAL account (the Cloudflare
+    #: delivery, a connected Gmail) that carried the message, and one such account carries mail for
+    #: every mailbox Granada manages. Without this column an organisation running three portal
+    #: accounts reads one combined inbox, and a code for one portal looks exactly like a code for
+    #: another.
+    mail_identity_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("mail_identities.id"), index=True
+    )
     thread_id: Mapped[Optional[str]] = mapped_column(ForeignKey("mail_threads.id"), index=True)
 
     provider_message_id: Mapped[str] = mapped_column(String(255))
