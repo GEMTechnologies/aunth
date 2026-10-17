@@ -1665,7 +1665,13 @@ def authorise_package(
         raise HTTPException(status_code=404, detail="no such package in this organisation")
 
     try:
-        authorised = SubmissionService(db, org_id=org_id).authorise(
+        agent = _agent_for(db, org_id)
+        if agent is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="this organisation has no Granada agent, so nothing can be filed for it",
+            )
+        authorised = SubmissionService(db, org_id=org_id, agent_id=str(agent.id)).authorise(
             package_id=str(package.id), user_id=str(user.id), note=note
         )
     except Exception as exc:  # noqa: BLE001 - the service's refusals are the reason a person can act on
