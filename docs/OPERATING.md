@@ -110,8 +110,11 @@ not a bug and not a loop: the correction is committed before refusing, so the se
   functions `app.user_org_ids()` and `fleet_active_agent_ids()`. `credential_secrets` is denied to the
   fleet role outright; the one narrow exception is `app.mail_credential_ciphertext(account_id)`, which
   returns ciphertext for one account and only when the caller is bound to that account's organisation.
-- **Browser evidence:** screenshots under `/var/lib/granada/browser-evidence/<org>/<package>/`. Retention
-  is plan-then-apply: `python tools/prune_evidence.py` shows what would be removed.
+- **Browser evidence:** screenshots under `/var/lib/granada/browser-evidence/<org>/<package>/`, mounted
+  read-only into the API and served at `GET /agent/evidence/{package_id}`. The packages card shows the
+  last four for each package. The served path is resolved and re-checked against the organisation's own
+  directory, so a traversal or another tenant's id is a 404. Retention is plan-then-apply:
+  `python tools/prune_evidence.py` shows what would be removed.
 - **Web research:** `python tools/web_search.py --question "..."` uses DeepSeek's Search/Fetch API at
   about $0.00075 a request. It is what found the portal's own registration guide.
 
@@ -121,10 +124,6 @@ not a bug and not a loop: the correction is committed before refusing, so the se
 
 - **Rejecting a document with a reason.** The button records the rejection and who made it, but there
   is no field for *why*, so a rejected document does not tell the next person what to fix.
-- **Viewing browser evidence in the product.** Screenshots are captured to
-  `/var/lib/granada/browser-evidence/` and their paths are recorded in the activity, but nothing serves
-  them to a person: the evidence store is on the host and not mounted into the API container. Today you
-  read it over SSH.
 - Registration on the UN portal has been **researched** end to end by the agent, and the registration page
   reached with the mailbox filled in — but **no organisation has been registered**. That needs step 7.
 
