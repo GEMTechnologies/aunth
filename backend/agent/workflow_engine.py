@@ -2411,14 +2411,31 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
             planner_key=settings.get("browser_planner_key") or None,
         )
     except Exception as exc:
-        # build_task refuses an unready package. That refusal is the readiness engine doing its job,
-        # and it is a WAIT - the package is not wrong, it is not finished.
-        return {
-            "summary": f"the package is not ready to be opened: {exc}",
-            "summary_key": "browser.package_not_ready",
-            "next_state": models.AgentWorkflow.WAITING,
-            "meaningful": False,
-        }
+        # A READINESS REFUSAL IS A WAIT. ANYTHING ELSE IS A BUG, AND WAS BEING DISGUISED AS ONE.
+        #
+        # This used to catch everything and park with `browser.package_not_ready` and a friendly
+        # sentence. `agent_activity` has no summary column, so neither the message nor the traceback
+        # was recorded ANYWHERE durable: the workflow sat WAITING looking patient while a crash
+        # repeated on every sweep. That is why "the browser will not open the portal" survived several
+        # rounds of investigation by better means than this one.
+        #
+        # `BrowserTaskRefused` is the readiness engine doing its job - a person has not finished
+        # something - so it parks. Any other exception is raised, so the executor records it as a
+        # failed job with a traceback rather than as patience.
+        from agent.browser_boundary import BrowserTaskRefused
+
+        if isinstance(exc, BrowserTaskRefused):
+            return {
+                "summary": f"the package is not ready to be opened: {exc}",
+                "summary_key": "browser.package_not_ready",
+                "next_state": models.AgentWorkflow.WAITING,
+                "meaningful": False,
+                "structured_data": {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                },
+            }
+        raise
 
     invoker = browser_invocation.SubprocessInvoker(settings.get(browser_invocation.BROWSER_WORKER_COMMAND, ""))
     outcome = browser_invocation.invoke(
