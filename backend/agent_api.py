@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 
@@ -1477,6 +1477,208 @@ def list_messages(
         "has_more": has_more,
         # The cursor for the next page, taken from the LAST row returned.
         "next_before": _iso(rows[-1].created_at) if has_more and rows else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Funding: what the discovery bot found, and what the matcher decided
+#
+# THE GAP THIS FILLS. A discovery sweep now populates a shared catalogue of 112 opportunities and the
+# matcher writes 95 verdicts against them - and no route exposed either. The funding pipeline was
+# running correctly and completely invisible, which is why "are the bots working?" could only be
+# answered by an engineer with psql.
+#
+# REJECTIONS AND BLOCKERS ARE SHOWN, NOT HIDDEN. `opportunity_matches` keeps `REJECTED_BY_RULE` rows
+# on purpose: an organisation that cannot see what it was ruled out of, and on what basis, cannot
+# correct its own profile. A screen that showed only the good matches would look tidier and be less
+# useful, so this route returns the gate evidence alongside the verdict.
+# ---------------------------------------------------------------------------
+
+#: Why a gate could not be evaluated, in the organisation's own terms, and the facts that would fix
+#: it. Derived from GATE_FACTS so the screen cannot drift from the matcher.
+def _blocking_requirements(unknown_gates: Optional[dict]) -> list[dict[str, Any]]:
+    """What the organisation would have to supply for each undecidable gate.
+
+    This is the join between the funding screen and the profile screen: "95 matches are waiting on
+    your country" is actionable, where "95 NEEDS_DATA" is not.
+    """
+    gates = []
+    if isinstance(unknown_gates, dict):
+        raw = unknown_gates.get("gates")
+        if isinstance(raw, list):
+            gates = [str(g) for g in raw if g]
+    out = []
+    for gate in gates:
+        needs = list(GATE_FACTS.get(gate, ()))
+        out.append(
+            {
+                "gate": gate,
+                "needs_facts": needs,
+                "action": (
+                    f"Supply {', '.join(needs)} in your organisation profile"
+                    if needs
+                    else "This gate needs information Granada does not yet have"
+                ),
+            }
+        )
+    return out
+
+
+@router.get("/opportunities", summary="Funding the matcher has considered for this organisation")
+def list_opportunities(
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+    state: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """The catalogue, left-joined with THIS organisation's verdict on each opportunity.
+
+    LEFT JOIN, not inner: an opportunity the matcher has not reached yet is a real and interesting
+    state ("the bot found it, the matcher hasn't judged it"). An inner join would hide it and make the
+    catalogue look smaller than it is.
+
+    The catalogue is SHARED and not tenant-owned (ADR-0009); only the match is per-organisation. The
+    join is therefore scoped on `org_id` so one organisation's verdicts can never appear beside
+    another's - and the outer join means an unmatched opportunity still appears once.
+    """
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    limit = max(1, min(int(limit), 200))
+    offset = max(0, int(offset))
+
+    # MATCHED first, then blocked, then ruled out, then not-yet-judged. An operator's attention
+    # belongs at the top of that list, not in the order rows happened to be inserted.
+    priority = case(
+        (models.OpportunityMatch.state == models.OpportunityMatch.MATCHED, 0),
+        (models.OpportunityMatch.state == models.OpportunityMatch.NEEDS_DATA, 1),
+        (models.OpportunityMatch.state == models.OpportunityMatch.REJECTED_BY_RULE, 2),
+        (models.OpportunityMatch.id.is_(None), 3),
+        else_=4,
+    )
+
+    query = (
+        db.query(models.Opportunity, models.OpportunityMatch)
+        .outerjoin(
+            models.OpportunityMatch,
+            and_(
+                models.OpportunityMatch.opportunity_id == models.Opportunity.id,
+                models.OpportunityMatch.org_id == org_id,
+            ),
+        )
+    )
+    if state:
+        wanted = state.strip().upper()
+        allowed = {
+            models.OpportunityMatch.MATCHED,
+            models.OpportunityMatch.REJECTED_BY_RULE,
+            models.OpportunityMatch.NEEDS_DATA,
+            models.OpportunityMatch.SUPERSEDED,
+        }
+        if wanted not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"state must be one of {sorted(allowed)}",
+            )
+        query = query.filter(models.OpportunityMatch.state == wanted)
+
+    total = query.count()
+    rows = (
+        query.order_by(
+            priority.asc(),
+            models.OpportunityMatch.rank.asc().nulls_last(),
+            models.OpportunityMatch.final_score.desc().nulls_last(),
+            models.Opportunity.deadline.asc().nulls_last(),
+        )
+        .limit(limit)
+        .offset(offset)
+        .all()
+    )
+
+    items = []
+    for opportunity, match in rows:
+        items.append(
+            {
+                "id": opportunity.id,
+                "title": opportunity.title,
+                "source_name": opportunity.source_name,
+                "source_url": opportunity.source_url,
+                "country": opportunity.country,
+                "deadline": _iso(opportunity.deadline),
+                "amount_min": opportunity.amount_min,
+                "amount_max": opportunity.amount_max,
+                "currency": opportunity.currency,
+                "sector": opportunity.sector,
+                "is_active": opportunity.is_active,
+                "match": None
+                if match is None
+                else {
+                    "state": match.state,
+                    "hard_gate_passed": bool(match.hard_gate_passed),
+                    "final_score": match.final_score,
+                    "rank": match.rank,
+                    "computed_at": _iso(match.computed_at),
+                    # The evidence, not just the verdict.
+                    "failed_gates": (match.failed_gates or {}).get("gates", []),
+                    "unknown_gates": (match.unknown_gates or {}).get("gates", []),
+                    "blocking": _blocking_requirements(match.unknown_gates),
+                    "gate_reasons": [
+                        {
+                            "gate": gate.get("gate"),
+                            "outcome": gate.get("outcome"),
+                            "reason": gate.get("reason"),
+                        }
+                        for gate in ((match.reasons or {}).get("gates") or [])
+                        if isinstance(gate, dict)
+                    ],
+                },
+            }
+        )
+
+    # Counts for the whole catalogue, not the page: a summary that described one page would be
+    # mistaken for the portfolio.
+    tally = {"matched": 0, "needs_data": 0, "rejected": 0, "not_evaluated": 0}
+    for state_name, count in (
+        db.query(models.OpportunityMatch.state, func.count())
+        .filter(models.OpportunityMatch.org_id == org_id)
+        .group_by(models.OpportunityMatch.state)
+        .all()
+    ):
+        if state_name == models.OpportunityMatch.MATCHED:
+            tally["matched"] = count
+        elif state_name == models.OpportunityMatch.NEEDS_DATA:
+            tally["needs_data"] = count
+        elif state_name == models.OpportunityMatch.REJECTED_BY_RULE:
+            tally["rejected"] = count
+    catalogue = db.query(models.Opportunity).count()
+    tally["not_evaluated"] = max(0, catalogue - sum(tally.values()))
+
+    # The single most useful sentence on the screen: what would unblock the most matches.
+    blocked_facts: dict[str, int] = {}
+    for match in (
+        db.query(models.OpportunityMatch)
+        .filter(
+            models.OpportunityMatch.org_id == org_id,
+            models.OpportunityMatch.state == models.OpportunityMatch.NEEDS_DATA,
+        )
+        .limit(500)
+        .all()
+    ):
+        for requirement in _blocking_requirements(match.unknown_gates):
+            for fact in requirement["needs_facts"]:
+                blocked_facts[fact] = blocked_facts.get(fact, 0) + 1
+
+    return {
+        "opportunities": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "summary": tally,
+        "catalogue_size": catalogue,
+        "blocked_by_fact": blocked_facts,
+        "next_offset": offset + len(items) if offset + len(items) < total else None,
     }
 
 

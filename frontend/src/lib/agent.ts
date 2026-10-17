@@ -288,3 +288,62 @@ export const fetchMailboxes = () => load<MailboxList>('/agent/mail/mailboxes');
 export const fetchMailMessages = (params?: { mailbox_id?: string; direction?: string; limit?: number; before?: string }) =>
   load<MessagePage>('/agent/mail/messages', params);
 
+// ---------------------------------------------------------------------------
+// Funding: what the discovery bot found, and what the matcher decided
+//
+// The catalogue is SHARED and belongs to nobody; only the `match` is this organisation's. That is
+// why `match` is nullable: an opportunity the matcher has not reached yet is a real state, not a
+// missing value.
+// ---------------------------------------------------------------------------
+
+export interface BlockingRequirement {
+  gate: string;
+  //: The profile facts that would make this gate decidable, e.g. ["country"].
+  needs_facts: string[];
+  action: string;
+}
+
+export interface OpportunityMatch {
+  state: 'MATCHED' | 'NEEDS_DATA' | 'REJECTED_BY_RULE' | 'SUPERSEDED';
+  hard_gate_passed: boolean;
+  final_score?: number | null;
+  rank?: number | null;
+  computed_at?: string | null;
+  failed_gates: string[];
+  unknown_gates: string[];
+  blocking: BlockingRequirement[];
+  gate_reasons: Array<{ gate: string; outcome: string; reason: string }>;
+}
+
+export interface Opportunity {
+  id: string;
+  title: string;
+  source_name: string;
+  source_url: string;
+  country: string;
+  deadline?: string | null;
+  amount_min?: number | null;
+  amount_max?: number | null;
+  currency?: string | null;
+  sector?: string | null;
+  is_active: boolean;
+  match?: OpportunityMatch | null;
+}
+
+export interface OpportunityList {
+  opportunities: Opportunity[];
+  total: number;
+  limit: number;
+  offset: number;
+  summary: { matched: number; needs_data: number; rejected: number; not_evaluated: number };
+  catalogue_size: number;
+  //: How many blocked matches each missing fact would unblock. The single most useful number on the
+  //: screen: it turns "95 NEEDS_DATA" into "95 are waiting on your country".
+  blocked_by_fact: Record<string, number>;
+  next_offset?: number | null;
+}
+
+export const fetchOpportunities = (params?: { state?: string; limit?: number; offset?: number }) =>
+  load<OpportunityList>('/agent/opportunities', params);
+
+
