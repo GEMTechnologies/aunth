@@ -1650,7 +1650,61 @@ class GranadaMail:
             record.processed_at = _now()
         except MailProviderError as exc:
             self._fail_event(record, str(exc))
+        else:
+            # ONLY ON SUCCESS, and only for a message that is now stored: offering a message that
+            # failed to persist to the verification engine would let a mailbox satisfy a waiting
+            # request with a message the organisation cannot see.
+            self._offer_to_verification(account=account, message=message)
         self.db.flush()
+
+    def _offer_to_verification(
+        self, *, account: models.MailAccount, message: InboundMessage
+    ) -> None:
+        """Offer a reconciled message to whatever verification this organisation is waiting on.
+
+        THE WEBHOOK PATH DID THIS AND RECONCILIATION DID NOT. `mail_ingest_api` stores the message and
+        then calls `VerificationService.examine`; `_process` never did, and `sync` reaches the mail
+        pipeline without passing the ingest API at all. So a code arriving at a CONNECTED mailbox -
+        the entire reason to connect one - was ingested, classified, and never matched against the
+        pending request. The browser task would wait out its timeout while the code sat in the
+        database, and nothing anywhere would say the two had missed each other.
+
+        The call shape is deliberately identical to the webhook's, so the two cannot drift apart.
+
+        A failure here is logged and swallowed rather than raised: the message is already stored, and
+        losing the stored message is worse than losing the match. A later sweep can still examine it.
+        """
+        from agent.mail.verification_service import VerificationService
+
+        try:
+            stored = self.db.execute(
+                select(models.MailMessage.id).where(
+                    models.MailMessage.mail_account_id == account.id,
+                    models.MailMessage.provider_message_id == message.provider_message_id,
+                )
+            ).scalars().first()
+            if stored is None:
+                return
+
+            outcome = VerificationService(self.db, org_id=self.org_id).examine(
+                subject=message.subject or "",
+                body=message.body_text or message.body_html or "",
+                sender=message.sender or "",
+                recipients=list(message.recipients or ()),
+                received_at=message.received_at or _now(),
+                message_id=stored,
+            )
+            self.db.flush()
+            if outcome.satisfied and not outcome.already_satisfied:
+                logger.info(
+                    "mail.verification_satisfied_from_sync",
+                    extra={"mail_account_id": account.id, "message_id": stored},
+                )
+        except Exception as exc:  # noqa: BLE001 - never lose a stored message to a matching failure
+            logger.warning(
+                "mail.verification_examine_failed",
+                extra={"mail_account_id": account.id, "error": type(exc).__name__},
+            )
 
     # ------------------------------------------------------------------
     # Activity and events
