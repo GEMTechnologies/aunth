@@ -1769,9 +1769,20 @@ def _handle_document_generate(db: Session, context: dict[str, Any]) -> dict[str,
     )
     wanted = required_types_for(listing_text)
 
-    # Every application needs a cover letter, whether or not the listing spells it out.
-    if "cover_letter" not in wanted:
-        wanted.append("cover_letter")
+    # Every application needs these two, whether or not the listing spells them out.
+    #
+    # `organisation_profile` WAS MISSING FROM THIS LIST, and the consequence was a permanent deadlock:
+    # the readiness gate treats it as mandatory material on the package, while the generator built
+    # `wanted` only from what the listing names - so the package could never assemble and the portal
+    # step could never start. Measured: the workflow COMPLETED having produced cover_letter only, while
+    # the package still read "missing mandatory material: cover_letter, organisation_profile".
+    #
+    # This is the disagreement the comment above claims cannot happen. The two sides do not share a
+    # source of truth: the gate's requirement set is not `required_types_for(listing_text)`. Until they
+    # do, the documents the gate demands unconditionally are named here unconditionally.
+    for always_generate in ("cover_letter", "organisation_profile"):
+        if always_generate not in wanted:
+            wanted.append(always_generate)
 
     # The listing and the donor are not ORGANISATION facts; they come from the opportunity.
     facts = dict(facts)
