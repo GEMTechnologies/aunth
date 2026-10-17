@@ -1581,6 +1581,106 @@ def reject_document(
     }
 
 
+@router.get("/packages", summary="Submission packages and whether they are authorised")
+def list_packages(
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Every submission package, with the state that decides whether the browser may open it.
+
+    WHY THIS EXISTS. `SubmissionService` could freeze, authorise and hand off, and no route exposed
+    any of it. A package assembled to DRAFT and the browser task then refused with
+    `browser.package_not_ready` - correctly, because opening a portal on a package no person has
+    authorised is exactly what the gate is for - and there was nothing in the product with which to
+    authorise it. The chain stopped one click from the portal.
+    """
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    rows = (
+        db.query(models.SubmissionPackage)
+        .filter(models.SubmissionPackage.org_id == org_id)
+        .order_by(models.SubmissionPackage.created_at.desc())
+        .all()
+    )
+
+    def _row(package) -> dict[str, Any]:
+        return {
+            "id": str(package.id),
+            "application_id": package.application_id,
+            "opportunity_id": package.opportunity_id,
+            "status": package.status,
+            "status_reason": package.status_reason,
+            "fingerprint": package.package_fingerprint,
+            "authorised_at": package.authorised_at.isoformat() if package.authorised_at else None,
+            "authorised_by": package.authorised_by,
+            "handoff_ready_at": (
+                package.handoff_ready_at.isoformat() if package.handoff_ready_at else None
+            ),
+        }
+
+    packages = [_row(p) for p in rows]
+    return {
+        "packages": packages,
+        "total": len(packages),
+        "awaiting_authorisation": len(
+            [p for p in packages if p["status"] == models.SubmissionPackage.DRAFT]
+        ),
+        "note": (
+            "A package is frozen at a fingerprint. Authorising it approves THAT fingerprint, and the "
+            "browser will not open a portal until someone has."
+        ),
+    }
+
+
+@router.post("/packages/{package_id}/authorise", summary="Authorise THIS package for the browser")
+def authorise_package(
+    package_id: str,
+    note: Optional[str] = None,
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Authorise one package, in the name of the person who clicked.
+
+    The service recalculates the fingerprint from the live row rather than accepting one from the
+    caller, so a client cannot authorise one package while another is filed. The permission is
+    `submission.authorise`, which is deliberately not implied by being an owner.
+    """
+    from agent.submission.service import SubmissionService
+
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    package = (
+        db.query(models.SubmissionPackage)
+        .filter(
+            models.SubmissionPackage.id == package_id,
+            models.SubmissionPackage.org_id == org_id,
+        )
+        .first()
+    )
+    if package is None:
+        raise HTTPException(status_code=404, detail="no such package in this organisation")
+
+    try:
+        authorised = SubmissionService(db, org_id=org_id).authorise(
+            package_id=str(package.id), user_id=str(user.id), note=note
+        )
+    except Exception as exc:  # noqa: BLE001 - the service's refusals are the reason a person can act on
+        raise HTTPException(status_code=409, detail=str(exc)[:300]) from exc
+    db.commit()
+
+    return {
+        "id": str(authorised.id),
+        "status": authorised.status,
+        "fingerprint": authorised.package_fingerprint,
+        "authorised_at": authorised.authorised_at.isoformat() if authorised.authorised_at else None,
+        "note": "Authorised. The browser task may now open the portal for this package.",
+    }
+
+
 class ConnectMailboxRequest(BaseModel):
     """Connect an external mailbox the organisation already owns.
 
