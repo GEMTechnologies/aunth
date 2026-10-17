@@ -791,9 +791,10 @@ class AgentWorker:
         try:
             return self._run(job, ledger, attempt)
         except Exception as exc:
-            ledger.fail(
+            category = "TRANSIENT_NETWORK" if _retryable(exc) else "PERMANENT_REJECTION"
+            resulting_state = ledger.fail(
                 attempt,
-                category="TRANSIENT_NETWORK" if _retryable(exc) else "PERMANENT_REJECTION",
+                category=category,
                 error=f"{type(exc).__name__}: {exc}",
                 retryable=_retryable(exc),
             )
@@ -803,6 +804,31 @@ class AgentWorker:
                 extra={"job_id": job_id, "agent_id": job.agent_id,
                        "reason": type(exc).__name__, "error": str(exc)[:500]},
             )
+
+            # A DEAD-LETTERED JOB MUST NOT LEAVE ITS WORKFLOW RUNNING FOR EVER.
+            #
+            # `ledger.fail` moves the JOB; nothing moved the WORKFLOW, so a job that exhausted its
+            # attempts or hit a permanent rejection left the workflow in RUNNING with no job behind
+            # it. Nothing re-dispatches a RUNNING workflow, so it was stranded: measured on
+            # production, 49 workflows sat in RUNNING after their jobs dead-lettered, and the work
+            # was silently never retried or closed.
+            #
+            # A retryable failure is left alone deliberately. The job is back in QUEUED and will be
+            # retried on the same workflow, so closing it here would abort work that is about to
+            # run again.
+            if resulting_state == models.Job.DEAD_LETTER and job.workflow_id:
+                workflow = self.db.execute(
+                    select(models.AgentWorkflow).where(
+                        models.AgentWorkflow.id == job.workflow_id
+                    )
+                ).scalars().first()
+                if workflow is not None:
+                    # FAILED, not WAITING: WAITING means "due again later", and a permanent
+                    # rejection that has exhausted its attempts is not going to become true.
+                    workflow.state = models.AgentWorkflow.FAILED
+                    workflow.waiting_on = f"job {job.id} dead-lettered ({category})"[:255]
+                    workflow.next_run_at = None
+
             self.db.flush()
             return ExecutionResult(
                 job_id=job_id, outcome=ExecutionResult.FAILED,
