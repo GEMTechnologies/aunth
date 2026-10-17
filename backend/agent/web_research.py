@@ -144,7 +144,9 @@ def _post(config: _Config, path: str, body: dict[str, Any]) -> dict[str, Any]:
             )
         except Exception as exc:  # noqa: BLE001
             if attempt >= 2:
-                raise WebResearchError(f"{path} failed: {type(exc).__name__}") from exc
+                # The MESSAGE, not just the type: "network down" and "RuntimeError" lead an operator
+                # to different places.
+                raise WebResearchError(f"{path} failed: {type(exc).__name__}: {exc}") from exc
             logger.warning(
                 "web_research.transport_failure", extra={"path": path, "error": type(exc).__name__}
             )
@@ -186,11 +188,12 @@ def search(
     hits: list[SearchHit] = []
     for row in data.get("results") or []:
         url = (row.get("url") or "").strip()
-        title = (row.get("title") or "").strip()
-        if not url or not title:
-            # A result without a title or a URL cannot be cited, and an uncitable result is not
-            # research. Dropped rather than passed on as a blank row.
+        if not url:
+            # A result with no URL cannot be cited, and an uncitable result is not research. A result
+            # with no TITLE can be: the URL is a poorer citation than a title but it is still one a
+            # person can open, so it is kept and labelled rather than thrown away.
             continue
+        title = (row.get("title") or "").strip() or url
         hits.append(
             SearchHit(
                 title=title,
