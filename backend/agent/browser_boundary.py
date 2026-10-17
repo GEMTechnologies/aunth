@@ -368,6 +368,20 @@ def build_task(
     max_attempts: int = 3,
     steps: Any = (),
     goal: Optional[str] = None,
+    # AN EXPLICIT TARGET, FOR WORK THAT IS NOT A FUNDER SUBMISSION.
+    #
+    # `target_url` was read from the package only, which is right for filing an application - the
+    # funder's portal URL is recorded on the package. But portal REGISTRATION is not tied to a grant
+    # submission: an organisation registers on the UN Partner Portal before it has any application at
+    # all, so the package's target is empty BY DESIGN for exactly the task this product exists to do.
+    #
+    # Measured: the browser ran and refused with NO_TARGET_URL - "the task named no target_url, so
+    # there was nothing to open" - on a package that was ready and authorised. The refusal was
+    # correct; nothing had ever given the task somewhere to go.
+    #
+    # An override wins when supplied; otherwise the package's value is used, so existing behaviour is
+    # unchanged for submission work.
+    target_url: Optional[str] = None,
     planner_url: Optional[str] = None,
     planner_key: Optional[str] = None,
 ) -> BrowserTask:
@@ -404,10 +418,15 @@ def build_task(
         job_id=None,
         package_fingerprint=str(package.package_fingerprint),
         action_scope=action_scope,
-        # CARRIED FROM THE PACKAGE, which is where the funder's portal URL is recorded. Passing it
-        # here is what makes `validate_task`'s target check real rather than a `getattr` on a field
-        # that did not exist, and it is what the worker needs in order to open anything at all.
-        target_url=getattr(package, "target_url", None),
+        # CARRIED FROM THE PACKAGE, which is where the funder's portal URL is recorded - or from the
+        # caller when this is registration work with no submission behind it. Passing it here is what
+        # makes `validate_task`'s target check real rather than a `getattr` on a field that did not
+        # exist, and it is what the worker needs in order to open anything at all.
+        target_url=(
+            str(target_url).strip() or None
+            if target_url
+            else getattr(package, "target_url", None)
+        ),
         steps=tuple(dict(s) for s in (steps or ()) if isinstance(s, dict)),
         goal=(str(goal).strip() or None) if goal else None,
         planner_url=(str(planner_url).strip() or None) if planner_url else None,

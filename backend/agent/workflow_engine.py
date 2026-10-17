@@ -2417,6 +2417,12 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
             # form-fill path, which is what every existing job uses.
             steps=settings.get("browser_steps") or (),
             goal=settings.get("browser_goal") or None,
+            # PORTAL REGISTRATION IS NOT A FUNDER SUBMISSION. A package carries the funder's portal
+            # URL for filing an application; an organisation registering on the UN Partner Portal has
+            # no application behind it, so `package.target_url` is empty BY DESIGN for the task this
+            # product exists to do. Without this the browser ran, opened nothing, and refused with
+            # NO_TARGET_URL - correctly, because nothing had given it somewhere to go.
+            target_url=settings.get("browser_target_url") or None,
             # The host asks the container; it is never given the model key or a DSN.
             planner_url=settings.get("browser_planner_url") or None,
             planner_key=settings.get("browser_planner_key") or None,
