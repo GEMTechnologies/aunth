@@ -1985,16 +1985,34 @@ def _handle_mail_process(db: Session, context: dict[str, Any]) -> dict[str, Any]
 #: Provider name -> adapter. Populated by the deployment: a provider with no
 #: configured credentials is absent rather than broken, so the handler parks
 #: instead of failing.
-def _mail_transport(provider: str) -> Any:
-    """Resolve a mail transport for a provider name.
+def _mail_transport(provider: str, *, db: Session = None, account: Any = None) -> Any:
+    """Resolve an INBOUND transport, preferring the ACCOUNT's own credential.
 
-    Delegates to the gateway's registry, which is the single place transports are
-    selected. Returns ``None`` when nothing is configured — deliberately not an
-    exception: an unconfigured provider is an operational state, not a processing
-    error, and conflating the two would make a configuration gap look like mail
-    corruption.
+    WHEN AN ACCOUNT IS SUPPLIED, its `credentials_ref` wins. `get_transport(provider)` returns the
+    DEPLOYMENT-WIDE transport registered under a provider name, which is empty when each organisation
+    brings its own mailbox - so a connected IMAP account was parked with
+    "mail transport for imap not configured" on every sweep, for ever, with no error. The account's
+    own status stayed blank because nothing ever tried, which is the one signal an operator would
+    have checked.
+
+    This is the inbound twin of `_outbound_transport`, which already had the fix. The webhook path
+    passes no account and keeps the deployment-wide transport, which is correct there: a managed
+    Granada address has no per-account credential to prefer.
+
+    Returns ``None`` when nothing is configured - deliberately not an exception: an unconfigured
+    provider is an operational state, not a processing error.
     """
-    from agent.mail.gateway import get_transport
+    from agent.mail.gateway import MailGateway, get_transport
+
+    if db is not None and account is not None:
+        try:
+            return MailGateway(
+                db, org_id=account.org_id, agent_id=str(account.agent_id)
+            ).transport_for_account(account)
+        except Exception:  # noqa: BLE001 - a tenant mismatch must not become a crash here
+            # Falling back to the provider-wide transport would be a silent cross-tenant read, which
+            # is the worst recovery available here, so this parks the work instead.
+            return None
 
     return get_transport(provider)
 
@@ -2224,7 +2242,7 @@ def _handle_mail_sync(db: Session, context: dict[str, Any]) -> dict[str, Any]:
             "meaningful": False,
         }
 
-    transport = _mail_transport(account.provider)
+    transport = _mail_transport(account.provider, db=db, account=account)
     if transport is None:
         return {
             "summary": f"no transport configured for {account.provider}",
