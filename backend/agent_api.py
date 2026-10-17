@@ -1529,12 +1529,54 @@ def approve_document(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     db.commit()
 
+    # APPROVAL IS WHAT UNBLOCKS ASSEMBLY, SO APPROVAL QUEUES IT.
+    #
+    # The generator used to enqueue assembly the moment it wrote the documents - which are drafts - so
+    # assembly always ran before anyone could approve them, blocked, and took the six-hour backoff a
+    # human-blocked step gets. Approval is the first moment the package can actually be frozen.
+    #
+    # Only when nothing is left pending: queuing on the first of two approvals would freeze a package
+    # with a draft still in it.
+    queued = False
+    try:
+        remaining = (
+            db.query(models.Document)
+            .filter(
+                models.Document.org_id == org_id,
+                models.Document.is_current.is_(True),
+                models.Document.approval_status == models.Document.PENDING,
+            )
+            .count()
+        )
+        if remaining == 0 and document.scope_ref:
+            from agent.mail.gateway import AgentWake
+
+            agent = _agent_for(db, org_id)
+            if agent is not None:
+                AgentWake.schedule(
+                    db,
+                    agent=agent,
+                    workflow_type="application_assemble",
+                    specialist_key="COMPLIANCE",
+                    subject_type="OPPORTUNITY",
+                    subject_id=str(document.scope_ref),
+                )
+                db.commit()
+                queued = True
+    except Exception:  # noqa: BLE001 - an approval that succeeded must not be reported as failed
+        db.rollback()
+
     return {
         "id": str(document.id),
         "approval_status": document.approval_status,
         "approved_by": document.approved_by,
         "approved_at": document.approved_at.isoformat() if document.approved_at else None,
-        "note": "Approved. Assembly can now freeze a package that includes it.",
+        "assembly_queued": queued,
+        "note": (
+            "Approved. Assembly has been queued, because every document is now approved."
+            if queued
+            else "Approved. Assembly waits until no document is left as a draft."
+        ),
     }
 
 

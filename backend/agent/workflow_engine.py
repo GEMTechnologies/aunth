@@ -1886,12 +1886,20 @@ def _handle_document_generate(db: Session, context: dict[str, Any]) -> dict[str,
             "skipped": skipped,
             "must_be_uploaded": sorted(set(skipped) & set(documents.EVIDENCE_TYPES)),
         },
-        # The package is assembled from what is now in the vault, so the next step is assembly.
-        "enqueue": {
-            "workflow_type": WORKFLOW_ASSEMBLE,
-            "specialist_key": "COMPLIANCE",
-            "correlation_id": context.get("correlation_id"),
-        },
+        # NO AUTO-ENQUEUE OF ASSEMBLY. It was here, and it made the chain deadlock every single run.
+        #
+        # The generator writes documents as PENDING - a draft the organisation has not stood behind -
+        # and then immediately queued assembly. Assembly ran seconds later, found unapproved documents,
+        # and parked with "Package blocked" on the six-hour backoff a human-blocked step gets. So by the
+        # time a person approved the documents, the assembly was asleep until the evening and looked
+        # like it had never been asked.
+        #
+        # Measured across several runs: assembly ALWAYS ran before approval was possible, and ALWAYS
+        # parked. The trigger was guaranteed to fire too early.
+        #
+        # APPROVAL IS THE TRIGGER NOW: `POST /agent/documents/{id}/approve` queues assembly once
+        # nothing is left pending. That is the moment the package can actually be frozen, because it is
+        # the moment the documents stop being drafts.
     }
 
 
