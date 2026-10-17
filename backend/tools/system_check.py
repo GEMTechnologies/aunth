@@ -421,6 +421,41 @@ def check_mailboxes(report: Report, db, now) -> None:
                    "the sweep runs every fifteen minutes; check the provider's IMAP access")
 
 
+def check_queue(report: Report, db, now) -> None:
+    """Are queued jobs actually being claimed?
+
+    MEASURED, round 33: a `document_generate` job sat QUEUED with `attempt=0` and no error while its
+    workflow said RUNNING. Nothing would ever have happened to it, and this command reported
+    "no stranded workflows" - because it defines stranded as `RUNNING` with NO queued job, and this
+    workflow had one. The queued job itself was the problem, and nothing looked at jobs.
+
+    A job that has never been attempted and is older than the grace window is not "pending". Being
+    queued is a state a healthy job leaves within seconds; staying there is a claim that failed.
+    """
+    stalled, error = _per_tenant(
+        db,
+        """
+        SELECT count(*) FROM jobs
+         WHERE state = 'QUEUED'
+           AND attempt = 0
+           AND created_at < now() - interval '10 minutes'
+        """,
+    )
+    if error:
+        report.add("queue is being claimed", SKIP, error)
+        return
+
+    if not stalled:
+        report.add("queue is being claimed", PASS, "no job is waiting to be picked up")
+        return
+
+    report.add(
+        "queue is being claimed", WARN,
+        f"{stalled} job(s) queued for over 10 minutes and never attempted",
+        "the executor is not claiming this work type; check its stream filter and the specialist",
+    )
+
+
 # ---------------------------------------------------------------------------
 # HTTP checks
 # ---------------------------------------------------------------------------
@@ -502,6 +537,7 @@ def main(argv: list[str] | None = None) -> int:
         db = FleetSessionLocal()
         check_database(report, db)
         check_mailboxes(report, db, datetime.now(timezone.utc))
+        check_queue(report, db, datetime.now(timezone.utc))
     except Exception as exc:  # noqa: BLE001
         report.add("database reachable", FAIL, f"{type(exc).__name__}: {exc}"[:200],
                    "check the postgres container and DATABASE_URL")
