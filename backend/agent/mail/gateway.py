@@ -519,7 +519,17 @@ class MailGateway:
                 "mail.credential_unavailable",
                 extra={"mail_account_id": account.id, "error": type(exc).__name__},
             )
-            return None
+            # THE FLEET ROLE CANNOT READ THIS TABLE AT ALL, BY DESIGN. ADR-0011's RESTRICTIVE policy
+            # `credential_secrets_fleet_denied` denies `granada_fleet` everything, and the executor runs
+            # as that role - so a per-account transport could never be built and the mailbox parked
+            # with "mail transport not configured" for ever. Measured on production before this was
+            # added: `CredentialNotFound` on every sweep.
+            #
+            # The narrow SECURITY DEFINER path returns the CIPHERTEXT for one account and only when
+            # the caller is bound to that account's organisation. The key never leaves the application.
+            payload = self._payload_via_definer(account, store)
+            if payload is None:
+                return None
 
         provider = (account.provider or "").upper()
         if provider == "IMAP":
@@ -545,8 +555,52 @@ class MailGateway:
         )
         return None
 
-    def receive(
-        self,
+    def _payload_via_definer(
+        self, account: models.MailAccount, store: Any
+    ) -> Optional[dict[str, Any]]:
+        """Read one account's credential through the narrow SECURITY DEFINER function.
+
+        Used only when the direct read is denied - which is the normal case for the executor, since
+        ADR-0011 denies `granada_fleet` all access to `credential_secrets`.
+
+        THE FUNCTION IS THE GUARD, NOT THIS METHOD. `app.mail_credential_ciphertext()` returns a row
+        only when the account's organisation equals `app.current_org()`, so an unbound caller gets
+        nothing and a forged account id from another tenant gets nothing. This method does not choose
+        an organisation; it cannot, because the function does not accept one.
+        """
+        from sqlalchemy import text
+
+        try:
+            token = self.db.execute(
+                text("SELECT app.mail_credential_ciphertext(:account)"),
+                {"account": account.id},
+            ).scalar()
+        except Exception as exc:  # noqa: BLE001 - an older database has no such function
+            logger.warning(
+                "mail.credential_definer_unavailable",
+                extra={"mail_account_id": account.id, "error": type(exc).__name__},
+            )
+            return None
+
+        if not token:
+            # Includes the unbound case and the wrong-organisation case, which must be
+            # indistinguishable from the outside.
+            logger.info(
+                "mail.credential_definer_empty",
+                extra={"mail_account_id": account.id},
+            )
+            return None
+
+        try:
+            return store.open_ciphertext(token)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "mail.credential_definer_undecryptable",
+                extra={"mail_account_id": account.id, "error": type(exc).__name__},
+            )
+            return None
+
+    def receive(        self,
         *,
         provider: str,
         event: ProviderEvent,

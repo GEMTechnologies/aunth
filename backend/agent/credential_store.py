@@ -224,6 +224,19 @@ class CredentialStore:
             )
         ).scalars().first()
 
+    def open_ciphertext(self, ciphertext: str) -> dict[str, Any]:
+        """Decrypt a token obtained from somewhere other than `get()`.
+
+        WHY THIS IS PUBLIC. `app.mail_credential_ciphertext()` (migration 025) is the narrow
+        SECURITY DEFINER path that lets a worker build a per-account mail transport without being
+        granted access to `credential_secrets` - which ADR-0011 denies it outright. That function
+        returns CIPHERTEXT, because the database does not hold the key; the application decrypts it
+        here. Keeping the two halves apart is the point: the database never learns a mailbox password.
+        """
+        if not ciphertext:
+            raise CredentialStoreError("refusing to decrypt an empty credential")
+        return self._decrypt(ciphertext)
+
     def _encrypt(self, payload: dict[str, Any]) -> str:
         try:
             return self._fernet.encrypt(json.dumps(payload).encode("utf-8")).decode("ascii")
