@@ -89,3 +89,24 @@ def test_the_handler_is_still_registered_under_compliance():
     source = (BACKEND / "agent" / "specialists.py").read_text(encoding="utf-8")
     assert '"browser_task": "_handle_browser_task"' in source
     assert '"COMPLIANCE"' in source
+
+
+def test_submission_authority_is_asked_rather_than_assumed():
+    """The flag used to be hard-coded False while a fully-written authority module was imported by
+    nothing - so the platform could prepare, approve and authorise, and still never complete, because
+    nobody asked the component that decides.
+
+    This is a reachability check, not a behaviour check: the behaviour is covered by
+    test_submission and by the module's own fail-closed evaluation. What it prevents is the specific
+    regression of passing a literal False again.
+    """
+    source = (BACKEND / "agent" / "workflow_engine.py").read_text(encoding="utf-8")
+
+    assert "submission_authority.evaluate(" in source, (
+        "the browser handler no longer asks the authority module whether it may submit"
+    )
+    assert "submission_authorised=False," not in source, (
+        "submission authority is hard-coded off again; no authorisation could ever take effect"
+    )
+    # And the decision must actually reach the invocation.
+    assert "submission_authorised=authority.allowed" in source
