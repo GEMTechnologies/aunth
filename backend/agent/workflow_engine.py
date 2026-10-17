@@ -2382,9 +2382,20 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
         }
 
     package = db.execute(
-        select(models.SubmissionPackage).where(
+        select(models.SubmissionPackage)
+        .where(
             models.SubmissionPackage.application_id == application.id
         )
+        # NEWEST FIRST. A package is re-frozen whenever the artefacts change, so an application
+        # accumulates one row per freeze - and `.first()` with no ordering returns whichever row the
+        # planner happens to produce, which in practice was the OLDEST.
+        #
+        # MEASURED: this handler refused a freshly AUTHORISED package with "package 22f55508 is not
+        # ready: Package blocked: cover letter has not been prepared", naming a superseded row whose
+        # documents had been replaced. The browser was being pointed at a package nobody had
+        # authorised, and the refusal was correct about that old row - which is exactly why it looked
+        # like the readiness engine disagreeing with itself.
+        .order_by(models.SubmissionPackage.created_at.desc())
     ).scalars().first()
     if package is None:
         # Nothing to open. PARK rather than fail: the package is assembled by another step, and
