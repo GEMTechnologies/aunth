@@ -278,3 +278,90 @@ def test_a_mailbox_with_no_transport_and_no_credential_is_still_skipped(db, worl
     db.commit()
 
     assert schedule_mail_sync(db, stale_seconds=60, org_id=str(world['org'].id)) == 0
+
+
+# ---------------------------------------------------------------------------
+# The narrow definer path: the guard is the SQL, and the app must respect an empty answer
+# ---------------------------------------------------------------------------
+class _FakeResult:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar(self):
+        return self._value
+
+
+class _FakeDB:
+    def __init__(self, value):
+        self._value = value
+        self.calls = []
+
+    def execute(self, statement, params=None):
+        self.calls.append((str(statement), params))
+        if self._value is _RAISE:
+            raise RuntimeError('function does not exist')
+        return _FakeResult(self._value)
+
+
+_RAISE = object()
+
+
+def _gateway(db, org_id):
+    from agent.mail.gateway import MailGateway
+
+    return MailGateway(db, org_id=org_id, agent_id='agent-1')
+
+
+def _account(org_id, credentials_ref='mail/imap/x'):
+    return models.MailAccount(
+        id='account-1', org_id=org_id, agent_id='agent-1', provider='imap',
+        provider_account_id='a@b.c', connection_type=models.MailAccount.CONNECTION_CONNECTED_IMAP,
+        address='a@b.c', status=models.MailAccount.ACTIVE, credentials_ref=credentials_ref,
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+def test_an_empty_answer_from_the_definer_is_an_empty_answer():
+    """The function returns nothing for an unbound caller and for an account in another
+    organisation, and the app must treat those identically - it may not go looking for a reason."""
+    store = object()
+    gw = _gateway(_FakeDB(''), 'org-1')
+    assert gw._payload_via_definer(_account('org-1'), store) is None
+
+
+def test_a_missing_function_is_not_a_crash():
+    gw = _gateway(_FakeDB(_RAISE), 'org-1')
+    assert gw._payload_via_definer(_account('org-1'), object()) is None
+
+
+def test_the_definer_passes_only_the_account_id():
+    """It must not accept an organisation: the organisation comes from the caller's binding, and a
+    function that took one could be asked on behalf of somebody else."""
+    db = _FakeDB('')
+    gw = _gateway(db, 'org-1')
+    gw._payload_via_definer(_account('org-1'), object())
+    statement, params = db.calls[0]
+    assert params == {'account': 'account-1'}
+    assert 'org' not in params
+
+
+def test_ciphertext_from_the_definer_is_decrypted_by_the_store():
+    from agent.credential_store import CredentialStore
+
+    class _Store:
+        def open_ciphertext(self, token):
+            assert token == 'CIPHER'
+            return {'host': 'imap.gmail.com', 'username': 'u', 'password': 'p'}
+
+    gw = _gateway(_FakeDB('CIPHER'), 'org-1')
+    payload = gw._payload_via_definer(_account('org-1'), _Store())
+    assert payload['host'] == 'imap.gmail.com'
+
+
+def test_an_undecryptable_ciphertext_is_not_a_crash():
+    class _Store:
+        def open_ciphertext(self, token):
+            raise RuntimeError('InvalidToken')
+
+    gw = _gateway(_FakeDB('CIPHER'), 'org-1')
+    assert gw._payload_via_definer(_account('org-1'), _Store()) is None
