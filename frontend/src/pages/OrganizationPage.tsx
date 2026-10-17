@@ -1,5 +1,6 @@
 
 import React, { useState, useEffect } from 'react';
+import OrganisationFactsCard from '../components/OrganisationFactsCard';
 import { api } from '../lib/api';
 
 interface User {
@@ -322,6 +323,10 @@ const OrganizationPage: React.FC<OrganizationPageProps> = ({ user }) => {
                       </div>
                     </div>
                   </div>
+
+                  {/* The fields the Funding screen tells you to supply. Without this the
+                      instruction pointed at a page that had nowhere to act on it. */}
+                  <OrganisationFactsCard />
                 </div>
               )}
 

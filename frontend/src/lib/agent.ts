@@ -354,4 +354,76 @@ export const fetchOpportunities = (params?: {
   include_inactive?: boolean;
 }) => load<OpportunityList>('/agent/opportunities', params);
 
+// ---------------------------------------------------------------------------
+// The organisation profile - the facts the matcher is waiting on
+//
+// The funding screen says "18 blocked matches would become decidable if you supplied country".
+// Without this there was nowhere to supply it: the backend has had PUT /agent/profile/facts since
+// the profile intake was built, and the product offered no form, so the instruction pointed at a
+// page with no field on it.
+// ---------------------------------------------------------------------------
+
+export interface ProfileFact {
+  key: string;
+  value: unknown;
+  state: string;
+  source: string;
+  version: number;
+  valid_until?: string | null;
+  //: Whether this fact could actually be used in a submission (state is VERIFIED/USER_PROVIDED).
+  submission_usable: boolean;
+}
+
+export interface MatchingGate {
+  gate: string;
+  decidable: boolean;
+  needs: string[];
+  satisfied_by: string[];
+}
+
+export interface ProfileFacts {
+  facts: ProfileFact[];
+  total: number;
+  usable_fact_keys: string[];
+  matching_gates: MatchingGate[];
+  blocks_matching: string[];
+  suggested_keys: Record<string, string>;
+}
+
+export interface ProfileFactsWriteResult {
+  recorded: Array<{ key: string; version: number; state: string }>;
+  rejected: Array<{ key: string; reason: string }>;
+  usable_fact_keys: string[];
+  matching_gates: MatchingGate[];
+  blocks_matching: string[];
+}
+
+export const fetchProfileFacts = () => load<ProfileFacts>('/agent/profile/facts');
+
+/**
+ * Record facts as USER_PROVIDED.
+ *
+ * A WRITE, so it is separate from the read helper above for the same reason `markNotification` is:
+ * merging them issues a GET and then a POST for one user action, and the read can fail
+ * independently of the write it was supposed to perform.
+ *
+ * The state is not sent - the server fixes it to USER_PROVIDED with the acting user as source. A
+ * body that could claim VERIFIED, or AI_INFERRED, would defeat the one guarantee the fact table
+ * exists for.
+ */
+export async function writeProfileFacts(
+  facts: Array<{ key: string; value: unknown; valid_until?: string | null }>,
+): Promise<AgentResult<ProfileFactsWriteResult>> {
+  try {
+    const response = await api.put('/agent/profile/facts', { facts });
+    return { ok: true, data: response.data };
+  } catch (error: any) {
+    const detail = error?.response?.data?.detail;
+    return {
+      ok: false,
+      error: typeof detail === 'string' ? detail : 'the profile could not be saved',
+    };
+  }
+}
+
 

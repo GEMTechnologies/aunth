@@ -1,0 +1,212 @@
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  MatchingGate,
+  ProfileFacts,
+  fetchProfileFacts,
+  writeProfileFacts,
+} from '../lib/agent';
+
+/**
+ * The facts the matcher is waiting on, and a field for each.
+ *
+ * WHY THIS EXISTS. The funding screen states plainly that "18 blocked matches would become decidable
+ * if you supplied country" and offers a button to the organisation profile. The profile page had no
+ * field for it: the backend has accepted `PUT /agent/profile/facts` since the intake was built, and
+ * the product never exposed it. An instruction with nowhere to act is worse than no instruction.
+ *
+ * THE FORM ONLY OFFERS WHAT THE MATCHER READS. The keys come from the server's own `matching_gates`,
+ * so a field cannot be added here that no gate consumes - the two cannot drift.
+ *
+ * NOTHING IS GUESSED. Every value is typed by a person and stored USER_PROVIDED with their id as
+ * source. The screen says so, because a fact the platform inferred could never be submitted and it
+ * would be dishonest to imply otherwise.
+ */
+
+const FIELD_LABELS: Record<string, { label: string; hint: string; type: string; placeholder: string }> = {
+  country: {
+    label: 'Country of registration',
+    hint: 'The country the organisation is legally registered in. Read by the country_eligible gate.',
+    type: 'text',
+    placeholder: 'e.g. Uganda',
+  },
+  registration_status: {
+    label: 'Registration status',
+    hint: 'ACTIVE if the registration is current. Read by the registration_valid gate.',
+    type: 'text',
+    placeholder: 'ACTIVE',
+  },
+  registration_valid_until: {
+    label: 'Registration valid until',
+    hint: 'The date the registration expires. Either this or the status is enough for the gate.',
+    type: 'date',
+    placeholder: '',
+  },
+};
+
+const OrganisationFactsCard: React.FC = () => {
+  const [data, setData] = useState<ProfileFacts | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState<string | null>(null);
+  const [rejected, setRejected] = useState<Array<{ key: string; reason: string }>>([]);
+
+  const load = useCallback(async () => {
+    setError(null);
+    const result = await fetchProfileFacts();
+    if (!result.ok) {
+      setData(null);
+      setError(result.error);
+      return;
+    }
+    setData(result.data);
+    const current: Record<string, string> = {};
+    for (const fact of result.data.facts) {
+      if (typeof fact.value === 'string') current[fact.key] = fact.value;
+    }
+    setDraft(current);
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // The gates the server says are undecidable; their required facts are the fields to show.
+  const gates: MatchingGate[] = data?.matching_gates ?? [];
+  const wanted = Array.from(new Set(gates.flatMap((gate) => gate.needs)));
+  const keys = wanted.length ? wanted : Object.keys(FIELD_LABELS).slice(0, 1);
+
+  const save = async () => {
+    const facts = keys
+      .map((key) => ({ key, value: (draft[key] ?? '').trim() }))
+      .filter((fact) => fact.value.length > 0)
+      .map((fact) => ({
+        key: fact.key,
+        value: fact.value,
+        valid_until: fact.key.endsWith('_until') ? fact.value : undefined,
+      }));
+
+    if (!facts.length) {
+      setRejected([{ key: keys[0] ?? 'profile', reason: 'nothing to save yet' }]);
+      return;
+    }
+
+    setSaving(true);
+    setSaved(null);
+    setRejected([]);
+    const result = await writeProfileFacts(facts);
+    setSaving(false);
+
+    if (!result.ok) {
+      setError(result.error);
+      return;
+    }
+    setRejected(result.data.rejected);
+    setSaved(
+      result.data.blocks_matching.length === 0
+        ? 'Saved. Every matching gate can now be decided.'
+        : `Saved. Still waiting on: ${result.data.blocks_matching.join(', ')}.`,
+    );
+    await load();
+  };
+
+  return (
+    <section
+      className="border border-gray-200 rounded-lg p-4 bg-white"
+      data-testid="profile-facts-card"
+    >
+      <header className="mb-3">
+        <h3 className="text-lg font-medium text-gray-900">Profile facts</h3>
+        <p className="text-sm text-gray-600 mt-1">
+          The matcher will not guess these. Until they are supplied, funding that depends on them
+          stays undecided — which is why the Funding screen reports matches as “needs data” rather
+          than making an offer it cannot support.
+        </p>
+      </header>
+
+      {error && (
+        <p className="text-sm text-red-700 mb-3" data-testid="facts-error">
+          {error}
+        </p>
+      )}
+
+      {!data && !error && <p className="text-sm text-gray-400">Loading…</p>}
+
+      {data && (
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+            {keys.map((key) => {
+              const meta = FIELD_LABELS[key] ?? {
+                label: key,
+                hint: 'Read by a matching gate.',
+                type: 'text',
+                placeholder: '',
+              };
+              const satisfied = gates.find((gate) => gate.satisfied_by.includes(key));
+              return (
+                <div key={key}>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    {meta.label}
+                    {satisfied && (
+                      <span className="ml-2 text-xs font-normal text-emerald-700">already supplied</span>
+                    )}
+                  </label>
+                  <input
+                    type={meta.type}
+                    value={draft[key] ?? ''}
+                    placeholder={meta.placeholder}
+                    onChange={(event) =>
+                      setDraft((current) => ({ ...current, [key]: event.target.value }))
+                    }
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    data-testid={`fact-${key}`}
+                  />
+                  <p className="text-xs text-gray-500 mt-1">{meta.hint}</p>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="flex items-center gap-3">
+            <button
+              onClick={save}
+              disabled={saving}
+              className="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 disabled:opacity-50"
+              data-testid="save-facts"
+            >
+              {saving ? 'Saving…' : 'Save facts'}
+            </button>
+            {saved && (
+              <p className="text-sm text-emerald-700" data-testid="facts-saved">
+                {saved}
+              </p>
+            )}
+          </div>
+
+          {rejected.length > 0 && (
+            <ul className="mt-3 text-sm text-amber-800" data-testid="facts-rejected">
+              {rejected.map((item) => (
+                <li key={item.key}>
+                  {item.key}: {item.reason}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {data.blocks_matching.length > 0 && (
+            <p className="mt-3 text-xs text-amber-800" data-testid="facts-blocking">
+              Matching is currently blocked on: {data.blocks_matching.join(', ')}.
+            </p>
+          )}
+
+          <p className="mt-3 text-xs text-gray-400">
+            Stored as supplied by you ({data.total} fact{data.total === 1 ? '' : 's'} on record). A
+            value the platform inferred would never be usable in a submission.
+          </p>
+        </>
+      )}
+    </section>
+  );
+};
+
+export default OrganisationFactsCard;
