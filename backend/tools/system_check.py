@@ -110,6 +110,62 @@ def _query(db, sql: str, *, many: bool = False):
         return None, f"{type(exc).__name__}: {str(exc).splitlines()[0]}"[:160]
 
 
+def _per_tenant(db, sql: str, *, many: bool = False):
+    """Sum/count a query across every organisation, binding one tenant at a time.
+
+    THE TOOL HAD THE BUG IT EXISTS TO CATCH. `jobs`, `agent_workflows` and `opportunity_matches`
+    are FORCE ROW LEVEL SECURITY. With no tenant bound, an unprivileged connection reads ZERO rows -
+    so the first version reported "no dead-lettered jobs", "no stranded workflows" and
+    "matched=0 needs_data=0" while the database held 112 matches. Three passes and a warning, all of
+    them describing the tool's blindness rather than the system's state.
+
+    That is precisely the failure mode this command was written to expose, so it is fixed the way the
+    fleet fixes it: read the roster from the one SECURITY DEFINER function that may answer it, then
+    bind each organisation and ask again.
+    """
+    from sqlalchemy import text
+
+    orgs, error = _query(db, "SELECT DISTINCT org_id FROM fleet_active_agent_ids()", many=True)
+    if error:
+        return None, error
+
+    if many:
+        totals: dict = {}
+        for (org_id,) in orgs or []:
+            try:
+                db.execute(
+                    text("SELECT set_config('app.current_org_id', :o, false)"), {"o": org_id}
+                )
+                for key, count in db.execute(text(sql)).all():
+                    totals[key] = totals.get(key, 0) + count
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                return None, f"{type(exc).__name__}: {str(exc).splitlines()[0]}"[:160]
+            finally:
+                try:
+                    db.execute(
+                        text("SELECT set_config('app.current_org_id', :o, false)"), {"o": ""}
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+        return list(totals.items()), None
+
+    total = 0
+    for (org_id,) in orgs or []:
+        try:
+            db.execute(text("SELECT set_config('app.current_org_id', :o, false)"), {"o": org_id})
+            total += db.execute(text(sql)).scalar() or 0
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            return None, f"{type(exc).__name__}: {str(exc).splitlines()[0]}"[:160]
+        finally:
+            try:
+                db.execute(text("SELECT set_config('app.current_org_id', :o, false)"), {"o": ""})
+            except Exception:  # noqa: BLE001
+                pass
+    return total, None
+
+
 # ---------------------------------------------------------------------------
 # Database checks
 # ---------------------------------------------------------------------------
@@ -123,7 +179,12 @@ def check_database(report: Report, db) -> None:
     now = datetime.now(timezone.utc)
 
     value, error = _query(db, "SELECT version_num FROM alembic_version")
-    if error:
+    if error and "permission denied" in error.lower():
+        # The runtime role deliberately cannot read alembic_version - that is a security decision,
+        # not a fault. Reported as SKIP with the reason, never as a pass.
+        report.add("schema at head", SKIP, "the runtime role cannot read alembic_version",
+                   "run this check from the migrate container or as the owner")
+    elif error:
         report.add("schema at head", FAIL, error, "run: docker compose up migrate")
     else:
         report.add("schema at head", PASS, f"alembic version {value}")
@@ -154,7 +215,7 @@ def check_database(report: Report, db) -> None:
         else:
             report.add("outbox drained", WARN, f"{pending} unpublished, recent")
 
-    dead, error = _query(db, "SELECT count(*) FROM jobs WHERE state = 'DEAD_LETTER'")
+    dead, error = _per_tenant(db, "SELECT count(*) FROM jobs WHERE state = 'DEAD_LETTER'")
     if error:
         report.add("no dead-lettered jobs", SKIP, error)
     else:
@@ -166,7 +227,7 @@ def check_database(report: Report, db) -> None:
 
     # A workflow in RUNNING with no running or queued job behind it is stranded: nothing
     # re-dispatches it, and it looks like work in progress for ever.
-    stranded, error = _query(db, """
+    stranded, error = _per_tenant(db, """
         SELECT count(*) FROM agent_workflows w
          WHERE w.state = 'RUNNING'
            AND NOT EXISTS (
@@ -199,7 +260,7 @@ def check_database(report: Report, db) -> None:
             report.add("funding catalogue", PASS,
                        f"{active} active, newest {age} old" if age else f"{active} active")
 
-    rows, error = _query(
+    rows, error = _per_tenant(
         db, "SELECT state, count(*) FROM opportunity_matches GROUP BY state", many=True
     )
     if error:
