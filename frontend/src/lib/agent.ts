@@ -346,6 +346,45 @@ export async function rejectDocument(id: string): Promise<AgentResult<{ approval
 }
 
 // ---------------------------------------------------------------------------
+// Asking the agent to register on the portal
+//
+// `POST /agent/portal/registration` has existed since the browser workflow was made reachable, and no
+// surface called it - so the mission's FIRST action, "go and register", had no button anywhere in the
+// product. A person could prepare and authorise everything and still have no way to say go.
+// ---------------------------------------------------------------------------
+
+export interface RegistrationStart {
+  workflow_id: string;
+  state: string;
+  opportunity_id: string;
+  application_id: string;
+  documents_workflow_id: string;
+  note: string;
+}
+
+/**
+ * Ask the agent to open the portal for this organisation.
+ *
+ * It never submits on this call: it queues the work. The browser stops before sending anything unless a
+ * package has been authorised by a person, which is a separate deliberate act.
+ */
+export async function startPortalRegistration(): Promise<AgentResult<RegistrationStart>> {
+  try {
+    const response = await api.post('/agent/portal/registration');
+    return { ok: true, data: response.data };
+  } catch (error: any) {
+    const detail = error?.response?.data?.detail;
+    return {
+      ok: false,
+      error:
+        typeof detail === 'string'
+          ? detail
+          : 'the registration task could not be queued',
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Authorising a package
 //
 // Authorisation approves a FINGERPRINT over the exact bytes that will be sent, and it is what permits

@@ -3,6 +3,7 @@ import React, { useState, useEffect } from 'react';
 import OrganisationFactsCard from '../components/OrganisationFactsCard';
 import DocumentsCard from '../components/DocumentsCard';
 import PackagesCard from '../components/PackagesCard';
+import PortalRegistrationCard from '../components/PortalRegistrationCard';
 import { api } from '../lib/api';
 
 interface User {
@@ -339,6 +340,11 @@ const OrganizationPage: React.FC<OrganizationPageProps> = ({ user }) => {
                       authorising the package is what permits the browser to submit. Until this card
                       existed the chain stopped one click from the portal. */}
                   <PackagesCard />
+
+                  {/* THE FIRST ACTION OF THE MISSION. Everything above prepares and authorises;
+                      this is the only control that says "go". It queues the work and never sends
+                      anything on its own. */}
+                  <PortalRegistrationCard />
                 </div>
               )}
 
