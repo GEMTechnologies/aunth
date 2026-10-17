@@ -1510,6 +1510,17 @@ class MailAccount(Base):
 
     CONNECTION_GRANADA_MANAGED = "GRANADA_MANAGED"
     CONNECTION_DELEGATED_OAUTH = "DELEGATED_OAUTH"
+    #: An external mailbox Granada READS over IMAP with credentials the organisation supplied.
+    #:
+    #: WHY THIS EXISTS. The product promised "organisations should also have the option of connecting
+    #: their existing Gmail or organisational email rather than using a Granada-managed address". The
+    #: IMAP provider, the credential store and the sync scheduler were all built; nothing created an
+    #: account, so `mail_accounts` stayed empty and the promise was unreachable.
+    #:
+    #: It is also the one path that does NOT depend on Cloudflare. A verification code arriving at the
+    #: organisation's own Gmail can be read by the sync sweep directly, which is why this connection
+    #: type matters beyond convenience.
+    CONNECTION_CONNECTED_IMAP = "CONNECTED_IMAP"
 
     CONNECTING = "CONNECTING"
     ACTIVE = "ACTIVE"

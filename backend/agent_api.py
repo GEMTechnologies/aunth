@@ -1308,6 +1308,134 @@ class MailboxSummary(BaseModel):
     last_message_at: Optional[str] = None
 
 
+class ConnectMailboxRequest(BaseModel):
+    """Connect an external mailbox the organisation already owns.
+
+    THE PASSWORD IS NEVER STORED IN A COLUMN. It goes into the encrypted credential store and only a
+    reference reaches `mail_accounts.credentials_ref`, which is how the mail schema was designed - the
+    table has no column that could hold a password, so the rule is enforced by shape rather than by
+    discipline.
+    """
+
+    address: str = Field(min_length=3, max_length=320, description="The mailbox address, e.g. ngo@gmail.com")
+    imap_host: str = Field(min_length=1, max_length=255, description="e.g. imap.gmail.com")
+    imap_port: int = Field(default=993, ge=1, le=65535)
+    imap_user: str = Field(min_length=1, max_length=320)
+    imap_password: str = Field(min_length=1, max_length=1024, description="An app password, not the account password")
+    use_ssl: bool = True
+    display_name: Optional[str] = Field(default=None, max_length=200)
+
+
+@router.post(
+    "/mail/accounts",
+    status_code=status.HTTP_201_CREATED,
+    summary="Connect an existing mailbox over IMAP",
+)
+def connect_mailbox(
+    payload: ConnectMailboxRequest,
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Register the organisation's OWN mailbox so Granada can read from it.
+
+    WHY THIS MATTERS BEYOND CONVENIENCE. Until now the only way mail reached Granada was a Cloudflare
+    Email Worker on a Granada-managed address. An organisation that already has Gmail - which is most
+    of them - had no path at all, and a verification code sent to their own inbox was invisible. With
+    an IMAP account registered, the sync sweep reads that inbox directly and the code is found by the
+    same verification engine. It is the one route to a completed portal signup that does not depend on
+    DNS or on a Cloudflare account.
+    """
+    import uuid as _uuid
+
+    from agent.credential_store import store_from_settings
+    from config import settings
+
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    allowed, reason = has_permission(
+        db, org_id=org_id, user_id=user.id, permission=PROFILE_WRITE_PERMISSION
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"you may not change this organisation's mailboxes: {reason}",
+        )
+
+    agent = _agent_for(db, org_id)
+    if agent is None:
+        # Named rather than guessed: a mailbox belongs to an agent, and an organisation without one
+        # cannot own mail. Organisation creation provisions the agent, so this means it was lost.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="this organisation has no Granada agent yet, so it cannot own a mailbox",
+        )
+
+    address = (payload.address or "").strip().lower()
+    if "@" not in address:
+        raise HTTPException(status_code=400, detail="the address is not an email address")
+
+    existing = (
+        db.query(models.MailAccount)
+        .filter(models.MailAccount.org_id == org_id, models.MailAccount.address == address)
+        .first()
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"{address} is already connected to this organisation",
+        )
+
+    account_id = str(_uuid.uuid4())
+    ref = f"mail/imap/{account_id}"
+    try:
+        store = store_from_settings(db, settings)
+        store.put(
+            org_id=org_id,
+            ref=ref,
+            payload={
+                "host": payload.imap_host.strip(),
+                "port": int(payload.imap_port),
+                "username": payload.imap_user.strip(),
+                "password": payload.imap_password,
+                "ssl": bool(payload.use_ssl),
+            },
+            kind=models.CredentialSecret.KIND_IMAP_PASSWORD,
+            note=f"IMAP credentials for {address}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        # A store that cannot encrypt means no credential, and a mailbox registered without one would
+        # look connected and fetch nothing. Refuse instead.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"the credential store is unavailable, so nothing was saved: {type(exc).__name__}",
+        ) from exc
+
+    service = GranadaMail(db, org_id=org_id, agent_id=str(agent.id))
+    account = service.add_account(
+        provider="imap",
+        provider_account_id=address,
+        address=address,
+        connection_type=models.MailAccount.CONNECTION_CONNECTED_IMAP,
+        display_name=payload.display_name,
+        credentials_ref=ref,
+    )
+    db.commit()
+
+    return {
+        "id": account.id,
+        "address": account.address,
+        "provider": account.provider,
+        "connection_type": account.connection_type,
+        "status": account.status,
+        "note": (
+            "The mailbox is registered. Granada reads it on the sync sweep; the password is stored "
+            "encrypted and only its reference is kept on the account."
+        ),
+    }
+
+
 class MailMessageSummary(BaseModel):
     id: str
     mailbox_id: Optional[str]

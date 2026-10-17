@@ -2039,12 +2039,21 @@ class GranadaMail:
         self.db.add(account)
         self.db.flush()
 
-        if connection_type == models.MailAccount.CONNECTION_GRANADA_MANAGED:
+        if connection_type in (
+            models.MailAccount.CONNECTION_GRANADA_MANAGED,
+            models.MailAccount.CONNECTION_CONNECTED_IMAP,
+        ):
             # A managed Granada address IS an identity, and creating one here is
             # what makes the global uniqueness of managed addresses real: the
             # constraint lives on mail_identities, so an account without a matching
             # identity would leave the guarantee unenforced. Two organisations
             # claiming warchild@granada.com is the mis-delivery failure.
+            #
+            # A CONNECTED mailbox needs one for a different reason: inbound routing resolves a
+            # recipient address to an organisation through `mail_routing`, which is kept in sync from
+            # `mail_identities`. Without the identity, mail pulled from the organisation's own Gmail
+            # would arrive with no mailbox to file it under - the merge this column exists to prevent.
+            is_managed = connection_type == models.MailAccount.CONNECTION_GRANADA_MANAGED
             self.db.add(
                 models.MailIdentity(
                     id=str(uuid.uuid4()),
@@ -2053,8 +2062,14 @@ class GranadaMail:
                     mail_account_id=account.id,
                     address=address.lower(),
                     display_name=display_name,
-                    identity_type=models.MailIdentity.TYPE_MANAGED,
-                    is_primary=True,
+                    identity_type=(
+                        models.MailIdentity.TYPE_MANAGED
+                        if is_managed
+                        else models.MailIdentity.TYPE_CONNECTED
+                    ),
+                    # Only a Granada-managed address is the organisation's PUBLIC address. An external
+                    # mailbox the organisation already owns must not silently replace it.
+                    is_primary=is_managed,
                     status=models.MailIdentity.ACTIVE,
                     created_at=_now(),
                 )
