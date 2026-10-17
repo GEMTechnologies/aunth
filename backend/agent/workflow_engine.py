@@ -2528,6 +2528,27 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
         for p in problems if isinstance(p, dict)
     )
 
+    # READ THE PAGES THE RUN CAPTURED. The screenshots were stored and nothing ever looked at them;
+    # `perception.read_page_with_vision` was written, tested, and called by nothing. Doing it here
+    # rather than in the worker is forced by the security boundary: the worker gets neither a DSN nor
+    # a model key, because it runs hostile page content, and a callable cannot cross a process.
+    #
+    # It cannot fail the run. The run has already happened and the screenshots are the record of it;
+    # losing the record because a model was unavailable would be worse than having no reading.
+    vision_record = None
+    try:
+        from agent.evidence_vision import read_screenshots, summary as vision_summary
+
+        evidence_paths = [str(p) for p in (getattr(outcome, "evidence", None) or []) if str(p)]
+        if evidence_paths:
+            vision_record = vision_summary(
+                read_screenshots(
+                    db=db, org_id=str(agent.org_id), paths=evidence_paths, limit=4
+                )
+            )
+    except Exception as exc:  # noqa: BLE001 - a reading must never fail a run that already happened
+        vision_record = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+
     return {
         "summary": _browser_summary(outcome),
         "summary_key": f"browser.{outcome.status.lower()}",
@@ -2557,6 +2578,10 @@ def _handle_browser_task(db: Session, context: dict[str, Any]) -> dict[str, Any]
             "final_title": getattr(outcome, "final_title", None),
             "trace": list(getattr(outcome, "trace", None) or []),
             "evidence": list(getattr(outcome, "evidence", None) or []),
+            # What a vision model READ off those screenshots. VISION-channel values only, so none of
+            # this can become an organisational fact - a scanned certificate proves a certificate
+            # exists, it does not prove the number on it.
+            "vision": vision_record,
             "problems": problems,
             "goal": getattr(task, "goal", None),
         },
