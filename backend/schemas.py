@@ -171,8 +171,24 @@ class SetContextRequest(BaseModel):
     context: UserContextResponse
 
 class ContextResolutionResponse(BaseModel):
-    redirect_url: str
-    context: Optional[UserContextResponse] = None
+    """Where the client should send the user next.
+
+    ALIGNED WITH WHAT THE SERVICE ACTUALLY RETURNS, which it never was: this model demanded a
+    required `redirect_url` while `ContextService.resolve_landing_context` returns `action`/`url`/
+    `context`/`contexts`. FastAPI validates the response against the model, so the mismatch was a
+    second route to the same 500 - and the client's own `ContextRouter` switches on `action`, so the
+    declared contract disagreed with both ends of the wire.
+
+    `action` is the discriminator: redirect | show_picker | show_product_picker | onboarding.
+    """
+
+    action: str = Field(..., description="redirect | show_picker | show_product_picker | onboarding")
+    url: Optional[str] = Field(default=None, description="Where to send the user, for action=redirect")
+    #: Retained so an older client that reads `redirect_url` keeps working.
+    redirect_url: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
+    contexts: Optional[List[Dict[str, Any]]] = None
+    product: Optional[str] = None
 
 class RegisterWithIntentRequest(BaseModel):
     email: EmailStr

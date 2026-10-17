@@ -1,5 +1,6 @@
 
 from typing import Optional, List, Dict, Any
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 import logging
@@ -11,42 +12,145 @@ logger = logging.getLogger(__name__)
 
 class ContextService:
     """Service for managing user contexts and routing logic"""
+
+    @staticmethod
+    def _bind_tenant(db: Session, org_id: str) -> None:
+        """Set (or clear) the row-level-security tenant, where the engine supports it.
+
+        A no-op on SQLite, which has neither `set_config` nor row-level security. Checked by dialect
+        rather than wrapped in try/except: an exception-driven skip made the organisation lookup fail
+        silently in tests and left the context without its slug - a missing field that looked like a
+        mapping bug rather than an unsupported call.
+        """
+        try:
+            dialect = getattr(getattr(db, "bind", None), "dialect", None)
+            if dialect is None or dialect.name != "postgresql":
+                return
+            db.execute(
+                text("SELECT set_config('app.current_org_id', :org, false)"), {"org": org_id}
+            )
+        except Exception:  # noqa: BLE001 - a missing binding must not stop resolution
+            logger.debug("context_bind_failed", extra={"org_id": org_id})
+
     
     @staticmethod
     def get_user_contexts(db: Session, user_id: str) -> Dict[str, Any]:
-        """Get all available contexts for a user"""
+        """Every workspace this user can enter, derived from REAL membership.
+
+        WHY THIS NO LONGER READS `user_contexts`. That table is populated by nothing - measured on
+        production: **0 rows**, while `org_members` held the actual membership and
+        `organisations.owner_user_id` named the owner. So every user resolved to zero contexts, and
+        `resolve_landing_context` raised a 500 that the client renders as "Something went wrong".
+        Sign-up worked, sign-in worked, and the product was unreachable for everybody - including the
+        organisation's owner.
+
+        THE ROSTER IS A CROSS-TENANT QUESTION, so it is asked of the one narrow SECURITY DEFINER
+        function that answers exactly it: "which organisations does this user belong to". Asking
+        `organisations` directly returns nothing, because RLS has no tenant bound yet - asking the
+        question is what the binding would be derived from.
+
+        Any rows that DO exist in `user_contexts` are still honoured and merged, so a deployment that
+        uses that table keeps working.
+        """
         user = db.query(models.User).filter(models.User.id == user_id).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        
-        # Get all active contexts
-        contexts = db.query(models.UserContext).filter(
-            models.UserContext.user_id == user_id,
-            models.UserContext.is_active == True
-        ).all()
-        
-        # Build context list
-        context_list = []
-        for ctx in contexts:
-            context_data = {
-                "type": ctx.context_type,
-                "product": ctx.product,
-                "role": ctx.role
+
+        context_list: List[Dict[str, Any]] = []
+        seen_orgs: set = set()
+
+        try:
+            rows = db.execute(
+                text("SELECT app.user_org_ids(:uid)"), {"uid": user_id}
+            ).all()
+        except Exception:  # noqa: BLE001 - resolution must not 500 on a missing helper
+            logger.warning("context_roster_unavailable", extra={"user_id": user_id})
+            rows = []
+
+        if not rows:
+            # FALLBACK, and it can only ADD contexts - never contradict the privileged answer.
+            #
+            # Two reasons it is needed. The test suite runs on SQLite, which has no
+            # `app.user_org_ids`; and a deployment whose helper is missing would otherwise resolve
+            # every user to onboarding, which is the bug this method exists to fix. A direct read may
+            # be filtered by RLS, so it is consulted only when the privileged answer is empty.
+            try:
+                owned = [
+                    org.id
+                    for org in db.query(models.Organisation)
+                    .filter(models.Organisation.owner_user_id == user_id)
+                    .all()
+                ]
+                member = [
+                    m.org_id
+                    for m in db.query(models.OrgMember)
+                    .filter(models.OrgMember.user_id == user_id)
+                    .all()
+                ]
+                rows = [(org_id,) for org_id in dict.fromkeys(owned + member) if org_id]
+            except Exception:  # noqa: BLE001
+                rows = []
+
+        for row in rows:
+            org_id = str(row[0]) if row and row[0] else None
+            if not org_id or org_id in seen_orgs:
+                continue
+            seen_orgs.add(org_id)
+
+            # Bind so the organisation row itself is readable, then clear it immediately. A leaked
+            # binding would let the next organisation's details resolve under this one's context.
+            #
+            # BINDING IS POSTGRES-ONLY, and checked rather than attempted. `set_config` does not
+            # exist on SQLite, so a try/except around it silently skipped the organisation lookup in
+            # every test - the context still resolved, but without a slug or a name, and the failure
+            # looked like a missing field rather than an unsupported call.
+            org = None
+            try:
+                ContextService._bind_tenant(db, org_id)
+                org = (
+                    db.query(models.Organisation)
+                    .filter(models.Organisation.id == org_id)
+                    .first()
+                )
+            except Exception:  # noqa: BLE001 - the id alone is still a usable context
+                org = None
+            finally:
+                ContextService._bind_tenant(db, "")
+
+            context: Dict[str, Any] = {
+                "type": "org",
+                "product": "ngos",
+                "org_id": org_id,
+                # The owner of the organisation is the one authority that cannot be revoked by
+                # deleting a membership row.
+                "role": "owner" if (org is not None and org.owner_user_id == user_id) else "member",
             }
-            
+            if org is not None:
+                context["org_slug"] = org.slug
+                context["org_name"] = org.name
+            context_list.append(context)
+
+        # Legacy contexts, still honoured.
+        for ctx in db.query(models.UserContext).filter(
+            models.UserContext.user_id == user_id,
+            models.UserContext.is_active == True,  # noqa: E712 - SQL comparison, not Python truth
+        ).all():
+            if ctx.org_id and str(ctx.org_id) in seen_orgs:
+                continue
+            data = {"type": ctx.context_type, "product": ctx.product, "role": ctx.role}
             if ctx.org_id:
-                context_data["org_id"] = ctx.org_id
+                data["org_id"] = ctx.org_id
                 if ctx.organisation:
-                    context_data["org_slug"] = ctx.organisation.slug
-                    context_data["org_name"] = ctx.organisation.name
-            
-            context_list.append(context_data)
-        
+                    data["org_slug"] = ctx.organisation.slug
+                    data["org_name"] = ctx.organisation.name
+                seen_orgs.add(str(ctx.org_id))
+            context_list.append(data)
+
         return {
             "last_active_context": user.last_active_context,
-            "contexts": context_list
+            "contexts": context_list,
         }
-    
+
     @staticmethod
     def set_last_active_context(db: Session, user_id: str, context: Dict[str, Any]) -> None:
         """Set user's last active context"""
@@ -125,8 +229,15 @@ class ContextService:
         if len(meta["contexts"]) > 1:
             return {"action": "show_picker", "contexts": meta["contexts"]}
         
-        # E) No contexts - should not happen for registered users
-        raise HTTPException(status_code=500, detail="User has no available contexts")
+        # E) No contexts. A NEWLY REGISTERED USER IS EXACTLY THIS, so raising 500 here made the
+        #    product unreachable for every account that had not yet created or joined an
+        #    organisation - which is every account, immediately after signing up. The comment that
+        #    used to sit here ("should not happen for registered users") was the assumption that
+        #    broke it.
+        #
+        #    Onboarding is a legitimate state, not an error: the client shows "set up your
+        #    workspace" and offers to create the organisation.
+        return {"action": "onboarding", "contexts": [], "url": None}
     
     @staticmethod
     def _subdomain_to_product(host: Optional[str]) -> Optional[str]:
