@@ -110,18 +110,22 @@ def _query(db, sql: str, *, many: bool = False):
         return None, f"{type(exc).__name__}: {str(exc).splitlines()[0]}"[:160]
 
 
-def _per_tenant(db, sql: str, *, many: bool = False):
-    """Sum/count a query across every organisation, binding one tenant at a time.
+def _per_tenant(db, sql: str, *, many: bool = False, combine: str = "sum"):
+    """Aggregate a query across every organisation, binding one tenant at a time.
 
-    THE TOOL HAD THE BUG IT EXISTS TO CATCH. `jobs`, `agent_workflows` and `opportunity_matches`
-    are FORCE ROW LEVEL SECURITY. With no tenant bound, an unprivileged connection reads ZERO rows -
-    so the first version reported "no dead-lettered jobs", "no stranded workflows" and
-    "matched=0 needs_data=0" while the database held 112 matches. Three passes and a warning, all of
-    them describing the tool's blindness rather than the system's state.
+    THE TOOL HAD THE BUG IT EXISTS TO CATCH, TWICE. `jobs`, `agent_workflows`, `opportunity_matches`
+    and `outbox_events` are all row-level-secured. With no tenant bound, an unprivileged connection
+    reads ZERO rows - so the first version reported "no dead-lettered jobs", "no stranded workflows"
+    and "matched=0 needs_data=0" while the database held 112 matches; and the outbox check went on
+    reporting "no unpublished events" for a table holding 3862 published rows, because
+    `max(published_at)` is NULL over an empty visible set.
 
     That is precisely the failure mode this command was written to expose, so it is fixed the way the
     fleet fixes it: read the roster from the one SECURITY DEFINER function that may answer it, then
     bind each organisation and ask again.
+
+    ``combine`` is "sum" for counts and "min"/"max" for timestamps: adding two timestamps is
+    meaningless, and the first version of this helper only knew how to count.
     """
     from sqlalchemy import text
 
@@ -150,11 +154,11 @@ def _per_tenant(db, sql: str, *, many: bool = False):
                     pass
         return list(totals.items()), None
 
-    total = 0
+    collected = []
     for (org_id,) in orgs or []:
         try:
             db.execute(text("SELECT set_config('app.current_org_id', :o, false)"), {"o": org_id})
-            total += db.execute(text(sql)).scalar() or 0
+            collected.append(db.execute(text(sql)).scalar())
         except Exception as exc:  # noqa: BLE001
             db.rollback()
             return None, f"{type(exc).__name__}: {str(exc).splitlines()[0]}"[:160]
@@ -163,7 +167,15 @@ def _per_tenant(db, sql: str, *, many: bool = False):
                 db.execute(text("SELECT set_config('app.current_org_id', :o, false)"), {"o": ""})
             except Exception:  # noqa: BLE001
                 pass
-    return total, None
+
+    present = [value for value in collected if value is not None]
+    if not present:
+        return None, None
+    if combine == "max":
+        return max(present), None
+    if combine == "min":
+        return min(present), None
+    return sum(present), None
 
 
 # ---------------------------------------------------------------------------
@@ -201,13 +213,19 @@ def check_database(report: Report, db) -> None:
     else:
         report.add("fleet can resolve its roster", PASS, f"{roster} active agent(s) visible")
 
-    pending, error = _query(db, "SELECT count(*) FROM outbox_events WHERE published_at IS NULL")
-    oldest, _ = _query(db, "SELECT min(created_at) FROM outbox_events WHERE published_at IS NULL")
-    # "PENDING = 0" ALONE CANNOT DISTINGUISH A WORKING RELAY FROM A DEAD ONE. An idle system and a
-    # relay that has published nothing for a week both report zero, so the age of the last successful
-    # publish is reported alongside it. It is information, not a grade: a genuinely quiet system is
-    # not a fault, and warning on it would be the crying-wolf failure this tool is meant to avoid.
-    newest_published, _ = _query(db, "SELECT max(published_at) FROM outbox_events")
+    pending, error = _per_tenant(
+        db, "SELECT count(*) FROM outbox_events WHERE published_at IS NULL"
+    )
+    oldest, _ = _per_tenant(
+        db, "SELECT min(created_at) FROM outbox_events WHERE published_at IS NULL",
+        combine="min",
+    )
+    # "PENDING = 0" ALONE CANNOT DISTINGUISH A WORKING RELAY FROM A DEAD ONE, and until this used
+    # _per_tenant it could not distinguish anything at all: outbox_events is row-level-secured, so an
+    # unbound read returned no rows and `max(published_at)` was NULL over 3862 published events.
+    # The age of the last successful publish is reported alongside, as information rather than a
+    # grade - a genuinely quiet system is not a fault, and warning on it would be crying wolf.
+    newest_published, _ = _per_tenant(db, "SELECT max(published_at) FROM outbox_events", combine="max")
     last_published = _age(now, newest_published)
     if error:
         report.add("outbox drained", SKIP, error)
