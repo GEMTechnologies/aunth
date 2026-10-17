@@ -22,10 +22,11 @@ on the fact of having received something.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -38,6 +39,17 @@ logger = logging.getLogger(__name__)
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _truthy(value: Optional[str], *, default: bool = False) -> bool:
+    """Parse a flag from the environment, so an unset variable is not silently False.
+
+    Mirrors `agent.fleet_runner._truthy` deliberately: the two processes read one migration flag,
+    and two implementations of "is this on" is how they end up disagreeing.
+    """
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class OutboxRelay:
@@ -179,10 +191,20 @@ class OutboxRelay:
             # batch, but a failed publish changes nothing except the counters -
             # and those are exactly what must survive.
             self.db.commit()
-            logger.warning(
-                "outbox.relay.nothing_published",
-                extra={"pending": len(self.pending())},
-            )
+            # SEVERITY FOLLOWS THE FACT. "Nothing to publish" is the normal state of a healthy
+            # system and belongs at DEBUG; logging it at WARNING every five seconds fills an
+            # operator's warning filter with non-problems until they stop reading it - which is how
+            # the 1089 stuck events went unnoticed in the first place.
+            #
+            # "Pending rows exist but none of them published" is the opposite: a real fault, and it
+            # stays at WARNING.
+            remaining = len(self.pending())
+            if remaining:
+                logger.warning(
+                    "outbox.relay.nothing_published", extra={"pending": remaining}
+                )
+            else:
+                logger.debug("outbox.relay.idle")
         return published
 
     def _fields(self, event: models.OutboxEvent) -> dict[str, Any]:
@@ -350,8 +372,63 @@ class OutboxRelayRunner:
         self.publisher = publisher or RedisEventPublisher()
         self.interval_seconds = max(0.5, float(interval_seconds))
         self.batch_size = batch_size
+
+        #: ADR-0011 STEP 2, READ FROM THE SAME VARIABLE THE FLEET READS.
+        #:
+        #: This module's header says the relay "runs as the owner against an ENABLE-only table", and
+        #: that was true when it was written. ADR-0011 then revoked `granada_fleet`'s BYPASSRLS, and
+        #: the relay kept connecting as the fleet role with no tenant binding - so `outbox_events`
+        #: returned ZERO rows and the relay published nothing while reporting `pending: 0`.
+        #:
+        #: Measured on production: 1089 unpublished events, ALL with `attempts = 0` (never even
+        #: tried), the oldest seven days old, and a relay logging `nothing_published pending: 0`
+        #: every five seconds. The health line was the defect: it re-ran the same blind query and
+        #: reported its own blindness as calm.
+        #:
+        #: Two readers of one flag is a smell; two flags for one migration would be worse, which is
+        #: why this is `FLEET_TENANT_BINDING` and not a second variable.
+        self.use_tenant_binding = _truthy(os.environ.get("FLEET_TENANT_BINDING"), default=False)
+
         self.health = RelayHealth()
         self._stop = threading.Event()
+
+    def _orgs_with_work(self, db: Session) -> list[str]:
+        """The organisations to drain one at a time, when bound.
+
+        The roster is the one legitimate cross-tenant read: "which organisations exist" cannot be
+        answered from inside any single tenant. `fleet_active_agent_ids()` is a SECURITY DEFINER
+        function granted to the fleet role for exactly this, and it returns ids only - never row
+        content.
+        """
+        return [
+            str(row[0])
+            for row in db.execute(text("SELECT DISTINCT org_id FROM fleet_active_agent_ids()"))
+        ]
+
+    def _bind(self, db: Session, org_id: str) -> None:
+        db.execute(
+            text("SELECT set_config('app.current_org_id', :org, false)"), {"org": org_id}
+        )
+
+    def _drain_per_tenant(self, db: Session) -> int:
+        """Drain every organisation's outbox, one tenant at a time.
+
+        A drain COMMITS, and the pool resets the binding on return, so the binding is re-applied
+        before each organisation rather than once per sweep - otherwise the second organisation
+        onwards would run unbound and see nothing, which is the same blindness in a smaller form.
+        """
+        published = 0
+        for org_id in self._orgs_with_work(db):
+            self._bind(db, org_id)
+            try:
+                published += OutboxRelay(
+                    db, self.publisher, batch_size=self.batch_size
+                ).drain_once()
+            finally:
+                # Cleared after EVERY organisation, including on failure: a leaked binding would
+                # drain the next organisation's outbox under this one's context.
+                self._bind(db, "")
+        return published
 
     def sweep_once(self) -> int:
         """One drain in its own session and transaction.
@@ -364,8 +441,12 @@ class OutboxRelayRunner:
         db = None
         try:
             db = self.session_factory()
-            relay = OutboxRelay(db, self.publisher, batch_size=self.batch_size)
-            published = relay.drain_once()   # commits the bookkeeping itself
+            if self.use_tenant_binding:
+                # BOUND: one organisation at a time, because the fleet role no longer carries
+                # BYPASSRLS. Without this the SELECT returns zero rows and the relay reports calm.
+                published = self._drain_per_tenant(db)
+            else:
+                published = OutboxRelay(db, self.publisher, batch_size=self.batch_size).drain_once()
             self.health.sweeps += 1
             self.health.published += published
             self.health.consecutive_empty = 0 if published else self.health.consecutive_empty + 1
