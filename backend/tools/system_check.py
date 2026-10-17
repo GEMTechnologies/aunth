@@ -203,10 +203,20 @@ def check_database(report: Report, db) -> None:
 
     pending, error = _query(db, "SELECT count(*) FROM outbox_events WHERE published_at IS NULL")
     oldest, _ = _query(db, "SELECT min(created_at) FROM outbox_events WHERE published_at IS NULL")
+    # "PENDING = 0" ALONE CANNOT DISTINGUISH A WORKING RELAY FROM A DEAD ONE. An idle system and a
+    # relay that has published nothing for a week both report zero, so the age of the last successful
+    # publish is reported alongside it. It is information, not a grade: a genuinely quiet system is
+    # not a fault, and warning on it would be the crying-wolf failure this tool is meant to avoid.
+    newest_published, _ = _query(db, "SELECT max(published_at) FROM outbox_events")
+    last_published = _age(now, newest_published)
     if error:
         report.add("outbox drained", SKIP, error)
     elif not pending:
-        report.add("outbox drained", PASS, "no unpublished events")
+        report.add(
+            "outbox drained", PASS,
+            "no unpublished events"
+            + (f"; last publish {last_published} ago" if last_published else ""),
+        )
     else:
         age = _age(now, oldest)
         if age and age > timedelta(minutes=15):
