@@ -85,146 +85,163 @@ def _age(now: datetime, then: datetime | None) -> timedelta | None:
     return now - then
 
 
+def _query(db, sql: str, *, many: bool = False):
+    """Run one read-only query, returning ``(value, error)``.
+
+    A FAILED STATEMENT POISONS THE TRANSACTION. PostgreSQL aborts the whole transaction on any error,
+    so every subsequent query returns ``InFailedSqlTransaction`` - and the first version of this tool
+    reported seven unrelated SKIPs because ONE check had failed. The symptom named the wrong checks:
+    a permission problem on the roster made the outbox, the workflows and the catalogue all look
+    unmeasurable.
+
+    So every check rolls back on failure and stands on its own. Read-only, so discarding the
+    transaction costs nothing.
+    """
+    from sqlalchemy import text
+
+    try:
+        result = db.execute(text(sql))
+        return (result.all() if many else result.scalar()), None
+    except Exception as exc:  # noqa: BLE001
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001 - nothing left to roll back
+            pass
+        return None, f"{type(exc).__name__}: {str(exc).splitlines()[0]}"[:160]
+
+
 # ---------------------------------------------------------------------------
 # Database checks
 # ---------------------------------------------------------------------------
 def check_database(report: Report, db) -> None:
-    from sqlalchemy import text
+    """Every check stands alone.
 
-    # --- schema at head -----------------------------------------------------
-    try:
-        head = db.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        report.add("schema at head", PASS, f"alembic version {head}")
-    except Exception as exc:  # noqa: BLE001
-        report.add("schema at head", FAIL, f"{type(exc).__name__}: {exc}"[:160],
-                   "run: docker compose up migrate")
+    A failed statement aborts the PostgreSQL transaction, so one failure used to make every later
+    check report ``InFailedSqlTransaction`` - naming seven wrong problems. `_query` rolls back on
+    failure, so each check survives its neighbours.
+    """
+    now = datetime.now(timezone.utc)
 
-    # --- the fleet role can actually see its roster -------------------------
+    value, error = _query(db, "SELECT version_num FROM alembic_version")
+    if error:
+        report.add("schema at head", FAIL, error, "run: docker compose up migrate")
+    else:
+        report.add("schema at head", PASS, f"alembic version {value}")
+
     # A revoked BYPASSRLS with an unbound sweep is the defect that killed the fleet: every query
     # returned zero rows and reported success.
-    try:
-        roster = db.execute(text("SELECT count(*) FROM fleet_active_agent_ids()")).scalar()
-        report.add(
-            "fleet can resolve its roster", PASS if roster else FAIL,
-            f"{roster} active agent(s) visible to the fleet role",
-            "if 0, the fleet role cannot see the roster and every sweep is blind",
-        )
-    except Exception as exc:  # noqa: BLE001
-        report.add("fleet can resolve its roster", FAIL, f"{type(exc).__name__}: {exc}"[:160])
+    roster, error = _query(db, "SELECT count(*) FROM fleet_active_agent_ids()")
+    if error:
+        report.add("fleet can resolve its roster", FAIL, error,
+                   "the fleet role cannot read the roster; every sweep would be blind")
+    elif not roster:
+        report.add("fleet can resolve its roster", FAIL, "0 active agents",
+                   "the fleet role cannot see the roster and every sweep is blind")
+    else:
+        report.add("fleet can resolve its roster", PASS, f"{roster} active agent(s) visible")
 
-    # --- outbox drained -----------------------------------------------------
-    try:
-        pending = db.execute(
-            text("SELECT count(*) FROM outbox_events WHERE published_at IS NULL")
-        ).scalar()
-        oldest = db.execute(
-            text("SELECT min(created_at) FROM outbox_events WHERE published_at IS NULL")
-        ).scalar()
-        age = _age(datetime.now(timezone.utc), oldest)
-        if not pending:
-            report.add("outbox drained", PASS, "no unpublished events")
-        elif age and age > timedelta(minutes=15):
-            report.add(
-                "outbox drained", FAIL,
-                f"{pending} unpublished, oldest {age} old",
-                "the relay is not publishing; check its tenant binding and role",
-            )
+    pending, error = _query(db, "SELECT count(*) FROM outbox_events WHERE published_at IS NULL")
+    oldest, _ = _query(db, "SELECT min(created_at) FROM outbox_events WHERE published_at IS NULL")
+    if error:
+        report.add("outbox drained", SKIP, error)
+    elif not pending:
+        report.add("outbox drained", PASS, "no unpublished events")
+    else:
+        age = _age(now, oldest)
+        if age and age > timedelta(minutes=15):
+            report.add("outbox drained", FAIL, f"{pending} unpublished, oldest {age} old",
+                       "the relay is not publishing; check its tenant binding and role")
         else:
             report.add("outbox drained", WARN, f"{pending} unpublished, recent")
-    except Exception as exc:  # noqa: BLE001
-        report.add("outbox drained", SKIP, f"{type(exc).__name__}: {exc}"[:160])
 
-    # --- no dead-lettered jobs ---------------------------------------------
-    try:
-        dead = db.execute(
-            text("SELECT count(*) FROM jobs WHERE state = 'DEAD_LETTER'")
-        ).scalar()
+    dead, error = _query(db, "SELECT count(*) FROM jobs WHERE state = 'DEAD_LETTER'")
+    if error:
+        report.add("no dead-lettered jobs", SKIP, error)
+    else:
         report.add(
             "no dead-lettered jobs", PASS if not dead else WARN,
             f"{dead} dead-lettered" if dead else "none",
             "inspect reasons before requeueing; a dead letter is a real failure, not noise",
         )
-    except Exception as exc:  # noqa: BLE001
-        report.add("no dead-lettered jobs", SKIP, f"{type(exc).__name__}: {exc}"[:160])
 
-    # --- no stranded workflows ---------------------------------------------
     # A workflow in RUNNING with no running or queued job behind it is stranded: nothing
     # re-dispatches it, and it looks like work in progress for ever.
-    try:
-        stranded = db.execute(text("""
-            SELECT count(*) FROM agent_workflows w
-             WHERE w.state = 'RUNNING'
-               AND NOT EXISTS (
-                   SELECT 1 FROM jobs j
-                    WHERE j.workflow_id = w.id AND j.state IN ('RUNNING', 'QUEUED')
-               )
-        """)).scalar()
+    stranded, error = _query(db, """
+        SELECT count(*) FROM agent_workflows w
+         WHERE w.state = 'RUNNING'
+           AND NOT EXISTS (
+               SELECT 1 FROM jobs j
+                WHERE j.workflow_id = w.id AND j.state IN ('RUNNING', 'QUEUED')
+           )
+    """)
+    if error:
+        report.add("no stranded workflows", SKIP, error)
+    else:
         report.add(
             "no stranded workflows", PASS if not stranded else FAIL,
             f"{stranded} RUNNING with no job behind them" if stranded else "none",
             "a dead-lettered job must close its workflow; see AgentWorker.execute",
         )
-    except Exception as exc:  # noqa: BLE001
-        report.add("no stranded workflows", SKIP, f"{type(exc).__name__}: {exc}"[:160])
 
-    # --- funding catalogue --------------------------------------------------
-    try:
-        active = db.execute(
-            text("SELECT count(*) FROM opportunities WHERE is_active")
-        ).scalar()
-        newest = db.execute(
-            text("SELECT max(created_at) FROM opportunities WHERE is_active")
-        ).scalar()
-        age = _age(datetime.now(timezone.utc), newest)
+    active, error = _query(db, "SELECT count(*) FROM opportunities WHERE is_active")
+    newest, _ = _query(db, "SELECT max(created_at) FROM opportunities WHERE is_active")
+    if error:
+        report.add("funding catalogue", SKIP, error)
+    else:
+        age = _age(now, newest)
         if not active:
             report.add("funding catalogue", FAIL, "no active opportunities",
                        "the discovery sweep is not producing anything")
         elif age and age > timedelta(days=3):
-            report.add("funding catalogue", WARN,
-                       f"{active} active, newest {age.days}d old",
+            report.add("funding catalogue", WARN, f"{active} active, newest {age.days}d old",
                        "discovery may be stalled; check the worker's discovery counters")
         else:
-            report.add("funding catalogue", PASS, f"{active} active, newest {age} old"
-                       if age else f"{active} active")
-    except Exception as exc:  # noqa: BLE001
-        report.add("funding catalogue", SKIP, f"{type(exc).__name__}: {exc}"[:160])
+            report.add("funding catalogue", PASS,
+                       f"{active} active, newest {age} old" if age else f"{active} active")
 
-    # --- matching -----------------------------------------------------------
-    try:
-        rows = db.execute(text(
-            "SELECT state, count(*) FROM opportunity_matches GROUP BY state"
-        )).all()
-        tally = {state: count for state, count in rows}
-        needs = tally.get("NEEDS_DATA", 0)
+    rows, error = _query(
+        db, "SELECT state, count(*) FROM opportunity_matches GROUP BY state", many=True
+    )
+    if error:
+        report.add("matching is decidable", SKIP, error)
+    else:
+        tally = {state: count for state, count in (rows or [])}
         matched = tally.get("MATCHED", 0)
+        needs = tally.get("NEEDS_DATA", 0)
         report.add(
             "matching is decidable", PASS if matched else WARN,
             f"matched={matched} needs_data={needs} rejected={tally.get('REJECTED_BY_RULE', 0)}",
             "if everything is NEEDS_DATA, the profile is missing facts the gates read",
         )
-    except Exception as exc:  # noqa: BLE001
-        report.add("matching is decidable", SKIP, f"{type(exc).__name__}: {exc}"[:160])
 
-    # --- inbound mailbox ----------------------------------------------------
-    try:
-        routable = db.execute(
-            text("SELECT count(*) FROM mail_routing WHERE is_active")
-        ).scalar()
+    routable, error = _query(db, "SELECT count(*) FROM mail_routing WHERE is_active")
+    if error:
+        report.add("inbound mailbox routable", SKIP, error)
+    else:
         report.add(
             "inbound mailbox routable", PASS if routable else WARN,
             f"{routable} routable address(es)",
             "without one, verification mail is rejected at the door",
         )
-    except Exception as exc:  # noqa: BLE001
-        report.add("inbound mailbox routable", SKIP, f"{type(exc).__name__}: {exc}"[:160])
+
 
 
 # ---------------------------------------------------------------------------
 # HTTP checks
 # ---------------------------------------------------------------------------
-def _get(url: str, timeout: float = 10.0) -> tuple[int, str]:
+def _get(url: str, timeout: float = 10.0, *, host: str = "") -> tuple[int, str]:
+    """GET a URL, optionally with an explicit ``Host`` header.
+
+    THE HOST HEADER IS NOT DECORATION. The API runs TrustedHostMiddleware and answers 400
+    "Invalid host header" to any name it does not recognise - so probing it as `http://api:8000`
+    from inside the compose network reports the service as broken when it is merely being asked
+    politely in the wrong voice. The check has to speak the name the service publishes under.
+    """
+    request = urllib.request.Request(url)
+    if host:
+        request.add_header("Host", host)
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, response.read().decode("utf-8", "replace")[:400]
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8", "replace")[:400]
@@ -232,16 +249,16 @@ def _get(url: str, timeout: float = 10.0) -> tuple[int, str]:
         return 0, f"{type(exc).__name__}: {exc}"
 
 
-def check_http(report: Report, base: str) -> None:
+def check_http(report: Report, base: str, *, host: str = "granadac.com") -> None:
     for name, path in (("API health", "/health"), ("API readiness", "/readyz")):
-        status, body = _get(base.rstrip("/") + path)
+        status, body = _get(base.rstrip("/") + path, host=host)
         if status == 200:
             report.add(name, PASS, body[:120])
         else:
             report.add(name, FAIL, f"HTTP {status}: {body[:120]}",
                        "check the api container and its logs")
 
-    status, body = _get(base.rstrip("/") + "/api/v1/internal/mail/ingest/health")
+    status, body = _get(base.rstrip("/") + "/api/v1/internal/mail/ingest/health", host=host)
     if status == 200:
         try:
             configured = json.loads(body).get("configured")
@@ -272,6 +289,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Check that Granada is actually working.")
     parser.add_argument("--api-base", default="http://127.0.0.1:8000")
     parser.add_argument("--bridge", default="http://172.18.0.1:8765")
+    parser.add_argument(
+        "--host-header",
+        default="granadac.com",
+        help="Host to present to the API; TrustedHostMiddleware answers 400 to any name it does not know.",
+    )
     parser.add_argument("--skip-http", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -292,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
             db.close()
 
     if not args.skip_http:
-        check_http(report, args.api_base)
+        check_http(report, args.api_base, host=args.host_header)
         check_browser_bridge(report, args.bridge)
 
     if args.json:
