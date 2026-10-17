@@ -31,6 +31,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--package", required=True, help="package id (the evidence directory name)")
     parser.add_argument("--org", default="3d4edeec-f4dc-4e5f-a99d-29100780b3f2", help="organisation id")
     parser.add_argument("--limit", type=int, default=4, help="how many screenshots to read")
+    parser.add_argument("--last", action="store_true", help="read the LAST N (the pages the run ended on)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -40,6 +41,8 @@ def main(argv: list[str]) -> int:
         return 1
 
     paths = sorted(p for p in directory.glob("*.png") if p.is_file())
+    if args.last:
+        paths = paths[-args.limit:]
     if not paths:
         print(f"FAIL  no screenshots in {directory}")
         return 1

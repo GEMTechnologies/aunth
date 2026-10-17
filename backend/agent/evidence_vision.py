@@ -73,6 +73,10 @@ def read_screenshots(
     settings: Any = None,
     tier: str = "CLASSIFICATION",
     limit: int = 12,
+    #: GENEROUS ON PURPOSE. Reasoning tokens come out of the same allowance, and DeepSeek Flash spends
+    #: a lot of them: measured at 1024 the call succeeded, the schema validated, and every reading was
+    #: EMPTY - which reads as "the model cannot see" when in fact it never got to the answer.
+    max_output_tokens: int = 4096,
 ) -> list[ScreenshotReading]:
     """Ask a vision model to read each screenshot and report what it can see.
 
@@ -122,6 +126,7 @@ def read_screenshots(
                 prompt_version=PROMPT_VERSION,
                 tier=tier,
                 image_loader=_load_bytes,
+                max_output_tokens=max_output_tokens,
             )
         except Exception as exc:  # noqa: BLE001 - never fail a run for a reading
             logger.warning(
