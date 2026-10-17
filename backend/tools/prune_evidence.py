@@ -13,8 +13,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from pathlib import Path
 
-from agent.evidence_retention import (
+# RUNNING AS A SCRIPT PUTS `tools/` ON sys.path, not the backend root, so `agent` does not resolve.
+# The container sets PYTHONPATH=/app/backend and hides this; a host invocation does not, and the
+# failure is a bare ModuleNotFoundError that says nothing about the fix. Pinned here so the command
+# works the same way in both places.
+BACKEND_ROOT = Path(__file__).resolve().parent.parent
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+from agent.evidence_retention import (  # noqa: E402
     DEFAULT_KEEP_FULL_DAYS,
     DEFAULT_KEEP_SAMPLED_DAYS,
     DEFAULT_SAMPLE_FRAMES,
