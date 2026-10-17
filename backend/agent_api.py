@@ -1296,6 +1296,96 @@ def _mailbox_purpose(identity: models.MailIdentity) -> str:
     return marker or "A Granada mailbox"
 
 
+class StartRegistrationOut(BaseModel):
+    workflow_id: str
+    state: str
+    opportunity_id: str
+    application_id: str
+    note: str
+
+
+@router.post(
+    "/portal/registration",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Ask the agent to register this organisation on the portal",
+    response_model=StartRegistrationOut,
+)
+def start_portal_registration(
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> StartRegistrationOut:
+    """Create the browser work. This is the trigger that did not exist.
+
+    MEASURED BEFORE THIS ROUTE: `WORKFLOW_BROWSER_TASK` was defined once in `agent/workflow_engine.py`
+    and created by nothing - not the API, not fleet discovery, not the application flow - so
+    `browser_workflows` was 0 on an agent whose settings enabled browser execution and named a real
+    UN-portal goal. The handler, the specialist registration and the worker all existed. The agent
+    could browse the portal and was never asked to.
+
+    THE SUBJECT IS AN OPPORTUNITY, AND THAT IS LOAD-BEARING. `_handle_browser_task` resolves the
+    application by `(agent.org_id, opportunity_id == workflow.subject_id)` and parks with
+    "no application is attached to this workflow" when it finds none. Scheduling against anything else
+    would create work that is guaranteed to park, which looks identical to a broken worker.
+
+    It does not submit anything: the handler passes `submission_authorised=False` and never consults
+    the agent's opinion, because submission authority is a separate decision that a human makes.
+    """
+    from agent.mail.gateway import AgentWake
+
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    agent = _agent_for(db, org_id)
+    if agent is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="this organisation has no Granada agent yet, so there is nobody to do the work",
+        )
+
+    row = (
+        db.query(models.Application, models.Opportunity)
+        .join(models.Opportunity, models.Opportunity.id == models.Application.opportunity_id)
+        .filter(models.Application.org_id == org_id)
+        .order_by(models.Application.created_at.desc())
+        .first()
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "no application exists for this organisation yet, so there is no portal registration "
+                "to perform; the browser work is scheduled against an application's opportunity"
+            ),
+        )
+    application, opportunity = row
+
+    workflow = AgentWake.schedule(
+        db,
+        agent=agent,
+        workflow_type="browser_task",
+        # COMPLIANCE owns both `application_assemble` and `browser_task` in agent/specialists.py;
+        # naming a specialist that does not advertise this work type produces UnknownSpecialist at
+        # execution time rather than here, which is why it is not a free choice.
+        specialist_key="COMPLIANCE",
+        subject_type="OPPORTUNITY",
+        subject_id=str(opportunity.id),
+        payload_ref={"portal": "unpartnerportal.org", "application_id": str(application.id)},
+    )
+    db.commit()
+
+    return StartRegistrationOut(
+        workflow_id=str(workflow.id),
+        state=str(workflow.state),
+        opportunity_id=str(opportunity.id),
+        application_id=str(application.id),
+        note=(
+            "The agent will open the portal. It never submits: submission authority is a separate "
+            "decision, and it will wait for a verification code if one is requested."
+        ),
+    )
+
+
 class MailboxSummary(BaseModel):
     id: str
     address: str

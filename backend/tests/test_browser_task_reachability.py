@@ -59,18 +59,29 @@ def _creation_sites() -> list[str]:
     return found
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "KNOWN GAP: nothing creates a browser_task workflow, so the agent can never be asked to register "
-        "an NGO on the UN portal. Fix by scheduling WORKFLOW_BROWSER_TASK from an API route the UI calls."
-    ),
-)
 def test_production_code_can_create_a_browser_task():
+    """WAS AN XFAIL FOR ONE ROUND. It failed, by design, until `POST /agent/portal/registration` was
+    added - the trigger that did not exist. `strict=True` meant it would turn into a FAILURE the moment
+    the gap closed, which is why this marker is gone rather than left behind as a stale "known gap".
+    """
     assert _creation_sites(), (
         "no production code creates a browser_task workflow: the capability is registered, configured "
         "and unreachable, and the mission can never start"
     )
+
+
+def test_the_route_that_creates_it_exists_and_is_reachable_http():
+    """The creation site must be a ROUTE, not merely a helper: the gap was that no client could ask."""
+    import agent_api
+
+    paths = {route.path for route in agent_api.router.routes}
+    assert "/agent/portal/registration" in paths
+
+    source = (BACKEND / "agent_api.py").read_text(encoding="utf-8")
+    assert 'workflow_type="browser_task"' in source
+    # The specialist is not a free choice: naming one that does not advertise this work type produces
+    # UnknownSpecialist at execution time, not at request time.
+    assert 'specialist_key="COMPLIANCE"' in source
 
 
 def test_the_handler_is_still_registered_under_compliance():
