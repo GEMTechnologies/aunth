@@ -517,7 +517,20 @@ class DocumentVault:
         self.db.flush()
         return document
 
-    def reject(self, document: models.Document, *, rejected_by: str) -> models.Document:
+    def reject(
+        self,
+        document: models.Document,
+        *,
+        rejected_by: str,
+        reason: "Optional[str]" = None,
+    ) -> models.Document:
+        """Reject a document, recording WHY as well as who.
+
+        A rejection naming only the person leaves the next one guessing what to change, and an audit
+        trail that answers "who" but not "why" cannot explain itself to the organisation it acts for.
+        The reason is optional - a rejection is still valid without one - but when given it is stored
+        and surfaced.
+        """
         if not rejected_by:
             raise OrganisationMemoryError("rejection requires a named person")
         if document.org_id != self.org_id:
@@ -525,6 +538,7 @@ class DocumentVault:
         document.approval_status = models.Document.REJECTED
         document.approved_by = rejected_by
         document.approved_at = _now()
+        document.rejection_reason = (reason or "").strip()[:500] or None
         self.db.flush()
         return document
 

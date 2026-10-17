@@ -51,8 +51,22 @@ const DocumentsCard: React.FC = () => {
   const act = async (document: VaultDocument, action: 'approve' | 'reject') => {
     setBusy(document.id);
     setActionError(null);
+    // Ask WHY on rejection. Cancelling the prompt is not a rejection with no reason - it is a
+    // decision not to reject yet, so nothing is sent.
+    let why: string | undefined;
+    if (action === 'reject') {
+      const answer = window.prompt('Why is this document being rejected?', '');
+      if (answer === null) {
+        setBusy(null);
+        return;
+      }
+      why = answer.trim() || undefined;
+    }
+
     const result: AgentResult<{ approval_status: string }> =
-      action === 'approve' ? await approveDocument(document.id) : await rejectDocument(document.id);
+      action === 'approve'
+        ? await approveDocument(document.id)
+        : await rejectDocument(document.id, why);
     setBusy(null);
     if (!result.ok) {
       setActionError(result.error);

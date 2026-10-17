@@ -146,3 +146,28 @@ def test_rejection_keeps_the_document_and_records_who(client, world):
     assert resp.status_code == 200
     assert resp.json()["approval_status"] == models.Document.REJECTED
     assert world["document"].approved_by == str(world["user"].id)
+
+
+def test_a_rejection_records_why_as_well_as_who(client, world):
+    """A rejection that names only the person leaves the next one guessing what to change, and an
+    audit trail that answers "who" but not "why" cannot explain itself to the organisation."""
+    document_id = str(world["document"].id)
+    resp = client.post(
+        f"/api/v1/agent/documents/{document_id}/reject",
+        params={"reason": "the registration number is wrong"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rejection_reason"] == "the registration number is wrong"
+    assert world["document"].rejection_reason == "the registration number is wrong"
+
+    # And it is visible where the document is listed, not only in the response.
+    listing = client.get("/api/v1/agent/documents").json()
+    assert listing["documents"][0]["rejection_reason"] == "the registration number is wrong"
+
+
+def test_a_rejection_without_a_reason_is_still_a_rejection(client, world):
+    document_id = str(world["document"].id)
+    resp = client.post(f"/api/v1/agent/documents/{document_id}/reject")
+    assert resp.status_code == 200
+    assert resp.json()["approval_status"] == models.Document.REJECTED
+    assert resp.json()["rejection_reason"] is None

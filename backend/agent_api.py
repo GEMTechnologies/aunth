@@ -1443,6 +1443,8 @@ class DocumentSummary(BaseModel):
     scope_ref: Optional[str] = None
     created_at: Optional[str] = None
     approved_at: Optional[str] = None
+    #: Why it was rejected, in the words of the person who rejected it.
+    rejection_reason: Optional[str] = None
     size_bytes: Optional[int] = None
 
 
@@ -1574,6 +1576,7 @@ def list_documents(
             scope_ref=row.scope_ref,
             created_at=row.created_at.isoformat() if row.created_at else None,
             approved_at=row.approved_at.isoformat() if row.approved_at else None,
+            rejection_reason=row.rejection_reason,
             size_bytes=row.size_bytes,
         )
         for row in rows
@@ -1687,6 +1690,7 @@ def approve_document(
 @router.post("/documents/{document_id}/reject", summary="Reject THIS document")
 def reject_document(
     document_id: str,
+    reason: Optional[str] = None,
     user: Any = Depends(get_current_user),
     tenant: TenantContext = Depends(get_tenant_context),
     db: Session = Depends(get_db),
@@ -1697,13 +1701,17 @@ def reject_document(
     org_id = _organisation(tenant)
     require_org_access(tenant, db, org_id)
 
-    allowed, reason = has_permission(
+    # THE PERMISSION RESULT MUST NOT BE CALLED "reason": it SHADOWED the query parameter of the same
+    # name, so the rejection reason was overwritten by the permission explanation - which is None when
+    # permission is granted. The stored reason was therefore always empty, and nothing about the code
+    # looked wrong. Caught by test_a_rejection_records_why_as_well_as_who.
+    allowed, denial = has_permission(
         db, org_id=org_id, user_id=user.id, permission=PROFILE_WRITE_PERMISSION
     )
     if not allowed:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"you may not change this organisation's documents: {reason}",
+            detail=f"you may not change this organisation's documents: {denial}",
         )
 
     document = (
@@ -1715,7 +1723,11 @@ def reject_document(
         raise HTTPException(status_code=404, detail="no such document in this organisation")
 
     try:
-        DocumentVault(db, org_id).reject(document, rejected_by=str(user.id))
+        # THE REASON IS RECORDED, because a rejection that names only the person leaves the next one
+        # guessing what to change.
+        DocumentVault(db, org_id).reject(
+            document, rejected_by=str(user.id), reason=reason
+        )
     except OrganisationMemoryError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     db.commit()
@@ -1723,6 +1735,7 @@ def reject_document(
     return {
         "id": str(document.id),
         "approval_status": document.approval_status,
+        "rejection_reason": document.rejection_reason,
         "note": "Rejected. It stays in the vault and will not be attached.",
     }
 

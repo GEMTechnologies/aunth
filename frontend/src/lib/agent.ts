@@ -335,9 +335,16 @@ export async function approveDocument(id: string): Promise<AgentResult<{ approva
   }
 }
 
-export async function rejectDocument(id: string): Promise<AgentResult<{ approval_status: string }>> {
+export async function rejectDocument(
+  id: string,
+  reason?: string,
+): Promise<AgentResult<{ approval_status: string; rejection_reason?: string | null }>> {
   try {
-    const response = await api.post(`/agent/documents/${id}/reject`);
+    // The reason is sent when given: a rejection naming only the person leaves the next one guessing
+    // what to change, and an audit trail that answers "who" but not "why" cannot explain itself.
+    const response = await api.post(`/agent/documents/${id}/reject`, null, {
+      params: reason ? { reason } : undefined,
+    });
     return { ok: true, data: response.data };
   } catch (error: any) {
     const detail = error?.response?.data?.detail;

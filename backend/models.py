@@ -717,6 +717,12 @@ class Document(Base):
     approval_status: Mapped[str] = mapped_column(String(20), default=PENDING, index=True)
     approved_by: Mapped[Optional[str]] = mapped_column(String(36))
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    #: WHY a document was rejected, in the words of the person who rejected it.
+    #:
+    #: A rejection recording only "who" leaves the next person guessing what to change, and an audit
+    #: trail that answers "who" but not "why" cannot explain itself to the organisation it acts for.
+    #: Nullable: approval does not use it, and older rows predate the column.
+    rejection_reason: Mapped[Optional[str]] = mapped_column(String(500))
 
     uploaded_by: Mapped[Optional[str]] = mapped_column(String(36))
     created_at: Mapped[datetime] = mapped_column(
