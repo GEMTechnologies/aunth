@@ -142,6 +142,62 @@ MAX_EXTRA_PAGES = 2
 MAX_COMBINED_CHARS = 24000
 
 
+#: Second-level labels that a registrable domain needs THREE labels for. `example.co.uk` is one site;
+#: `co.uk` alone is a public suffix and two different organisations under it are not the same
+#: organisation. Not an exhaustive PSL - it covers the suffixes an NGO realistically uses, and getting it
+#: wrong here is conservative in the safe direction (a wider suffix list means STRICTER matching).
+_MULTI_LABEL_SUFFIXES = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "ltd.uk", "me.uk", "net.uk",
+    "co.ug", "or.ug", "ac.ug", "go.ug", "sc.ug",
+    "co.ke", "or.ke", "ac.ke", "go.ke",
+    "co.tz", "or.tz", "ac.tz", "go.tz",
+    "co.za", "org.za", "ac.za", "gov.za",
+    "com.au", "net.au", "org.au", "edu.au",
+    "co.in", "org.in", "ac.in", "gov.in",
+    "com.ng", "org.ng", "gov.ng",
+}
+
+
+def _registrable_domain(host: str) -> str:
+    """The domain a site is really under: `origin4-www.example.org` -> `example.org`.
+
+    WHY THIS EXISTS. Matching exact hosts meant a mirror or CDN host was rejected as "somebody else's
+    site". Measured: a real organisation's search results came back on `origin4-www.<domain>` and every
+    one was filtered out, so the multi-page reading silently degraded to the front page - the feature was
+    present, correct, and did nothing.
+    """
+    host = (host or "").lower().strip().rstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    labels = [label for label in host.split(".") if label]
+    if len(labels) <= 2:
+        return ".".join(labels)
+    if ".".join(labels[-2:]) in _MULTI_LABEL_SUFFIXES:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _same_site(candidate_url: str, base_url: str) -> bool:
+    """Whether a URL belongs to the same organisation's own site as `base_url`.
+
+    Same registrable domain, so a CDN or `www` mirror counts as the site - but a DIFFERENT organisation
+    that happens to share a suffix does not. This is the width of "we only read your own site": a
+    subdomain is still your site; an unrelated host is not.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        candidate = urlparse(candidate_url).netloc.lower()
+        base = urlparse(base_url).netloc.lower()
+    except ValueError:
+        return False
+    if not candidate or not base:
+        return False
+    if candidate == base:
+        return True
+    return _registrable_domain(candidate) == _registrable_domain(base)
+
+
 def _candidate_links(content: str, base_url: str) -> list[str]:
     """About/contact pages referenced by the homepage, in the order they appear.
 
@@ -159,9 +215,9 @@ def _candidate_links(content: str, base_url: str) -> list[str]:
         parsed = urlparse(target)
         if parsed.scheme not in ("http", "https"):
             continue
-        # Same site only. Following an off-site link would be reading somebody else's page and
-        # attributing it to this organisation.
-        if parsed.netloc.lower() != base_host:
+        # Same SITE only. Following an off-site link would be reading somebody else's page and
+        # attributing it to this organisation - but a CDN or www mirror is still this organisation's site.
+        if not _same_site(target, base_url):
             continue
         haystack = f"{text} {parsed.path.lower()}"
         if not any(pattern in haystack for pattern in _FOLLOW_PATTERNS):
@@ -219,8 +275,7 @@ def propose_from_website(
                 extra_links = [
                     h.url.split("#", 1)[0]
                     for h in hits
-                    if urlparse(h.url).netloc.lower() == urlparse(url).netloc.lower()
-                    and h.url.rstrip("/") != url.rstrip("/")
+                    if _same_site(h.url, url) and h.url.rstrip("/") != url.rstrip("/")
                 ][:MAX_EXTRA_PAGES]
         except Exception as exc:  # noqa: BLE001 - discovery is a bonus, never a failure
             logger.info("website_intake.link_search_failed", extra={"error": str(exc)[:120]})
