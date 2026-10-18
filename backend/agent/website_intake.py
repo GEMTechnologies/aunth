@@ -254,6 +254,21 @@ def _rank_links(links: list[str], base_url: str) -> list[str]:
     return sorted(links, key=score)
 
 
+def _conventional_links(base_url: str) -> list[str]:
+    """The pages an organisation's registration details are usually filed under.
+
+    WHY THIS EXISTS, AND WHY IT IS FIRST. Search for a site's about page returns help subdomains, media
+    articles and directories as readily as the page we want - measured: both candidates it returned for a
+    real organisation timed out, so the multi-page reading came back with the homepage alone. Most sites
+    answer at a conventional path, and a conventional guess costs one fetch and no search quota.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    return [f"{origin}/{slug}" for slug in ("about", "about-us", "contact", "who-we-are")]
+
+
 def propose_from_website(
     *, db: Any, org_id: str, url: str, settings: Any = None
 ) -> dict[str, Any]:
@@ -284,7 +299,12 @@ def propose_from_website(
         {"url": url, "title": home.title or "", "content": home.content or ""}
     ]
 
-    extra_links = _candidate_links(home.content or "", url)
+    # Order of preference: what the page links to (a real signal), then the conventional paths, then a
+    # search for the site's own pages.
+    discovered = _candidate_links(home.content or "", url)
+    extra_links = list(discovered) + [
+        link for link in _conventional_links(url) if link not in discovered
+    ]
     if not extra_links:
         # THE FETCHED MARKDOWN OFTEN HAS NO NAVIGATION IN IT. Measured: a real organisation's homepage
         # produced no about/contact links at all, so the multi-page reading silently degraded to one
