@@ -201,7 +201,31 @@ def propose_from_website(
     pages: list[dict[str, Any]] = [
         {"url": url, "title": home.title or "", "content": home.content or ""}
     ]
-    for link in _candidate_links(home.content or "", url):
+
+    extra_links = _candidate_links(home.content or "", url)
+    if not extra_links:
+        # THE FETCHED MARKDOWN OFTEN HAS NO NAVIGATION IN IT. Measured: a real organisation's homepage
+        # produced no about/contact links at all, so the multi-page reading silently degraded to one
+        # page. When the page does not show us its links, ask the search engine which of its own pages
+        # talk about it - still same-site only, still at most MAX_EXTRA_PAGES.
+        try:
+            from urllib.parse import urlparse
+
+            from agent.web_research import search
+
+            host = urlparse(url).netloc.lower().lstrip("www.")
+            if host:
+                hits = search(f"site:{host} about contact registration", count=4, settings=settings)
+                extra_links = [
+                    h.url.split("#", 1)[0]
+                    for h in hits
+                    if urlparse(h.url).netloc.lower() == urlparse(url).netloc.lower()
+                    and h.url.rstrip("/") != url.rstrip("/")
+                ][:MAX_EXTRA_PAGES]
+        except Exception as exc:  # noqa: BLE001 - discovery is a bonus, never a failure
+            logger.info("website_intake.link_search_failed", extra={"error": str(exc)[:120]})
+
+    for link in extra_links:
         try:
             page = fetch(link, max_chars=10000, settings=settings)
         except WebResearchError as exc:
