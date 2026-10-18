@@ -95,7 +95,17 @@ class _Config:
 
 
 def config_from_settings(settings: Any) -> _Config:
-    """Read the same settings the model gateway uses, so there is one key and one base URL."""
+    """Read the same settings the model gateway uses, so there is one key and one base URL.
+
+    `settings=None` MEANS THE APPLICATION'S SETTINGS, not "no configuration". It used to return an
+    empty key, so every caller that omitted the argument - which is the natural call inside a route -
+    failed with "no API key is configured for web research" while the key was present and working.
+    Measured: the website importer reported exactly that against a container whose settings carried a
+    35-character key.
+    """
+    if settings is None:
+        from config import settings  # type: ignore[assignment]
+
     base = (getattr(settings, "model_base_url", "") or "https://api.deepseek.com").strip()
     key = (getattr(settings, "model_api_key", "") or "").strip()
     return _Config(
