@@ -2618,6 +2618,11 @@ def import_facts_from_website(
         "found": recorded,
         "kept_existing": skipped,
         "considered": proposal.get("considered") or [],
+        # Which pages were actually read, and which fields the site simply does not publish - so the
+        # screen can say "we read your site and it does not state this" rather than leaving the operator
+        # to wonder why a field is still empty.
+        "pages_read": proposal.get("pages_read") or [{"url": proposal.get("url") or url}],
+        "absent": proposal.get("absent") or [],
         "note": (
             "Proposed from your website and stored as AI_INFERRED - never usable in a submission until "
             "a person confirms it. Review the fields and save the ones that are right."

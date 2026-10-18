@@ -236,6 +236,17 @@ const OrganisationFactsCard: React.FC = () => {
             . They are stored as inferred — review and save to confirm.
           </p>
         )}
+        {imported && imported.pages_read && imported.pages_read.length > 1 && (
+          <p className="text-[11px] text-gray-500 mt-1" data-testid="import-pages">
+            Read {imported.pages_read.length} pages from your site.
+          </p>
+        )}
+        {imported && imported.absent && imported.absent.length > 0 && (
+          <p className="text-[11px] text-gray-500 mt-1" data-testid="import-absent">
+            Your site does not state: {imported.absent.slice(0, 5).join(', ')}
+            {imported.absent.length > 5 ? '…' : ''}
+          </p>
+        )}
       </div>
 
       {error && (

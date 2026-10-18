@@ -109,17 +109,81 @@ def extract_facts_from_text(
         # A value that is obviously a placeholder is not a finding.
         if value and value.lower() not in {"", "n/a", "none", "unknown", "not stated"}:
             found[field] = value[:500]
-    return {"url": url, "prompt_version": PROMPT_VERSION, "found": found, "considered": list(FACT_FIELDS)}
+    return {
+        "url": url,
+        "prompt_version": PROMPT_VERSION,
+        "found": found,
+        "considered": list(FACT_FIELDS),
+        # Which fields the site simply did not state, so the screen can say "we read your site and it
+        # does not publish these" instead of leaving the operator to guess why they are empty.
+        "absent": [f for f in FACT_FIELDS if f not in found],
+    }
+
+
+#: Links worth following from a homepage. An organisation's registration details live on an about or
+#: contact page far more often than on the front page.
+_FOLLOW_PATTERNS = (
+    "about",
+    "who-we-are",
+    "who_we_are",
+    "contact",
+    "our-story",
+    "legal",
+    "registration",
+    "governance",
+)
+
+#: At most this many pages beyond the one given. A bounded walk, not a crawl: unbounded crawling of a
+#: site whose robots policy we have not read is how a domain gets blocked and an organisation gets a
+#: complaint.
+MAX_EXTRA_PAGES = 2
+
+#: Combined text handed to the model. Two pages of marketing copy is already generous.
+MAX_COMBINED_CHARS = 24000
+
+
+def _candidate_links(content: str, base_url: str) -> list[str]:
+    """About/contact pages referenced by the homepage, in the order they appear.
+
+    The Fetch API returns Markdown, so links arrive as `[text](url)`. Both the link TEXT and the URL
+    are matched, because a site can publish `/page?id=7` whose text says "About us".
+    """
+    import re
+    from urllib.parse import urljoin, urlparse
+
+    found: list[str] = []
+    base_host = urlparse(base_url).netloc.lower()
+    for match in re.finditer(r"\[([^\]]{1,80})\]\(([^)\s]{1,300})\)", content or ""):
+        text, href = match.group(1).lower(), match.group(2)
+        target = urljoin(base_url, href)
+        parsed = urlparse(target)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        # Same site only. Following an off-site link would be reading somebody else's page and
+        # attributing it to this organisation.
+        if parsed.netloc.lower() != base_host:
+            continue
+        haystack = f"{text} {parsed.path.lower()}"
+        if not any(pattern in haystack for pattern in _FOLLOW_PATTERNS):
+            continue
+        cleaned = target.split("#", 1)[0]
+        if cleaned not in found and cleaned.rstrip("/") != base_url.rstrip("/"):
+            found.append(cleaned)
+    return found[:MAX_EXTRA_PAGES]
 
 
 def propose_from_website(
     *, db: Any, org_id: str, url: str, settings: Any = None
 ) -> dict[str, Any]:
-    """Fetch the organisation's own page and propose facts from it.
+    """Read the organisation's site and propose facts from it.
 
-    One fetch, through the same client the research path uses. A failure here is reported as a sentence
-    a person can act on, not as a stack trace - "the site blocked us" and "the URL is wrong" lead an
-    operator to different places.
+    THE FRONT PAGE IS NOT ENOUGH. Measured on a real organisation: a homepage yielded its name and its
+    mission and nothing else, because registration numbers and addresses are published on an about or
+    contact page. So this reads the page given, follows up to two same-site about/contact links it can
+    see, and hands the combined text to one model call.
+
+    Still bounded: two extra pages, one model call, and the combined text is capped. That is a reading
+    of the site, not a crawl of it.
     """
     from agent.web_research import WebResearchError, fetch
 
@@ -130,11 +194,28 @@ def propose_from_website(
         url = "https://" + url
 
     try:
-        page = fetch(url, max_chars=20000, settings=settings)
+        home = fetch(url, max_chars=12000, settings=settings)
     except WebResearchError as exc:
         raise WebsiteIntakeError(f"the page could not be fetched: {str(exc)[:160]}") from exc
 
-    body = page.content or ""
-    if page.title:
-        body = f"{page.title}\n\n{body}"
-    return extract_facts_from_text(text=body, org_id=org_id, db=db, settings=settings, url=url)
+    pages: list[dict[str, Any]] = [
+        {"url": url, "title": home.title or "", "content": home.content or ""}
+    ]
+    for link in _candidate_links(home.content or "", url):
+        try:
+            page = fetch(link, max_chars=10000, settings=settings)
+        except WebResearchError as exc:
+            # A broken about page must not lose the homepage that did load.
+            logger.info("website_intake.link_unreadable", extra={"link": link, "error": str(exc)[:120]})
+            continue
+        pages.append({"url": link, "title": page.title or "", "content": page.content or ""})
+
+    combined = []
+    for page in pages:
+        header = f"--- {page['title'] or page['url']} ({page['url']}) ---"
+        combined.append(f"{header}\n{page['content']}")
+    text = "\n\n".join(combined)[:MAX_COMBINED_CHARS]
+
+    outcome = extract_facts_from_text(text=text, org_id=org_id, db=db, settings=settings, url=url)
+    outcome["pages_read"] = [{"url": p["url"], "title": p["title"]} for p in pages]
+    return outcome

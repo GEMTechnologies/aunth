@@ -675,6 +675,10 @@ export interface WebsiteImport {
   found: Array<{ key: string; value: string }>;
   kept_existing: string[];
   considered: string[];
+  //: Which pages were actually read - the front page, plus up to two about/contact pages.
+  pages_read?: Array<{ url: string; title?: string }>;
+  //: Fields the site simply does not publish, so an empty field is explainable.
+  absent?: string[];
   note: string;
 }
 
