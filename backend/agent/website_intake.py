@@ -243,3 +243,60 @@ def propose_from_website(
     outcome = extract_facts_from_text(text=text, org_id=org_id, db=db, settings=settings, url=url)
     outcome["pages_read"] = [{"url": p["url"], "title": p["title"]} for p in pages]
     return outcome
+
+
+def propose_from_name(
+    *, db: Any, org_id: str, name: str, settings: Any = None
+) -> dict[str, Any]:
+    """Find the organisation from its NAME, then read its site.
+
+    THE THIRD WAY IN, and the one an NGO is most likely to use: it knows its own name, not the URL of
+    the page that lists its registration number. Search finds the official site, the site is read the
+    same way a pasted URL is read, and the facts come back with the same provenance.
+
+    THE NAME IS A CLAIM, NOT A MATCH. Search can return an umbrella body, a partner, or a directory
+    entry that mentions the organisation without being it. The resolved page is therefore kept, shown,
+    and checked against what the page itself says the organisation is called - a person reviewing the
+    proposal must be able to see which site it read before trusting anything on it.
+    """
+    import re
+    from urllib.parse import urlparse
+
+    from agent.web_research import WebResearchError, search
+
+    name = (name or "").strip()
+    if len(name) < 3:
+        raise WebsiteIntakeError("a name of at least three characters is required")
+
+    try:
+        hits = search(f"{name} official website", count=6, settings=settings)
+    except WebResearchError as exc:
+        raise WebsiteIntakeError(f"the search failed: {str(exc)[:160]}") from exc
+
+    if not hits:
+        raise WebsiteIntakeError(f"no website found for {name!r}")
+
+    # Prefer a hit whose host or title contains the name's distinctive words: searching an acronym
+    # returns directories and news before it returns the organisation itself.
+    words = [w for w in re.split(r"\W+", name.lower()) if len(w) > 2]
+
+    def _score(hit: Any) -> tuple[int, float]:
+        haystack = f"{hit.title} {hit.url}".lower()
+        overlap = sum(1 for w in words if w in haystack)
+        return (overlap, hit.score)
+
+    best = sorted(hits, key=_score, reverse=True)[0]
+
+    proposed = propose_from_website(db=db, org_id=org_id, url=best.url, settings=settings)
+    proposed["resolved_from"] = {"name": name, "query": f"{name} official website"}
+    proposed["resolved_host"] = urlparse(best.url).netloc.lower()
+    proposed["resolved_title"] = best.title
+
+    # Report whether the page agrees it is this organisation. Not a refusal - a small NGO's site may
+    # carry a different trading name - but the reviewer must see it.
+    claimed = (proposed.get("found") or {}).get("organisation_name", "")
+    if words and claimed and not any(w in claimed.lower() for w in words):
+        proposed["name_mismatch"] = (
+            f"the site calls itself {claimed!r}, which does not obviously match {name!r}"
+        )
+    return proposed

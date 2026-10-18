@@ -4,6 +4,7 @@ import {
   ProfileFacts,
   WebsiteImport,
   fetchProfileFacts,
+  importFactsFromName,
   importFactsFromWebsite,
   writeProfileFacts,
 } from '../lib/agent';
@@ -110,8 +111,25 @@ const OrganisationFactsCard: React.FC = () => {
   const [saved, setSaved] = useState<string | null>(null);
   const [rejected, setRejected] = useState<Array<{ key: string; reason: string }>>([]);
   const [siteUrl, setSiteUrl] = useState('');
+  const [orgName, setOrgName] = useState('');
   const [importing, setImporting] = useState(false);
   const [imported, setImported] = useState<WebsiteImport | null>(null);
+
+  const importFromName = async () => {
+    if (!orgName.trim()) return;
+    setImporting(true);
+    setImported(null);
+    setError(null);
+    const result = await importFactsFromName(orgName.trim());
+    setImporting(false);
+    if (!result.ok) {
+      setError(result.error);
+      return;
+    }
+    setImported(result.data);
+    if (result.data.name_mismatch) setError(result.data.name_mismatch);
+    load();
+  };
 
   const importFromSite = async () => {
     if (!siteUrl.trim()) return;
@@ -207,8 +225,26 @@ const OrganisationFactsCard: React.FC = () => {
       {/* ONBOARDING SHOULD NOT ASK FOR TEN VALUES THE ORGANISATION ALREADY PUBLISHES. */}
       <div className="mb-4 p-3 bg-gray-50 border border-gray-200 rounded-lg">
         <label className="text-xs text-gray-600 block mb-1">
-          Start from your website — we will propose the fields below
+          Start from your name or your website — we will propose the fields below
         </label>
+        <div className="flex gap-2 mb-2">
+          <input
+            value={orgName}
+            onChange={(e) => setOrgName(e.target.value)}
+            placeholder="Your organisation's name"
+            className="flex-1 px-3 py-1.5 text-sm border border-gray-300 rounded-md"
+            data-testid="org-name"
+          />
+          <button
+            type="button"
+            onClick={importFromName}
+            disabled={importing}
+            className="px-3 py-1.5 text-sm bg-emerald-600 text-white rounded-md hover:bg-emerald-700 disabled:opacity-50"
+            data-testid="import-name"
+          >
+            {importing ? 'Looking…' : 'Find us'}
+          </button>
+        </div>
         <div className="flex gap-2">
           <input
             value={siteUrl}

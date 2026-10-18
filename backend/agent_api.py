@@ -1605,6 +1605,28 @@ def upload_document(
     )
     db.commit()
 
+    # THE FILE IS ALSO AN APPLICATION FOR HELP, not just an attachment. An organisation that uploads its
+    # certificate is telling us who it is; the transcription already exists, so the same model call is
+    # reused to propose the profile fields. Same provenance rule as the website: AI_INFERRED, never
+    # submission-safe, and it never overwrites what a person asserted.
+    proposed: list[dict[str, Any]] = []
+    kept: list[str] = []
+    if read_ok and (reading or {}).get("transcription"):
+        try:
+            from agent.website_intake import extract_facts_from_text
+
+            proposal = extract_facts_from_text(
+                text=reading["transcription"],
+                org_id=org_id,
+                db=db,
+                url=f"document:{stored.document_id}",
+            )
+            proposed, kept = _record_proposed_facts(
+                db=db, org_id=org_id, user=user, proposal=proposal, source_prefix="document"
+            )
+        except Exception as exc:  # noqa: BLE001 - a proposal must never fail the upload
+            logger.info("upload.fact_proposal_failed", extra={"error": type(exc).__name__})
+
     return {
         "document_id": stored.document_id,
         "size_bytes": stored.size_bytes,
@@ -1613,6 +1635,9 @@ def upload_document(
         "read": read_ok,
         "reading": reading,
         "limitation": limitation,
+        # What the document says about the organisation, proposed as profile facts.
+        "facts_proposed": proposed,
+        "facts_kept": kept,
         "note": (
             "Stored and read. The reading is evidence, not fact: text taken from an image is never "
             "used as an organisation's own claim."
@@ -2546,6 +2571,100 @@ def _gate_readiness(facts: dict[str, Any]) -> list[dict[str, Any]]:
     return readiness
 
 
+def _record_proposed_facts(
+    *, db: Session, org_id: str, user: Any, proposal: dict[str, Any], source_prefix: str
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Store a proposal as AI_INFERRED, keeping anything a person already asserted.
+
+    One place, because three routes now produce proposals — a website, a name, an uploaded document —
+    and the guarantee must not differ between them. Every proposed value is `AI_INFERRED`, which
+    `SUBMISSION_SAFE_STATES` excludes, so nothing here can reach a funder as the organisation's own
+    claim until a person confirms it.
+    """
+    from agent.organisation_memory import OrganisationMemory
+
+    memory = OrganisationMemory(db, org_id, actor_id=str(user.id))
+    protected = {
+        fact.key
+        for fact in memory.current_facts()
+        if fact.state in (models.OrgFact.USER_PROVIDED, models.OrgFact.VERIFIED)
+    }
+
+    recorded: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    for key, value in (proposal.get("found") or {}).items():
+        if key in protected:
+            skipped.append(key)
+            continue
+        memory.record_fact(
+            key=key,
+            value=value,
+            state=models.OrgFact.AI_INFERRED,
+            source=f"{source_prefix}:{proposal.get('url') or ''}"[:500],
+            confidence=0.6,
+            source_ref=str(proposal.get("url") or "")[:500],
+        )
+        recorded.append({"key": key, "value": value})
+    db.commit()
+    return recorded, skipped
+
+
+@router.post("/profile/import-from-name", summary="Find the organisation by name and propose its facts")
+def import_facts_from_name(
+    name: str,
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """The third way in: paste the organisation's NAME.
+
+    An NGO knows its own name, not the URL of the page that lists its registration number. Search finds
+    the official site, the site is read the same way a pasted URL is read, and the facts come back with
+    the same provenance.
+
+    The resolved site is returned with the proposal, because the name is a claim and not a match -
+    search can return an umbrella body or a directory entry that mentions the organisation without
+    being it, and a reviewer must be able to see which site was read before trusting anything on it.
+    """
+    from agent.website_intake import WebsiteIntakeError, propose_from_name
+
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    allowed, denial = has_permission(
+        db, org_id=org_id, user_id=user.id, permission=PROFILE_WRITE_PERMISSION
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"you may not change this organisation's profile: {denial}",
+        )
+
+    try:
+        proposal = propose_from_name(db=db, org_id=org_id, name=name)
+    except WebsiteIntakeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    recorded, skipped = _record_proposed_facts(
+        db=db, org_id=org_id, user=user, proposal=proposal, source_prefix="website"
+    )
+    return {
+        "url": proposal.get("url") or "",
+        "resolved_title": proposal.get("resolved_title"),
+        "resolved_host": proposal.get("resolved_host"),
+        "name_mismatch": proposal.get("name_mismatch"),
+        "found": recorded,
+        "kept_existing": skipped,
+        "considered": proposal.get("considered") or [],
+        "pages_read": proposal.get("pages_read") or [],
+        "absent": proposal.get("absent") or [],
+        "note": (
+            "Found from the name you gave, read the site, and stored the proposals as AI_INFERRED - "
+            "never usable in a submission until a person confirms it."
+        ),
+    }
+
+
 @router.post("/profile/import-from-website", summary="Propose facts from the organisation's website")
 def import_facts_from_website(
     url: str,
@@ -2566,7 +2685,6 @@ def import_facts_from_website(
     It will not overwrite what the organisation supplied or a person verified. Correcting the platform
     is a person's act; it must not be silently undone by a later import.
     """
-    from agent.organisation_memory import OrganisationMemory
     from agent.website_intake import WebsiteIntakeError, propose_from_website
 
     org_id = _organisation(tenant)
@@ -2588,30 +2706,9 @@ def import_facts_from_website(
         # different places.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    memory = OrganisationMemory(db, org_id, actor_id=str(user.id))
-    # Anything the organisation or a person has already asserted wins over a proposal.
-    protected = {
-        fact.key
-        for fact in memory.current_facts()
-        if fact.state in (models.OrgFact.USER_PROVIDED, models.OrgFact.VERIFIED)
-    }
-
-    recorded: list[dict[str, Any]] = []
-    skipped: list[str] = []
-    for key, value in (proposal.get("found") or {}).items():
-        if key in protected:
-            skipped.append(key)
-            continue
-        memory.record_fact(
-            key=key,
-            value=value,
-            state=models.OrgFact.AI_INFERRED,
-            source=f"website:{proposal.get('url') or url}",
-            confidence=0.6,
-            source_ref=(proposal.get("url") or url)[:500],
-        )
-        recorded.append({"key": key, "value": value})
-    db.commit()
+    recorded, skipped = _record_proposed_facts(
+        db=db, org_id=org_id, user=user, proposal=proposal, source_prefix="website"
+    )
 
     return {
         "url": proposal.get("url") or url,

@@ -689,6 +689,28 @@ export interface WebsiteImport {
  * stored AI_INFERRED — never usable in a submission until a person confirms it — and it never
  * overwrites what the organisation supplied or someone verified.
  */
+export interface NameImport extends WebsiteImport {
+  resolved_title?: string | null;
+  resolved_host?: string | null;
+  name_mismatch?: string | null;
+}
+
+/**
+ * The third way in: paste the organisation's NAME.
+ *
+ * An NGO knows its own name, not the URL of the page that lists its registration number. The resolved
+ * site comes back with the proposal so a person can see which site was read before trusting it.
+ */
+export async function importFactsFromName(name: string): Promise<AgentResult<NameImport>> {
+  try {
+    const response = await api.post('/agent/profile/import-from-name', null, { params: { name } });
+    return { ok: true, data: response.data };
+  } catch (error: any) {
+    const detail = error?.response?.data?.detail;
+    return { ok: false, error: typeof detail === 'string' ? detail : 'no website was found for that name' };
+  }
+}
+
 export async function importFactsFromWebsite(url: string): Promise<AgentResult<WebsiteImport>> {
   try {
     const response = await api.post('/agent/profile/import-from-website', null, { params: { url } });
