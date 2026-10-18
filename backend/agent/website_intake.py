@@ -138,6 +138,11 @@ _FOLLOW_PATTERNS = (
 #: complaint.
 MAX_EXTRA_PAGES = 2
 
+#: How many candidate pages are fetched before we stop looking for the two we want. Fetching is the slow
+#: part and a candidate can time out; giving up after exactly MAX_EXTRA_PAGES attempts is how the
+#: multi-page reading degraded to one page on a real site.
+MAX_FETCH_ATTEMPTS = 4
+
 #: Combined text handed to the model. Two pages of marketing copy is already generous.
 MAX_COMBINED_CHARS = 24000
 
@@ -228,6 +233,27 @@ def _candidate_links(content: str, base_url: str) -> list[str]:
     return found[:MAX_EXTRA_PAGES]
 
 
+def _rank_links(links: list[str], base_url: str) -> list[str]:
+    """Order candidates so the most likely about/contact page is fetched first.
+
+    A search for a site's about page returns help subdomains and media articles as well as the page we
+    want, and every fetch costs time and quota. Path relevance first, then the exact host over a
+    subdomain, then the shorter URL - a front page beats a deep article.
+    """
+    from urllib.parse import urlparse
+
+    base_host = urlparse(base_url).netloc.lower()
+
+    def score(link: str) -> tuple[int, int, int]:
+        parsed = urlparse(link)
+        path = (parsed.path or "").lower()
+        relevant = 1 if any(pattern in path for pattern in _FOLLOW_PATTERNS) else 0
+        exact_host = 1 if parsed.netloc.lower() == base_host else 0
+        return (-relevant, -exact_host, len(link))
+
+    return sorted(links, key=score)
+
+
 def propose_from_website(
     *, db: Any, org_id: str, url: str, settings: Any = None
 ) -> dict[str, Any]:
@@ -271,21 +297,30 @@ def propose_from_website(
 
             host = urlparse(url).netloc.lower().lstrip("www.")
             if host:
-                hits = search(f"site:{host} about contact registration", count=4, settings=settings)
+                hits = search(f"site:{host} about contact", count=8, settings=settings)
                 extra_links = [
                     h.url.split("#", 1)[0]
                     for h in hits
                     if _same_site(h.url, url) and h.url.rstrip("/") != url.rstrip("/")
-                ][:MAX_EXTRA_PAGES]
+                ][:MAX_FETCH_ATTEMPTS]
         except Exception as exc:  # noqa: BLE001 - discovery is a bonus, never a failure
             logger.info("website_intake.link_search_failed", extra={"error": str(exc)[:120]})
 
-    for link in extra_links:
+    # TRY MORE CANDIDATES THAN WE NEED. A discovered link can be a slow subdomain or a media page that
+    # times out; the first version gave up after exactly two attempts and returned the homepage alone,
+    # so the feature silently did nothing on the site that motivated it. Bounded attempts, best-first.
+    attempts = 0
+    for link in _rank_links(extra_links, url):
+        if len(pages) > MAX_EXTRA_PAGES or attempts >= MAX_FETCH_ATTEMPTS:
+            break
+        attempts += 1
         try:
             page = fetch(link, max_chars=10000, settings=settings)
         except WebResearchError as exc:
-            # A broken about page must not lose the homepage that did load.
+            # A broken or slow page must not lose the homepage that did load.
             logger.info("website_intake.link_unreadable", extra={"link": link, "error": str(exc)[:120]})
+            continue
+        if not (page.content or "").strip():
             continue
         pages.append({"url": link, "title": page.title or "", "content": page.content or ""})
 
