@@ -670,6 +670,34 @@ export interface ProfileFactsWriteResult {
 
 export const fetchProfileFacts = () => load<ProfileFacts>('/agent/profile/facts');
 
+export interface WebsiteImport {
+  url: string;
+  found: Array<{ key: string; value: string }>;
+  kept_existing: string[];
+  considered: string[];
+  note: string;
+}
+
+/**
+ * Propose the onboarding facts from the organisation's own website.
+ *
+ * Onboarding should not ask an NGO to type ten values it already publishes. Everything this writes is
+ * stored AI_INFERRED — never usable in a submission until a person confirms it — and it never
+ * overwrites what the organisation supplied or someone verified.
+ */
+export async function importFactsFromWebsite(url: string): Promise<AgentResult<WebsiteImport>> {
+  try {
+    const response = await api.post('/agent/profile/import-from-website', null, { params: { url } });
+    return { ok: true, data: response.data };
+  } catch (error: any) {
+    const detail = error?.response?.data?.detail;
+    return {
+      ok: false,
+      error: typeof detail === 'string' ? detail : 'the website could not be read',
+    };
+  }
+}
+
 /**
  * Record facts as USER_PROVIDED.
  *

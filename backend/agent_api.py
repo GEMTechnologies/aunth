@@ -2546,6 +2546,85 @@ def _gate_readiness(facts: dict[str, Any]) -> list[dict[str, Any]]:
     return readiness
 
 
+@router.post("/profile/import-from-website", summary="Propose facts from the organisation's website")
+def import_facts_from_website(
+    url: str,
+    user: Any = Depends(get_current_user),
+    tenant: TenantContext = Depends(get_tenant_context),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Read the organisation's own site and propose the onboarding facts from it.
+
+    ONBOARDING SHOULD NOT ASK AN NGO TO TYPE TEN VALUES IT ALREADY PUBLISHES. The website is the first
+    artefact an organisation has; a model can read it, so the flow is: give us your URL, we propose the
+    facts, you confirm them.
+
+    EVERYTHING IT WRITES IS `AI_INFERRED`, which `SUBMISSION_SAFE_STATES` deliberately excludes - so a
+    value read off a homepage can never reach a funder as if the organisation had asserted it. The
+    proposal is a head start for a person, not a substitute for one.
+
+    It will not overwrite what the organisation supplied or a person verified. Correcting the platform
+    is a person's act; it must not be silently undone by a later import.
+    """
+    from agent.organisation_memory import OrganisationMemory
+    from agent.website_intake import WebsiteIntakeError, propose_from_website
+
+    org_id = _organisation(tenant)
+    require_org_access(tenant, db, org_id)
+
+    allowed, denial = has_permission(
+        db, org_id=org_id, user_id=user.id, permission=PROFILE_WRITE_PERMISSION
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"you may not change this organisation's profile: {denial}",
+        )
+
+    try:
+        proposal = propose_from_website(db=db, org_id=org_id, url=url)
+    except WebsiteIntakeError as exc:
+        # A sentence an operator can act on: "the site blocked us" and "the URL is wrong" send them to
+        # different places.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    memory = OrganisationMemory(db, org_id, actor_id=str(user.id))
+    # Anything the organisation or a person has already asserted wins over a proposal.
+    protected = {
+        fact.key
+        for fact in memory.current_facts()
+        if fact.state in (models.OrgFact.USER_PROVIDED, models.OrgFact.VERIFIED)
+    }
+
+    recorded: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    for key, value in (proposal.get("found") or {}).items():
+        if key in protected:
+            skipped.append(key)
+            continue
+        memory.record_fact(
+            key=key,
+            value=value,
+            state=models.OrgFact.AI_INFERRED,
+            source=f"website:{proposal.get('url') or url}",
+            confidence=0.6,
+            source_ref=(proposal.get("url") or url)[:500],
+        )
+        recorded.append({"key": key, "value": value})
+    db.commit()
+
+    return {
+        "url": proposal.get("url") or url,
+        "found": recorded,
+        "kept_existing": skipped,
+        "considered": proposal.get("considered") or [],
+        "note": (
+            "Proposed from your website and stored as AI_INFERRED - never usable in a submission until "
+            "a person confirms it. Review the fields and save the ones that are right."
+        ),
+    }
+
+
 @router.get("/profile/facts", summary="The organisation's profile facts")
 def list_profile_facts(
     user: Any = Depends(get_current_user),

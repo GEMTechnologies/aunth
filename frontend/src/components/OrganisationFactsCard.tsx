@@ -2,7 +2,9 @@ import React, { useCallback, useEffect, useState } from 'react';
 import {
   MatchingGate,
   ProfileFacts,
+  WebsiteImport,
   fetchProfileFacts,
+  importFactsFromWebsite,
   writeProfileFacts,
 } from '../lib/agent';
 
@@ -107,6 +109,24 @@ const OrganisationFactsCard: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState<string | null>(null);
   const [rejected, setRejected] = useState<Array<{ key: string; reason: string }>>([]);
+  const [siteUrl, setSiteUrl] = useState('');
+  const [importing, setImporting] = useState(false);
+  const [imported, setImported] = useState<WebsiteImport | null>(null);
+
+  const importFromSite = async () => {
+    if (!siteUrl.trim()) return;
+    setImporting(true);
+    setImported(null);
+    setError(null);
+    const result = await importFactsFromWebsite(siteUrl.trim());
+    setImporting(false);
+    if (!result.ok) {
+      setError(result.error);
+      return;
+    }
+    setImported(result.data);
+    load();
+  };
 
   const load = useCallback(async () => {
     setError(null);
@@ -183,6 +203,40 @@ const OrganisationFactsCard: React.FC = () => {
           than making an offer it cannot support.
         </p>
       </header>
+
+      {/* ONBOARDING SHOULD NOT ASK FOR TEN VALUES THE ORGANISATION ALREADY PUBLISHES. */}
+      <div className="mb-4 p-3 bg-gray-50 border border-gray-200 rounded-lg">
+        <label className="text-xs text-gray-600 block mb-1">
+          Start from your website — we will propose the fields below
+        </label>
+        <div className="flex gap-2">
+          <input
+            value={siteUrl}
+            onChange={(e) => setSiteUrl(e.target.value)}
+            placeholder="https://your-organisation.org"
+            className="flex-1 px-3 py-1.5 text-sm border border-gray-300 rounded-md"
+            data-testid="website-url"
+          />
+          <button
+            type="button"
+            onClick={importFromSite}
+            disabled={importing}
+            className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50"
+            data-testid="import-website"
+          >
+            {importing ? 'Reading…' : 'Import'}
+          </button>
+        </div>
+        {imported && (
+          <p className="text-xs text-emerald-700 mt-2" data-testid="import-result">
+            {imported.found.length} field(s) proposed
+            {imported.kept_existing.length
+              ? `, ${imported.kept_existing.length} kept as you supplied them`
+              : ''}
+            . They are stored as inferred — review and save to confirm.
+          </p>
+        )}
+      </div>
 
       {error && (
         <p className="text-sm text-red-700 mb-3" data-testid="facts-error">

@@ -33,3 +33,10 @@ python-dotenv==1.2.2
 # --- Outbound HTTP (OAuth provider calls) ---
 httpx==0.25.2
 
+
+# --- Documents: reading what an organisation uploads ---
+# A certificate arrives as whatever the NGO has: a PDF from a registry, or a photograph of the printed
+# one. pypdf reads a text layer; pypdfium2 renders a page so a SCANNED pdf - no text layer at all - can
+# go to the multimodal model as an image. Both are wheels with no system packages.
+pypdf==5.1.0
+pypdfium2==4.30.0
